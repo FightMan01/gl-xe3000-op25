@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Restore GL UI</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+	body { font-family: -apple-system, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
+	h1 { font-size: 1.3rem; }
+	p { line-height: 1.5; }
+	.status { margin-top: 1rem; white-space: pre-wrap; font-family: monospace; }
+</style>
+</head>
+<body>
+<h1>GL UI not installed yet</h1>
+<p>
+	This router is running the community backend, but the GL.iNet frontend
+	files haven't been restored yet. If you ran
+	<code>backup-gl-ui.sh</code> against this router before flashing,
+	upload that <code>gl-ui-backup.tar.gz</code> below.
+</p>
+<form id="f">
+	<input type="file" name="backup" id="file" accept=".tar.gz,.gz">
+	<button type="submit">Restore</button>
+</form>
+<div class="status" id="status"></div>
+<script>
+document.getElementById("f").addEventListener("submit", function (e) {
+	e.preventDefault();
+	var file = document.getElementById("file").files[0];
+	var status = document.getElementById("status");
+	if (!file) {
+		status.textContent = "Choose a file first.";
+		return;
+	}
+	var data = new FormData();
+	data.append("backup", file);
+	status.textContent = "Uploading...";
+	fetch("/restore-ui", { method: "POST", body: data })
+		.then(function (r) { return r.text().then(function (t) { return { ok: r.ok, text: t }; }); })
+		.then(function (r) {
+			status.textContent = r.text;
+			if (r.ok) {
+				window.setTimeout(function () { window.location.reload(); }, 1500);
+			}
+		})
+		.catch(function (err) { status.textContent = "Upload failed: " + err; });
+});
+</script>
+</body>
+</html>

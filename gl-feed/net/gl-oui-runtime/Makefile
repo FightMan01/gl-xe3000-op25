@@ -1,9 +1,11 @@
 #
 # gl-oui-runtime: browser-side Vuex live-refresh glue for the GL SDK4 GUI
-# port. This is original code written for this port, unlike gl-oui-www
-# (GL's own compiled frontend bundle, not redistributed here - install it
-# yourself from your device's official firmware, or from GL's public
-# downloads, then this package's postinst wires the extra script tag in).
+# port, plus a fallback restore page for routers that don't have the GL
+# frontend installed yet. This is original code written for this port,
+# unlike gl-oui-www (GL's own compiled frontend bundle, not redistributed
+# here - install it yourself from your device's official firmware, or
+# restore a backup made with tools/backup-gl-ui.sh through this package's
+# restore-ui.html page).
 #
 
 include $(TOPDIR)/rules.mk
@@ -29,6 +31,11 @@ define Package/gl-oui-runtime/description
   admin page is open. Requires gl_home.html (installed by gl-oui-www) to
   reference /js/gl-port-runtime.js - this package's postinst adds that
   script tag if it's missing.
+
+  Also installs restore-ui.html, a fallback page nginx serves at / until
+  gl_home.html exists, letting a freshly-flashed router accept a GL UI
+  backup tarball (see tools/backup-gl-ui.sh) through the browser instead
+  of scp/ssh. Only usable before a root password is set.
 endef
 
 define Build/Compile
