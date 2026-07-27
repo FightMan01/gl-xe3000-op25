@@ -3,13 +3,35 @@
 # hotplugs in (see /etc/hotplug.d/usb/20-gl-oui-tethering). No custom
 # kernel modules, just netifd + stock USB-net drivers.
 
-[ -n "$(uci -q get network.tethering)" ] && exit 0
+if [ -z "$(uci -q get network.tethering)" ]; then
+	uci -q batch <<-EOF
+		set network.tethering=interface
+		set network.tethering.proto='dhcp'
+		set network.tethering.auto='1'
+	EOF
+	uci -q commit network
+fi
 
-uci -q batch <<-EOF
-	set network.tethering=interface
-	set network.tethering.proto='dhcp'
-	set network.tethering.auto='1'
-EOF
-uci -q commit network
+# Add tethering to the existing "wan" firewall zone (NAT/masquerade),
+# same as the cellular WAN and repeater uplink - without this, a phone
+# tethered over USB gets an address but no forwarding/NAT, the same
+# "connected but no internet" failure mode as an un-zoned modem or
+# repeater interface.
+. /lib/functions.sh
+
+zone_section=""
+config_cb() {
+	if [ "$1" = "zone" ]; then
+		local name
+		config_get name "$2" name
+		[ "$name" = "wan" ] && zone_section="$2"
+	fi
+}
+config_load firewall
+
+if [ -n "$zone_section" ]; then
+	uci -q add_list firewall."$zone_section".network='tethering'
+	uci -q commit firewall
+fi
 
 exit 0
