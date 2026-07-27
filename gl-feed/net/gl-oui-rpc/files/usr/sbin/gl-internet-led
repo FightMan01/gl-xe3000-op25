@@ -1,0 +1,23 @@
+#!/bin/sh
+
+LED=/sys/class/leds/green:wan
+
+[ -d "$LED" ] || exit 0
+echo none > "$LED/trigger"
+
+trap 'echo 0 > "$LED/brightness"; exit 0' INT TERM EXIT
+
+while true; do
+	if [ "$(uci -q get system.gl_led.led_enable)" = "0" ]; then
+		online=0
+	else
+		statuses="$(ubus call mwan3 status 2>/dev/null |
+			jsonfilter -e '@.interfaces.*.status' 2>/dev/null)"
+		case "$statuses" in
+			*online*) online=1 ;;
+			*) online=0 ;;
+		esac
+	fi
+	echo "$online" > "$LED/brightness"
+	sleep 5
+done

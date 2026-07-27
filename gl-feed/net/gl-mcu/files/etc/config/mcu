@@ -1,0 +1,21 @@
+config global 'global'
+	# /proc/gl-hw-info/mcu reports "/dev/ttyS1,9600" on this device -
+	# hardcoded here rather than auto-detected since the UART path is fixed.
+	option dev '/dev/ttyS1'
+	option baudrate '9600'
+	option poll_interval '5'
+
+config warning 'temp_high'
+	option enable '0'
+	option interval '5'
+	option value '50'
+
+config warning 'temp_low'
+	option enable '0'
+	option interval '5'
+	option value '-10'
+
+config warning 'capacity'
+	option enable '0'
+	option interval '5'
+	option value '10'

@@ -1,0 +1,23 @@
+#!/bin/sh
+# uhttpd's snapshot init generates a DER certificate. uhttpd accepts DER,
+# but nginx's SSL module requires PEM, so the GL UI gets its own persistent
+# PEM certificate while LuCI keeps its existing certificate unchanged.
+
+if [ ! -s /etc/gl-oui.crt ] || [ ! -s /etc/gl-oui.key ]; then
+	hostname="$(uci -q get system.@system[0].hostname)"
+	[ -n "$hostname" ] || hostname='GL-XE3000'
+	/usr/sbin/px5g selfsigned \
+		-days 3970 \
+		-newkey rsa:2048 \
+		-keyout /etc/gl-oui.key.new \
+		-out /etc/gl-oui.crt.new \
+		-subj "/C=HU/O=GL.iNet/CN=$hostname" \
+		-addext extendedKeyUsage=serverAuth \
+		-addext "subjectAltName=DNS:$hostname" >/dev/null 2>&1 &&
+		mv /etc/gl-oui.key.new /etc/gl-oui.key &&
+		mv /etc/gl-oui.crt.new /etc/gl-oui.crt
+fi
+
+chmod 0600 /etc/gl-oui.key 2>/dev/null
+chmod 0644 /etc/gl-oui.crt 2>/dev/null
+exit 0

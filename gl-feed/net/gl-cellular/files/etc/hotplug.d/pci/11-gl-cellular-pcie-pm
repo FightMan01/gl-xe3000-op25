@@ -1,0 +1,4 @@
+#!/bin/sh
+
+[ "$ACTION" = "add" ] || exit 0
+/usr/sbin/gl-cellular-pcie-pm

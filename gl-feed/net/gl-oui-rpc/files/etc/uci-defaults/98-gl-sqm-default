@@ -1,0 +1,22 @@
+#!/bin/sh
+
+if [ -f /etc/config/sqm ] && ! uci -q get sqm.@queue[0] >/dev/null; then
+	uci set sqm.gl='queue'
+	uci set sqm.gl.interface='br-lan'
+	uci set sqm.gl.enabled='0'
+	uci set sqm.gl.download='0'
+	uci set sqm.gl.upload='0'
+	uci set sqm.gl.qdisc='cake'
+	uci set sqm.gl.script='piece_of_cake.qos'
+	uci set sqm.gl.qdisc_advanced='0'
+	uci set sqm.gl.ingress_ecn='ECN'
+	uci set sqm.gl.egress_ecn='ECN'
+	uci set sqm.gl.qdisc_really_really_advanced='0'
+	uci set sqm.gl.itarget='auto'
+	uci set sqm.gl.etarget='auto'
+	uci set sqm.gl.linklayer='none'
+	uci commit sqm
+fi
+
+/etc/init.d/sqm enable 2>/dev/null
+exit 0

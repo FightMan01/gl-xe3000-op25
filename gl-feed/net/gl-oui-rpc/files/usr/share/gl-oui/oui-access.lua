@@ -1,0 +1,8 @@
+-- gl-oui-rpc: static-asset access hook.
+--
+-- Intentionally permissive. Static assets (SPA bundle, i18n, fonts,
+-- themes) must load before any session exists - the login screen itself
+-- depends on them. Request-level hardening (rate limiting, referrer
+-- checks) is a follow-up task, not required for basic login to work.
+-- The /rpc endpoint itself (oui-rpc.lua) enforces real ACL/session
+-- checks independently of this file.

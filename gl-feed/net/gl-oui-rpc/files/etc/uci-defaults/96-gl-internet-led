@@ -1,0 +1,5 @@
+#!/bin/sh
+
+/etc/init.d/gl-internet-led enable
+
+exit 0

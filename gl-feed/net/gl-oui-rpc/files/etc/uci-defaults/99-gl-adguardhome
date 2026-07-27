@@ -1,0 +1,9 @@
+#!/bin/sh
+
+uci -q set adguardhome.config.enabled='0'
+uci -q set adguardhome.config.dns_enabled='0'
+uci -q commit adguardhome
+/etc/init.d/adguardhome stop >/dev/null 2>&1
+/etc/init.d/adguardhome disable >/dev/null 2>&1
+
+exit 0

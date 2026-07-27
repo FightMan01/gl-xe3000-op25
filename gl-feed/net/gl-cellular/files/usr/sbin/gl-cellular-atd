@@ -1,0 +1,756 @@
+#!/usr/bin/env eco
+
+-- gl-cellular-atd: AT-command daemon for the Quectel RM520N-GL's AT port.
+--
+-- The QMI control interface (cdc-wdm, handled by uqmi/netifd's qmi proto)
+-- only covers connection-lifecycle operations. The rich per-cell data
+-- (RSRP/RSSI/RSRQ/SINR, cell ID, band, uplink/downlink bandwidth, mode)
+-- and the band-masking/network-type controls are only available via
+-- Quectel's AT command set on the modem's separate AT serial port
+-- (standard Quectel USB composite device layout: QMI/MBIM control + a
+-- diagnostic/AT port + NMEA).
+--
+-- Registers ubus object "cellular.at" with a single `command(cmd, timeout)`
+-- method returning raw response text, kept deliberately thin - response
+-- parsing (which varies by AT command) lives in the Lua RPC objects that
+-- call this, not here.
+--
+-- The AT port is the one with USB interface number 2 (bInterfaceNumber 2)
+-- - Quectel's standard 4-port composite layout (DM=0, NMEA=1, AT=2,
+-- PPP/secondary=3), at 115200 baud. The hotplug script matches on that
+-- interface number rather than "highest ttyUSB ordinal" - see
+-- etc/hotplug.d/usb/11-gl-cellular-atport.
+--
+-- Also registers a SEPARATE ubus object "cellular" (methods modems_info/
+-- modems_status/sims_info/sims_status/networks_info/networks_status),
+-- which oui-ws.lua (package gl-oui-rpc) polls to live-push the
+-- overview/internet page's modem status card, per menu.d/internet.json's
+-- `global_sockets` field. Field shapes here intentionally mirror
+-- modem.lua's own naming for consistency, parsed directly via this
+-- daemon's own send_at() rather than round-tripping through the
+-- "cellular.at" object's own `command` method (this daemon already has
+-- the AT port open).
+
+local eco = require 'eco'
+local termios = require 'eco.termios'
+local file = require 'eco.file'
+local time = require 'eco.time'
+local ubus = require 'eco.ubus'
+local uci = require 'eco.uci'
+local log = require 'eco.log'
+local cjson = require 'cjson'
+
+local function as_array(t)
+	if next(t) == nil then return cjson.empty_array end
+	return t
+end
+
+-- Negative dBm readings (RSRP/RSRQ/RSSI) come out as huge positive
+-- numbers over ubus (e.g. -81 as 4294967215) because lua-eco's
+-- lua_table_to_blob_impl encodes any Lua integer <= INT32_MAX via
+-- blobmsg_add_u32() regardless of sign, truncating negative int64_t
+-- values to their unsigned 32-bit representation. Routing around it here
+-- rather than patching lua-eco: forcing the value to a Lua float
+-- (integer + 0.0) makes lua_isinteger() false, taking the
+-- blobmsg_add_double() branch instead, which handles negative values
+-- correctly.
+local function tofloat(n)
+	if n == nil then return nil end
+	return n + 0.0
+end
+
+local cursor = uci.cursor()
+local dev = cursor:get('gl-cellular', 'atport', 'dev') or '/dev/ttyUSB2'
+local baudrate = tonumber(cursor:get('gl-cellular', 'atport', 'baudrate') or '115200')
+
+local speed_const = termios['B' .. tostring(baudrate)]
+if not speed_const then
+	error('gl-cellular-atd: unsupported baud rate ' .. tostring(baudrate))
+end
+
+local f = nil
+
+local function open_port()
+	local handle, err = file.open(dev, file.O_RDWR)
+	if not handle then
+		return nil, err
+	end
+	local attr, gerr = termios.tcgetattr(handle.fd)
+	if not attr then
+		handle:close()
+		return nil, gerr
+	end
+	attr:clr_flag('l', termios.ECHO)
+	attr:clr_flag('l', termios.ICANON)
+	attr:clr_flag('l', termios.ISIG)
+	attr:set_cc(termios.VMIN, 0)
+	attr:set_cc(termios.VTIME, 1)
+	attr:set_speed(speed_const)
+	local ok, serr = termios.tcsetattr(handle.fd, termios.TCSANOW, attr)
+	if not ok then
+		handle:close()
+		return nil, serr
+	end
+	return handle
+end
+
+-- Sends `cmd` (without trailing CR), reads until "OK"/"ERROR" or timeout.
+-- Not reentrant - callers are serialized by ubus's single-threaded request
+-- handling within this daemon, matching how a single AT port can only
+-- service one command at a time anyway.
+local at_busy = false
+
+local function send_at_unlocked(cmd, timeout_s)
+	if not f then
+		return nil, 'AT port not open'
+	end
+	f:write(cmd .. '\r\n')
+
+	local deadline = os.time() + (timeout_s or 5)
+	local buf = {}
+	while os.time() < deadline do
+		local line, err = f:read('l', 1)
+		if line then
+			table.insert(buf, line)
+			if line:match('^OK%s*$') or line:match('^ERROR') or line:match('^%+CME ERROR') then
+				break
+			end
+		end
+	end
+	return table.concat(buf, '\n')
+end
+
+-- The history/LED sampler runs as a background eco coroutine while ubus
+-- requests are handled by other coroutines.  Serialize the shared serial
+-- port so replies from two AT commands can never be interleaved.
+local function send_at(cmd, timeout_s)
+	while at_busy do time.sleep(0.05) end
+	at_busy = true
+	local ok, response, err = pcall(send_at_unlocked, cmd, timeout_s)
+	at_busy = false
+	if not ok then return nil, response end
+	return response, err
+end
+
+-- Persistent cellular data-usage accounting (the "Data Used" figure on the
+-- main modem card in the supplied screenshots). Interface byte counters
+-- reset on every ifup/ifdown (e.g. reconnects, band/APN changes), so this
+-- samples the delta every `poll_interval` seconds and accumulates into UCI
+-- rather than reading the live kernel counter directly - the same pattern
+-- gl-mcu uses for state that must survive restarts.
+local last_rx, last_tx = nil, nil
+
+local function traffic_total()
+	local live = uci.cursor()
+	return tonumber(live:get('gl-cellular', 'state', 'data_used_bytes') or '0') or 0
+end
+
+local function traffic_sample()
+	-- ubus network.interface.wwan status gives us the real netdev name
+	-- (may not be a fixed "wwan0" depending on the qmi_wwan driver's
+	-- naming) without hardcoding it.
+	local con2 = ubus.connect()
+	if not con2 then return end
+	local status = con2:call('network.interface.wwan', 'status', {})
+	con2:close()
+	local netdev = status and (status.device or status.l3_device)
+	if not netdev then return end
+
+	local rx = file.readfile('/sys/class/net/' .. netdev .. '/statistics/rx_bytes')
+	local tx = file.readfile('/sys/class/net/' .. netdev .. '/statistics/tx_bytes')
+	rx, tx = tonumber(rx), tonumber(tx)
+	if not rx or not tx then return end
+
+	if last_rx and last_tx and rx >= last_rx and tx >= last_tx then
+		local delta = (rx - last_rx) + (tx - last_tx)
+		if delta > 0 then
+			local live = uci.cursor()
+			local total = tonumber(live:get('gl-cellular', 'state', 'data_used_bytes') or '0')
+			live:set('gl-cellular', 'state', 'data_used_bytes', tostring(total + delta))
+			live:commit('gl-cellular')
+		end
+	end
+	-- else: counters went backwards (interface bounced) - don't add a
+	-- bogus negative/huge delta, just resync the baseline below.
+	last_rx, last_tx = rx, tx
+end
+
+local function traffic_loop()
+	local poll_interval = tonumber(cursor:get('gl-cellular', 'atport', 'traffic_poll_interval') or '60')
+	while true do
+		time.sleep(poll_interval)
+		local ok, err = pcall(traffic_sample)
+		if not ok then
+			log.err('gl-cellular-atd: traffic_sample error: ' .. tostring(err))
+		end
+	end
+end
+
+-- --- "cellular" ubus object helpers (ported from gloui/at.lua's pure-Lua
+-- CSV parsing + modem.lua's field logic - can't `require "gloui.at"`
+-- directly since it needs the synchronous LuaJIT `ubus` binding, not
+-- `eco.ubus`, so the small parsing bits are duplicated inline here rather
+-- than sharing a module across the two incompatible Lua runtimes). ---
+
+local function split_csv(s)
+	local fields = {}
+	local pos = 1
+	local len = #s
+	while pos <= len + 1 do
+		if s:sub(pos, pos) == '"' then
+			local close = s:find('"', pos + 1) or len
+			table.insert(fields, s:sub(pos + 1, close - 1))
+			pos = close + 2
+		else
+			local nextcomma = s:find(',', pos) or (len + 1)
+			table.insert(fields, s:sub(pos, nextcomma - 1))
+			pos = nextcomma + 1
+		end
+	end
+	return fields
+end
+
+local function csv_fields(resp, prefix)
+	if not resp then return nil end
+	for line in resp:gmatch('[^\r\n]+') do
+		local payload = line:match('^' .. prefix .. ':%s*(.+)$')
+		if payload then
+			return split_csv(payload)
+		end
+	end
+	return nil
+end
+
+local BANDWIDTH_MHZ = { [0] = 1.4, [1] = 3, [2] = 5, [3] = 10, [4] = 15, [5] = 20 }
+-- Quectel RM5xxQ/RM5x0N AT manual, QENG <NR_DL_bandwidth>.
+local NR_BANDWIDTH_MHZ = {
+	[0] = 5, [1] = 10, [2] = 15, [3] = 20, [4] = 25, [5] = 30,
+	[6] = 40, [7] = 50, [8] = 60, [9] = 70, [10] = 80,
+	[11] = 90, [12] = 100, [13] = 200, [14] = 400,
+	[15] = 35, [16] = 45,
+}
+
+local function interface_status(name)
+	local con2 = ubus.connect()
+	if not con2 then return nil end
+	local status = con2:call('network.interface.' .. name, 'status', {})
+	con2:close()
+	return status
+end
+
+local function wwan_status()
+	return interface_status('wwan')
+end
+
+local function signal_level(metric, value)
+	if value == nil then return nil end
+	local thresholds = {
+		rsrp = { -80, -95, -110 },
+		rssi = { -65, -75, -85 },
+		rsrq = { -10, -15, -20 },
+		sinr = { 12.5, 10, 7 },
+	}
+	local t = thresholds[metric]
+	if value >= t[1] then return 4 end
+	if value >= t[2] then return 3 end
+	if value >= t[3] then return 2 end
+	return 1
+end
+
+local function add_signal_levels(cell)
+	if not cell then return end
+	cell.rsrp_level = signal_level('rsrp', cell.rsrp)
+	cell.rssi_level = signal_level('rssi', cell.rssi)
+	cell.rsrq_level = signal_level('rsrq', cell.rsrq)
+	cell.sinr_level = signal_level('sinr', cell.sinr)
+end
+
+local function all_qeng_lines(resp)
+	local out = {}
+	if not resp then return out end
+	for line in resp:gmatch('[^\r\n]+') do
+		local payload = line:match('^%+QENG:%s*(.+)$')
+		if payload then
+			table.insert(out, split_csv(payload))
+		end
+	end
+	return out
+end
+
+-- See modem.lua's get_serving_cell() for the full field-mapping rationale
+-- - ported here since gl-cellular-atd can't require "gloui.at"/modem.lua
+-- directly (different Lua runtime). LTE-only mode is one combined
+-- "+QENG:" line; 5G NSA/SA mode splits across three separate lines
+-- (state-only, LTE anchor, NR5G-* secondary).
+local function serving_cell_snapshot()
+	local lines = all_qeng_lines(send_at('AT+QENG="servingcell"', 3))
+	if #lines == 0 then return nil end
+
+	if #lines == 1 and lines[1][3] then
+		local fields = lines[1]
+		local rat = fields[3]
+		if rat == 'LTE' then
+			return {
+				mode = 'LTE ' .. (fields[4] or ''),
+				band = fields[10],
+				cell_id = fields[7],
+				ul_bandwidth = BANDWIDTH_MHZ[tonumber(fields[11])]
+					and (BANDWIDTH_MHZ[tonumber(fields[11])] .. 'MHz'),
+				dl_bandwidth = BANDWIDTH_MHZ[tonumber(fields[12])]
+					and (BANDWIDTH_MHZ[tonumber(fields[12])] .. 'MHz'),
+				rsrp = tofloat(tonumber(fields[14])), rsrq = tofloat(tonumber(fields[15])),
+				rssi = tofloat(tonumber(fields[16])), sinr = tofloat(tonumber(fields[17])),
+			}
+		end
+		return { mode = rat }
+	end
+
+	local result = nil
+	for _, fields in ipairs(lines) do
+		if fields[1] == 'LTE' then
+			result = result or {}
+			result.mode = '5G NSA (LTE ' .. (fields[2] or '') .. ' anchor)'
+			result.band = fields[8]
+			result.cell_id = fields[5]
+			result.ul_bandwidth = BANDWIDTH_MHZ[tonumber(fields[9])]
+				and (BANDWIDTH_MHZ[tonumber(fields[9])] .. 'MHz')
+			result.dl_bandwidth = BANDWIDTH_MHZ[tonumber(fields[10])]
+				and (BANDWIDTH_MHZ[tonumber(fields[10])] .. 'MHz')
+			result.rsrp = tofloat(tonumber(fields[12])); result.rsrq = tofloat(tonumber(fields[13]))
+			result.rssi = tofloat(tonumber(fields[14])); result.sinr = tofloat(tonumber(fields[15]))
+		elseif fields[1] == 'NR5G-NSA' or fields[1] == 'NR5G-SA' then
+			result = result or {}
+			if fields[1] == 'NR5G-SA' then result.mode = '5G SA' end
+			result.nr = {
+				band = fields[9] and ('n' .. fields[9]),
+				cell_id = fields[4],
+				bandwidth_code = fields[10],
+				dl_bandwidth = NR_BANDWIDTH_MHZ[tonumber(fields[10])]
+					and (NR_BANDWIDTH_MHZ[tonumber(fields[10])] .. 'MHz'),
+				rsrp = tofloat(tonumber(fields[5])), sinr = tofloat(tonumber(fields[6])), rsrq = tofloat(tonumber(fields[7])),
+			}
+		end
+	end
+	return result
+end
+
+-- Thresholds consumed by the historical-signal frontend.  The arrays run
+-- from poor to excellent and match the quality badges used elsewhere in
+-- the GL UI.
+local SIGNAL_LEVELS = {
+	LTE = {
+		rsrp = { -140.0, -110.0, -95.0, -80.0 },
+		rssi = { -120.0, -85.0, -75.0, -65.0 },
+		rsrq = { -30.0, -20.0, -15.0, -10.0 },
+		sinr = { -20.0, 7.0, 10.0, 12.5 },
+	},
+	['NR5G-NSA'] = {
+		rsrp = { -140.0, -110.0, -95.0, -80.0 },
+		rsrq = { -30.0, -20.0, -15.0, -10.0 },
+		sinr = { -20.0, 7.0, 10.0, 12.5 },
+	},
+	['NR5G-SA'] = {
+		rsrp = { -140.0, -110.0, -95.0, -80.0 },
+		rsrq = { -30.0, -20.0, -15.0, -10.0 },
+		sinr = { -20.0, 7.0, 10.0, 12.5 },
+	},
+}
+
+local signal_history = {}
+local SIGNAL_HISTORY_MAX = 181
+
+local function update_signal_leds(strength)
+	local live = uci.cursor()
+	local enabled = live:get('system', 'gl_led', 'led_enable') ~= '0'
+	for i = 1, 4 do
+		local base = '/sys/class/leds/green:5g:led' .. i
+		if file.readfile(base .. '/brightness') then
+			file.writefile(base .. '/trigger', 'none')
+			file.writefile(base .. '/brightness',
+				enabled and i <= (strength or 0) and '1' or '0')
+		end
+	end
+end
+
+local function signal_sample()
+	local cell = serving_cell_snapshot()
+	local sample = nil
+	if cell and cell.nr then
+		sample = {
+			network_type = cell.mode == '5G SA' and 'NR5G-SA' or 'NR5G-NSA',
+			slot = 1,
+			rsrp = cell.nr.rsrp,
+			rsrq = cell.nr.rsrq,
+			sinr = cell.nr.sinr,
+		}
+	elseif cell and cell.mode and cell.mode:find('^LTE') then
+		sample = {
+			network_type = 'LTE',
+			slot = 1,
+			rsrp = cell.rsrp,
+			rssi = cell.rssi,
+			rsrq = cell.rsrq,
+			sinr = cell.sinr,
+		}
+	end
+
+	local strength = sample and signal_level('rsrp', sample.rsrp) or 0
+	update_signal_leds(strength)
+	if not sample then return end
+	sample.timestamp = os.time()
+	table.insert(signal_history, sample)
+	while #signal_history > SIGNAL_HISTORY_MAX do table.remove(signal_history, 1) end
+end
+
+local function signal_loop()
+	while true do
+		local ok, err = pcall(signal_sample)
+		if not ok then
+			log.err('gl-cellular-atd: signal_sample error: ' .. tostring(err))
+		end
+		time.sleep(10)
+	end
+end
+
+local methods = {
+	command = {
+		function(req, msg, con)
+			local resp, err = send_at(msg.cmd, msg.timeout)
+			if not resp then
+				return con:reply(req, ubus.STATUS_INVALID_ARGUMENT)
+			end
+			con:reply(req, { response = resp })
+		end, { cmd = ubus.STRING, timeout = ubus.INT32 }
+	},
+
+	reset_data_usage = {
+		function(req, msg, con)
+			cursor:set('gl-cellular', 'state', 'data_used_bytes', '0')
+			cursor:commit('gl-cellular')
+			con:reply(req, {})
+		end
+	},
+}
+
+-- "cellular" object (distinct from "cellular.at" above) - status snapshots
+-- for oui-ws.lua's live-push polling, see this file's header.
+local MODEM_BUS = 'mhi0'
+
+-- eco.uci cursors cache package data.  Configuration written by the
+-- separate nginx RPC process (Connect/Disconnect, APN changes) therefore
+-- needs a fresh cursor when producing each status snapshot.
+local function current_config(package_name, section, option)
+	local live = uci.cursor()
+	return live:get(package_name, section, option)
+end
+
+local function sim_pin_snapshot()
+	local resp = send_at('AT+CPIN?', 2)
+	if not resp then return 0, nil end
+	if resp:match('%+CPIN:%s*READY') then return 2, nil end
+	if resp:match('%+CPIN:%s*SIM PIN') then
+		local attempts = send_at('AT+QPINC?', 2)
+		local count = attempts and attempts:match('%+QPINC:%s*"SC",(%d+)')
+		return 3, tonumber(count) or 3
+	end
+	if resp:match('%+CPIN:%s*SIM PUK') then return 4, 0 end
+	return 1, nil
+end
+
+local function configured_apn()
+	return current_config('network', 'wwan', 'apn') or 'internet'
+end
+
+local function numeric_result(resp, min_len)
+	if not resp then return nil end
+	for line in resp:gmatch('[^\r\n]+') do
+		local value = line:match('^%s*(%d+)%s*$')
+		if value and #value >= (min_len or 1) then return value end
+	end
+	return nil
+end
+
+local cellular_methods = {
+	modems_info = {
+		function(req, msg, con)
+			local resp = send_at('AT+CGSN', 2)
+			local imei = resp and resp:match('(%d+)')
+			con:reply(req, { modems = {
+				{
+					bus = MODEM_BUS,
+					type = 0,
+					model = 'RM520N-GL',
+					name = 'RM520N-GL',
+					vendor = 'Quectel',
+					-- The GL UI supports multi-slot modems and always calls
+					-- .find() on this field; even a single IMEI is an array.
+					imei = { { slot = '1', imei = imei } },
+					sim_slot_num = 1,
+					standby_type = 0,
+					sms_support = true,
+					signal_support = true,
+					-- RM520N-GL supports Quectel common/4g and common/5g
+					-- QNWLOCK. The matching modem RPCs implement discovery,
+					-- persisted state, lock and unlock, so expose the stock
+					-- XE3000 feature in the unchanged GL frontend.
+					lock_tower_support = true,
+					lock_carrier_support = true,
+					at_port = dev,
+					data_port = '/dev/wwan0mbim0',
+					devices = { '/dev/wwan0mbim0' },
+					protocols = { 'mbim' },
+					network_type_support = { 'AUTO', 'NR5G', 'LTE' },
+					band = {
+						LTE = { 1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18,
+							19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40,
+							41, 42, 43, 46, 48, 66, 71 },
+						['NR-NSA'] = { 1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20,
+							25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71,
+							75, 76, 77, 78, 79 },
+						['NR-SA'] = { 1, 2, 3, 5, 7, 8, 12, 13, 14, 18, 20,
+							25, 26, 28, 29, 30, 38, 40, 41, 48, 66, 70, 71,
+							75, 76, 77, 78, 79 },
+					},
+					-- GL UI uses numeric PDP enums: 0=IPv4/IPv6,
+					-- 1=IPv4, 2=IPv6.  It expects option objects here,
+					-- not the netifd pdptype strings.
+					supports_ip_type = {
+						{ label = 'IPv4 & IPv6', value = 0 },
+						{ label = 'IPv4', value = 1 },
+						{ label = 'IPv6', value = 2 },
+					},
+				},
+			} })
+		end
+	},
+
+	modems_status = {
+		function(req, msg, con)
+			local status = wwan_status()
+			con:reply(req, { modems = {
+				{
+					bus = MODEM_BUS,
+					status = 1,
+					current_sim_slot = '1',
+					slot_switch_status = 0,
+					connected = status and status.up == true or false,
+				},
+			} })
+		end
+	},
+
+	sims_info = {
+		function(req, msg, con)
+			local iccid = csv_fields(send_at('AT+QCCID', 2), '+QCCID')
+			local imsi_resp = send_at('AT+CIMI', 2)
+			local iccid_value = iccid and iccid[1]
+			if iccid_value then iccid_value = iccid_value:gsub('F$', '') end
+			con:reply(req, { sims = {
+				{
+					bus = MODEM_BUS,
+					slot = '1',
+					type = 0,
+					iccid = iccid_value,
+					imsi = numeric_result(imsi_resp, 14),
+					apn_list = cjson.empty_array,
+					phone_number = '',
+				},
+			} })
+		end
+	},
+
+	sims_status = {
+		function(req, msg, con)
+			local sim_status, pin_counter = sim_pin_snapshot()
+			local cops = csv_fields(send_at('AT+COPS?', 3), '+COPS')
+			local iccid = csv_fields(send_at('AT+QCCID', 2), '+QCCID')
+			local iccid_value = iccid and iccid[1]
+			if iccid_value then iccid_value = iccid_value:gsub('F$', '') end
+			local nwinfo = csv_fields(send_at('AT+QNWINFO', 2), '+QNWINFO')
+			local network_name = nwinfo and nwinfo[1] or ''
+			-- CPIN READY only says the SIM is unlocked.  GL uses status 5
+			-- for an unlocked SIM that is not registered, which activates
+			-- the card's explicit "SIM not registered / no service" text.
+			local operator = cops and cops[3] or ''
+			if sim_status == 2
+				and (network_name == '' or network_name == 'No Service')
+				and operator == '' then
+				sim_status = 5
+			end
+			local cell = serving_cell_snapshot() or {}
+			local technology = 0
+			if cell.nr or (cell.mode and cell.mode:find('^5G NSA'))
+				or network_name:find('NR5G%-NSA') then
+				technology = 51
+			elseif network_name:find('NR5G') then
+				technology = 5
+			elseif network_name:find('LTE') then
+				technology = 4
+			elseif network_name:find('WCDMA') or network_name:find('UMTS') then
+				technology = 3
+			elseif network_name ~= '' and network_name ~= 'No Service' then
+				technology = 2
+			end
+			local rsrp = cell.nr and cell.nr.rsrp or cell.rsrp
+			local strength = 0
+			if rsrp then
+				if rsrp >= -80 then strength = 4
+				elseif rsrp >= -95 then strength = 3
+				elseif rsrp >= -110 then strength = 2
+				else strength = 1 end
+			end
+			con:reply(req, { sims = {
+				{
+					bus = MODEM_BUS,
+					slot = '1',
+					type = 0,
+					status = sim_status,
+					pin_counter = pin_counter,
+					carrier = operator,
+					apn = configured_apn(),
+					iccid = iccid_value,
+					technology = technology,
+					strength = strength,
+				},
+			} })
+		end
+	},
+
+	networks_info = {
+		function(req, msg, con)
+			local cell = serving_cell_snapshot()
+			local status = wwan_status()
+			local status4 = interface_status('wwan_4')
+			local status6 = interface_status('wwan_6')
+			local ipv4 = status4 and status4['ipv4-address'] and status4['ipv4-address'][1]
+			local route = status4 and status4.route and status4.route[1]
+			-- The card's detail drawer only renders the top-level
+			-- cell_info fields. For NSA, present the NR secondary cell
+			-- there and retain the LTE cell under lte_anchor; otherwise
+			-- the drawer misleadingly labels a 5G session with LTE band 7.
+			if cell and cell.nr then
+				local anchor = {
+					band = cell.band, cell_id = cell.cell_id,
+					ul_bandwidth = cell.ul_bandwidth,
+					dl_bandwidth = cell.dl_bandwidth,
+					rsrp = cell.rsrp, rsrq = cell.rsrq,
+					rssi = cell.rssi, sinr = cell.sinr,
+				}
+				cell.band = cell.nr.band
+				cell.cell_id = cell.nr.cell_id
+				cell.rsrp = cell.nr.rsrp
+				cell.rsrq = cell.nr.rsrq
+				cell.sinr = cell.nr.sinr
+				cell.rssi = nil
+				cell.ul_bandwidth = nil
+				cell.dl_bandwidth = cell.nr.dl_bandwidth
+				cell.lte_anchor = anchor
+			end
+			add_signal_levels(cell)
+			con:reply(req, { networks = {
+				{
+					bus = MODEM_BUS,
+					slot = '1',
+					network_mode = (current_config('network', 'wwan', 'modes') or 'AUTO'):upper(),
+					ipv4 = {
+						ip = ipv4 and ipv4.address,
+						gateway = route and route.nexthop,
+						dns = as_array(status4 and status4['dns-server'] or {}),
+					},
+					ipv6 = {
+						ip = status6 and status6['ipv6-address']
+							and status6['ipv6-address'][1]
+							and status6['ipv6-address'][1].address,
+						dns = as_array(status6 and status6['dns-server'] or {}),
+					},
+					traffic_total = tostring(traffic_total()),
+					cell_info = cell or {},
+				},
+			} })
+		end
+	},
+
+	networks_status = {
+		function(req, msg, con)
+			local cell = serving_cell_snapshot()
+			local status = wwan_status()
+			local status4 = interface_status('wwan_4')
+			local status6 = interface_status('wwan_6')
+			cell = cell or {}
+			local signal = cell.nr or cell
+			local connected = status and status.up == true
+				and ((status4 and status4.up == true) or (status6 and status6.up == true))
+			local desired = current_config('gl-cellular', 'state', 'dial_enabled') ~= '0'
+			local connection_status
+			if connected then
+				connection_status = 0 -- CONNECTED
+			elseif desired and status and status.pending then
+				connection_status = 1 -- CONNECTING
+			elseif desired then
+				connection_status = 3 -- CONNECTION_FAILED
+			else
+				connection_status = 2 -- DISCONNECTED
+			end
+			con:reply(req, { networks = {
+				{
+					bus = MODEM_BUS,
+					slot = '1',
+					status = connection_status,
+					-- dial_status=0 means a dial session is desired/active
+					-- in the GL UI.  Keeping this separate from the current
+					-- connection state enables Connecting/Failed warnings
+					-- and makes a deliberate Disconnect show Connect.
+					dial_status = desired and 0 or 1,
+					rsrp = signal.rsrp,
+					rsrq = signal.rsrq,
+					rssi = signal.rssi,
+					sinr = signal.sinr,
+					nr = cell.nr,
+					traffic_total = tostring(traffic_total()),
+				},
+			} })
+		end
+	},
+
+	signals_history = {
+		function(req, msg, con)
+			local seconds = tonumber(msg.time) or 180
+			local cutoff = os.time() - math.max(1, seconds)
+			local samples = {}
+			for _, sample in ipairs(signal_history) do
+				if sample.timestamp >= cutoff then table.insert(samples, sample) end
+			end
+			con:reply(req, {
+				level = SIGNAL_LEVELS,
+				signals = as_array(samples),
+			})
+		end, { time = ubus.INT32 }
+	},
+}
+
+local handle, open_err = open_port()
+if not handle then
+	log.err('gl-cellular-atd: failed to open ' .. dev .. ': ' .. tostring(open_err))
+	os.exit(1)
+end
+f = handle
+
+local con, err = ubus.connect(nil, true)
+if not con then
+	error('gl-cellular-atd: ubus connect failed: ' .. tostring(err))
+end
+
+local obj, add_err = con:add('cellular.at', methods)
+if not obj then
+	error('gl-cellular-atd: ubus add failed: ' .. tostring(add_err))
+end
+
+local cellular_obj, cellular_add_err = con:add('cellular', cellular_methods)
+if not cellular_obj then
+	error('gl-cellular-atd: ubus add (cellular) failed: ' .. tostring(cellular_add_err))
+end
+
+eco.run(traffic_loop)
+eco.run(signal_loop)
+
+log.info('gl-cellular-atd started on ' .. dev .. ' @ ' .. tostring(baudrate))

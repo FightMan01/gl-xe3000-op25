@@ -1,0 +1,26 @@
+From: GL-XE3000 OpenWrt port
+Subject: [PATCH] arm64: dts: mediatek: disable PCIe port PM for X3000/XE3000
+
+The RM520N-GL firmware in the GL-XE3000 does not survive the PCIe root
+port entering D3hot while MHI is starting.  Disable PCIe port runtime
+power management from the kernel command line so the setting is active
+before the modem driver probes.  Applying a sysfs override later races
+with initialization and can leave the host in an AER recovery loop.
+
+--- a/target/linux/mediatek/dts/mt7981a-glinet-gl-x3000-xe3000-common.dtsi
++++ b/target/linux/mediatek/dts/mt7981a-glinet-gl-x3000-xe3000-common.dtsi
+@@ -8,7 +8,13 @@
+ 
+ / {
+ 	chosen {
+-		bootargs = "console=ttyS0,115200n8 root=PARTLABEL=rootfs rootwait";
++		/*
++		 * The RM520N-GL firmware crashes if PCIe port runtime PM puts
++		 * the link into D3hot while MHI is starting.  Disable port PM
++		 * before the modem driver probes; a later sysfs override races
++		 * with initialization and can leave the host in an AER loop.
++		 */
++		bootargs = "console=ttyS0,115200n8 root=PARTLABEL=rootfs rootwait pcie_port_pm=off";
+ 	};
+ 
+ 	aliases {

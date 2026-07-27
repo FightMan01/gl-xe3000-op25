@@ -1,0 +1,23 @@
+#!/bin/sh
+# Add the cellular WAN to the existing "wan" firewall zone (NAT/masquerade),
+# rather than creating a separate zone - simplest correct behavior for a
+# single-active-SIM device where cellular is just another WAN path.
+
+. /lib/functions.sh
+
+zone_section=""
+config_cb() {
+	if [ "$1" = "zone" ]; then
+		local name
+		config_get name "$2" name
+		[ "$name" = "wan" ] && zone_section="$2"
+	fi
+}
+config_load firewall
+
+if [ -n "$zone_section" ]; then
+	uci -q add_list firewall."$zone_section".network='wwan'
+	uci -q commit firewall
+fi
+
+exit 0

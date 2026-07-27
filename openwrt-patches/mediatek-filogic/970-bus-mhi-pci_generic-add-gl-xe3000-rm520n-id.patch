@@ -1,0 +1,25 @@
+From: GL-XE3000 OpenWrt port
+Subject: [PATCH] bus: mhi: host: pci_generic: add GL-XE3000 RM520N ID
+
+The RM520N-GL fitted to the GL-XE3000 exposes the Qualcomm SDX65
+vendor/device ID together with Qualcomm subsystem IDs 17cb:5201.
+Select the Quectel RM5xx channel layout for this variant so the MBIM
+data channel is exposed as IP_HW0_MBIM.
+
+This match must be used together with pcie_port_pm=off on the
+GL-X3000/XE3000 platform.  The modem firmware does not survive the
+root port entering D3hot during MHI startup.
+
+--- a/drivers/bus/mhi/host/pci_generic.c
++++ b/drivers/bus/mhi/host/pci_generic.c
+@@ -913,6 +913,10 @@ static const struct pci_device_id mhi_pc
+ 		.driver_data = (kernel_ulong_t) &mhi_telit_fn980_hw_v1_info },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_QCOM, 0x0306),
+ 		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx55_info },
++	/* RM520N-GL variant with Qualcomm vendor and subsystem IDs */
++	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0308,
++			 PCI_VENDOR_ID_QCOM, 0x5201),
++		.driver_data = (kernel_ulong_t) &mhi_quectel_rm5xx_info },
+ 	/* Telit FN990 */
+ 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0308, 0x1c5d, 0x2010),
+ 		.driver_data = (kernel_ulong_t) &mhi_telit_fn990_info },

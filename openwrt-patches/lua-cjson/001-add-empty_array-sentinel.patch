@@ -1,0 +1,71 @@
+From: GL-XE3000 OpenWrt port <noreply@localhost>
+Date: Thu, 23 Jul 2026 17:00:00 +0200
+Subject: [PATCH] add cjson.empty_array sentinel for forcing [] over {}
+
+This vendored lua-cjson (upstream Mark Pulford 2.1.0, not the OpenResty
+fork) has no way to encode a genuinely empty Lua table as JSON "[]" -
+lua_array_length() returns 0 for `{}` (no non-integer keys were found,
+so it's not rejected as an object, but there's nothing to report either),
+and json_append_data()'s `if (len > 0)` check treats 0 the same as "not
+an array", always falling through to json_append_object() and emitting
+"{}".
+
+This is a real, live bug in the GL-XE3000 OpenWrt port project: any RPC
+handler returning an empty array-typed field (e.g. an empty client list)
+serializes it as a JSON object, and the vendored GL frontend - unmodified,
+calling plain Array methods like `.map()` on it - throws
+"TypeError: e.map is not a function" and silently breaks the page.
+Confirmed via live browser console errors while zero clients were
+connected.
+
+Fix: add `cjson.empty_array`, a single distinguished empty table stored
+in the Lua registry. json_append_data() checks table identity against it
+before running the normal array-length heuristic; on a match it emits
+"[]" directly regardless of content. This is purely additive - every
+other table (including every other empty `{}`) encodes exactly as
+before. Lua code opts in explicitly per call site by returning
+`cjson.empty_array` instead of `{}` where it means "empty array", the
+same explicit-opt-in shape OpenResty's own cjson fork uses for its
+`array_mt`/`empty_array` mechanism (this just doesn't need a metatable
+check since a plain reference-equality check is enough for one sentinel
+value).
+
+--- a/lua_cjson.c
++++ b/lua_cjson.c
+@@ -674,6 +674,14 @@ static void json_append_data(lua_State *l, json_config_t *cfg,
+             strbuf_append_mem(json, "false", 5);
+         break;
+     case LUA_TTABLE:
++        /* GL SDK4 port: cjson.empty_array sentinel, forces "[]" */
++        lua_getfield(l, LUA_REGISTRYINDEX, "cjson.empty_array");
++        if (lua_rawequal(l, -1, -2)) {
++            lua_pop(l, 1);
++            strbuf_append_mem(json, "[]", 2);
++            break;
++        }
++        lua_pop(l, 1);
+         current_depth++;
+         json_check_encode_depth(l, cfg, current_depth, json);
+         len = lua_array_length(l, cfg, json);
+@@ -1371,6 +1379,21 @@ static int lua_cjson_new(lua_State *l)
+     /* Set cjson.null */
+     lua_pushlightuserdata(l, NULL);
+     lua_setfield(l, -2, "null");
++
++    /* GL SDK4 port: cjson.empty_array, see json_append_data */
++    /*
++     * cjson and cjson.safe each call lua_cjson_new().  Reuse one registry
++     * sentinel instead of replacing it on the second module load, otherwise
++     * the first module's exported table stops comparing equal.
++     */
++    lua_getfield(l, LUA_REGISTRYINDEX, "cjson.empty_array");
++    if (lua_isnil(l, -1)) {
++        lua_pop(l, 1);
++        lua_newtable(l);
++        lua_pushvalue(l, -1);
++        lua_setfield(l, LUA_REGISTRYINDEX, "cjson.empty_array");
++    }
++    lua_setfield(l, -2, "empty_array");
+ 
+     /* Set module name / version fields */
+     lua_pushliteral(l, CJSON_MODNAME);

@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# Brand a freshly-installed XE3000 like GL's own firmware instead of
+# leaving OpenWrt's generic hostname. Preserve any hostname the user has
+# already chosen on an upgrade.
+hostname="$(uci -q get system.@system[0].hostname)"
+if [ -z "$hostname" ] || [ "$hostname" = "OpenWrt" ]; then
+	uci -q set system.@system[0].hostname='GL-XE3000'
+	uci -q commit system
+fi
+
+exit 0

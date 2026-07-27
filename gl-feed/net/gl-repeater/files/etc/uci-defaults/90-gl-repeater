@@ -1,0 +1,36 @@
+#!/bin/sh
+# Seed the repeater uplink interface: a STA (client) wifi-iface bridging to
+# its own logical network, double-NAT'd through the "wan" firewall zone
+# (same pattern as the cellular WAN, /etc/uci-defaults/91-gl-cellular-
+# firewall) - NOT bridged into "lan". This is deliberate: WDS/4addr
+# repeating (GL's original gl-sdk4-repeater-v2/gl-repeater.ko approach)
+# requires the upstream AP to also support WDS, which enterprise networks
+# like eduroam never do. STA-uplink + double-NAT works against any
+# upstream AP, including WPA2/3-Enterprise ones (wpad-full, eduroam
+# support).
+
+if [ -z "$(uci -q get network.repeater)" ]; then
+	uci -q batch <<-EOF
+		set network.repeater=interface
+		set network.repeater.proto='dhcp'
+		set network.repeater.metric='10'
+	EOF
+	uci -q commit network
+fi
+
+zone_section=""
+config_cb() {
+	if [ "$1" = "zone" ]; then
+		local name
+		config_get name "$2" name
+		[ "$name" = "wan" ] && zone_section="$2"
+	fi
+}
+. /lib/functions.sh
+config_load firewall
+if [ -n "$zone_section" ]; then
+	uci -q add_list firewall."$zone_section".network='repeater'
+	uci -q commit firewall
+fi
+
+exit 0

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Set the LAN IP to GL's real default of 192.168.8.1.
+#
+# mainline's board.d/02_network for glinet,gl-xe3000 only calls
+# `ucidef_set_interfaces_lan_wan eth1 eth0` with no ipaddr override, so
+# stock config_generate's hardcoded lan fallback ("192.168.1.1") is what
+# actually lands in /etc/config/network on first boot.
+
+[ "$(uci -q get network.lan.ipaddr)" = "192.168.8.1/24" ] && exit 0
+
+# config_generate stores the default LAN address as `add_list
+# network.lan.ipaddr='192.168.1.1/24'` - a list option, in CIDR form. A
+# plain `uci set network.lan.ipaddr='192.168.8.1'` (no /24, collapsing
+# the list to a scalar) leaves netifd with no prefix length to infer
+# from, so it defaults br-lan to a /32 host route - the kernel then
+# treats 192.168.8.0/24 as not locally attached at all, and dnsmasq
+# refuses to serve DHCP or even answer already-leased clients. Matching
+# config_generate's own list+CIDR format avoids that.
+uci -q delete network.lan.ipaddr
+uci -q add_list network.lan.ipaddr='192.168.8.1/24'
+uci -q commit network
+
+exit 0

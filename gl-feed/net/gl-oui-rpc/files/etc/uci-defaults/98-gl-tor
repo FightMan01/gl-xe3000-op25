@@ -1,0 +1,13 @@
+#!/bin/sh
+
+uci -q batch <<'EOF'
+set gl-tor.main=settings
+set gl-tor.main.enabled='0'
+set gl-tor.main.manual='0'
+commit gl-tor
+EOF
+
+/etc/init.d/tor disable >/dev/null 2>&1
+/etc/init.d/tor stop >/dev/null 2>&1
+
+exit 0

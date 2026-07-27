@@ -1,0 +1,44 @@
+#!/bin/sh
+# Cellular WAN interface - native PCIe/MHI data path (the modem's
+# full-speed PCIe link, not the USB/QMI fallback).
+#
+# The modem enumerates on PCIe as vendor 0x17cb (PCI_VENDOR_ID_QCOM)
+# device 0x0308. GL's own firmware binds it with an out-of-tree "pcie_mhi"
+# vendor driver, not available on mainline - but mainline Linux's own
+# in-tree drivers/bus/mhi/host/pci_generic.c driver already has this exact
+# PCI ID in its table (matched as "qcom-sdx65m" / mhi_qcom_sdx65_info), so
+# no driver patching is needed, just enabling the already-buildable,
+# off-by-default kmod-mhi-bus/kmod-mhi-pci-generic/kmod-mhi-wwan-ctrl/
+# kmod-mhi-wwan-mbim/kmod-wwan packages (see gl-cellular's Makefile
+# DEPENDS) and mainline's in-tree `mbim` netifd proto (package umbim).
+#
+# The SDX65 MHI channel config exposes both MBIM (ch 12/13) and QMI
+# (ch 14/15) control channels; MBIM was chosen over QMI-over-QRTR since
+# umbim/mbim.sh is a simpler, already fully in-tree path (QMI-over-MHI
+# needs the qrtr-mhi kmod plus a QRTR-capable QMI client, which OpenWrt
+# doesn't currently package). AT-command access for the richer signal/SIM
+# data (gl-cellular-atd) is unaffected by any of this - it's a separate,
+# parallel USB composition (ttyUSB0-3, the standard mainline "option"
+# driver) that exists independently of which path carries the data
+# connection.
+#
+# Device path /dev/wwan0mbim0 matches mainline's own documented convention
+# for this MHI+MBIM combination (see the comment in umbim's own mbim.sh
+# proto script). Since this is a fixed PCIe device (not USB, no
+# enumeration-order ambiguity), no hotplug-based device detection is
+# needed the way the AT port required.
+
+[ -n "$(uci -q get network.wwan)" ] && exit 0
+
+uci -q batch <<-EOF
+	set network.wwan=interface
+	set network.wwan.proto='mbim'
+	set network.wwan.device='/dev/wwan0mbim0'
+	set network.wwan.apn='internet'
+	set network.wwan.pdptype='ipv4v6'
+	set network.wwan.auto='1'
+	set network.wwan.metric='20'
+EOF
+uci -q commit network
+
+exit 0

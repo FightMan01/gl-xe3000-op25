@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# The GL Network Storage page enumerates mounted filesystems below /mnt.
+# Enable OpenWrt's safe anonymous removable-media automount behavior so USB
+# partitions appear there immediately after insertion.
+if [ -f /etc/config/fstab ]; then
+	uci -q set fstab.@global[0].auto_mount='1'
+	uci -q set fstab.@global[0].anon_mount='1'
+	uci -q set fstab.@global[0].check_fs='0'
+	uci -q commit fstab
+fi
+
+/etc/init.d/fstab enable >/dev/null 2>&1
+
+exit 0

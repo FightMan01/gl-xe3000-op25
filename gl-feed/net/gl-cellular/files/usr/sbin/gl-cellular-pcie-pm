@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# Keep the built-in RM520N-GL PCIe function out of runtime autosuspend.
+#
+# This modem remains fully functional with PCIe ASPM in performance mode,
+# but its function-level runtime PM repeatedly enters/exits D3 every ten
+# seconds.  Besides flooding dmesg with PCI config save/restore messages,
+# that churn needlessly resets MHI bus mastering.  Match all four IDs so
+# this never changes power policy for an unrelated PCIe device.
+
+for dev in /sys/bus/pci/devices/*; do
+	[ -r "$dev/vendor" ] || continue
+	[ "$(cat "$dev/vendor")" = "0x17cb" ] || continue
+	[ "$(cat "$dev/device")" = "0x0308" ] || continue
+	[ "$(cat "$dev/subsystem_vendor")" = "0x17cb" ] || continue
+	[ "$(cat "$dev/subsystem_device")" = "0x5201" ] || continue
+	[ -w "$dev/power/control" ] && echo on > "$dev/power/control"
+done
+
+exit 0

@@ -1,0 +1,41 @@
+# This section must be explicitly named 'main' (not anonymous) - ui.lua's
+# set_lang/set_inited_internet/init and gl-ngx-session's own get_config()
+# all address it by the literal name "main"
+# (cursor:get('gl-oui-rpc','main',opt)), which in UCI means "the section
+# named main", not "a section of type main". Left anonymous, this section
+# is only addressable as @main[0], and set_lang/init/etc would create a
+# separate "main"-named section that never merges with it.
+config main 'main'
+	# 0: no security rule, 1: generic security rule
+	option security_rule '1'
+	option max_login_fail '10'
+	option login_fail_wait '600'
+	option session_timeout '300'
+
+# Methods callable before login, on an ALREADY-INITIALIZED device (i.e.
+# while the login form itself is showing) - object/method pairs only.
+# Separate from, and narrower than, the uninitialized-device bypass in
+# oui-rpc.lua's rpc_call (root_password_is_set() check) that gives the
+# setup wizard full access before any password exists at all. This list
+# only matters once a real password is set and the normal login page is
+# what's showing.
+#
+# ui.get_menu_list and system.get_info are the two methods the login
+# page's own bundle references (model/hostname/branding shown alongside
+# the login form). ui.get_lang, load_locales, get_wifi_config_init, init,
+# check_initialized, and get_timezone_list are also called pre-login
+# (sid=""), from the un-authenticated first-boot wizard.
+config no_auth 'ui'
+	list method 'get_menu_list'
+	list method 'get_lang'
+	list method 'load_locales'
+	list method 'get_wifi_config_init'
+	list method 'init'
+	list method 'check_initialized'
+
+config no_auth 'screen'
+	list method 'get_lock_status'
+
+config no_auth 'system'
+	list method 'get_info'
+	list method 'get_timezone_list'

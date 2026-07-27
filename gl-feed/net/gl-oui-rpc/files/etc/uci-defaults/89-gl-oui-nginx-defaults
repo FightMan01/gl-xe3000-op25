@@ -1,0 +1,24 @@
+#!/bin/sh
+# Remove the nginx package's own default UCI server sections
+# ("_lan" self-signed HTTPS on :443, "_redirect2ssl" HTTP->HTTPS redirect
+# on :80).
+#
+# nginx's own init script runs `nginx -t` before every start and exits on
+# any config-test failure - the whole daemon then never starts, taking
+# down our own conf.d/gl-oui.conf server block on :80 along with whatever
+# failed. The stock default /etc/config/nginx defines a "_lan" server
+# that references a self-signed cert pair generated at boot by
+# `nginx-util init_lan` - any hiccup in that generation step is enough to
+# take the entire GUI offline.
+#
+# This port doesn't need any of that: conf.d/gl-oui.conf already serves
+# everything plainly on :80 (no forced HTTPS/redirect), so removing these
+# two sections avoids that fragility entirely.
+
+[ -n "$(uci -q get nginx._lan)" ] || exit 0
+
+uci -q delete nginx._lan
+uci -q delete nginx._redirect2ssl
+uci -q commit nginx
+
+exit 0

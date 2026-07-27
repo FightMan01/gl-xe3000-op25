@@ -1,0 +1,4 @@
+config settings 'settings'
+	option auto '1'
+	option lock_band ''
+

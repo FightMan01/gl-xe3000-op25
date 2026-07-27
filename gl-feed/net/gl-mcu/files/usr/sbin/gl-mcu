@@ -1,0 +1,418 @@
+#!/usr/bin/env eco
+
+-- gl-mcu: battery/MCU controller daemon, reimplemented for the OpenWrt
+-- 25.12 port of the GL-XE3000.
+--
+-- This device has a discrete MCU chip over UART, /dev/ttyS1 @ 9600 baud
+-- (not the I2C cw2217 battery-gauge path some other GL products use).
+--
+-- Wire protocol: router->MCU messages are JSON, then run through a
+-- byte-substitution transform (format_message below, a clean-room Lua
+-- reimplementation of GL's documented wire format - a real hardware
+-- protocol that must be matched exactly, not redesigned). MCU->router
+-- responses are plain JSON, or a "{OK},<capacity>,<temp>,<chg_state>,
+-- <cycles>" CSV-ish line.
+--
+-- Registers ubus object "mcu" matching GL's own method surface.
+--
+-- TODO, not yet verified against a UART capture on real hardware:
+--   - The exact request command sent to poll status - poll() below sends
+--     {"mcu_status":"1"} based on GL's get_serial_data/uart_write
+--     functions, but this is the best available evidence, not a captured
+--     exact command.
+--   - Message framing/terminator between MCU responses (assumed
+--     newline-terminated below).
+
+local eco = require 'eco'
+local termios = require 'eco.termios'
+local file = require 'eco.file'
+local time = require 'eco.time'
+local ubus = require 'eco.ubus'
+local uci = require 'eco.uci'
+local log = require 'eco.log'
+local cjson = require 'cjson'
+
+local cursor = uci.cursor()
+local dev = cursor:get('mcu', 'global', 'dev') or '/dev/ttyS1'
+local baudrate = tonumber(cursor:get('mcu', 'global', 'baudrate') or '9600')
+local poll_interval = tonumber(cursor:get('mcu', 'global', 'poll_interval') or '5')
+
+-- speed constant lookup, e.g. 9600 -> termios.B9600
+local speed_const = termios['B' .. tostring(baudrate)]
+if not speed_const then
+	error('gl-mcu: unsupported baud rate ' .. tostring(baudrate))
+end
+
+-- ubus state, matching `ubus call mcu status`'s shape:
+--   { fastcharge, charge_cnt, temperature, abnormal, charging_status,
+--     charge_percent, abnormal_type }
+local state = {
+	fastcharge = 0,
+	charge_cnt = 0,
+	temperature = 0,
+	abnormal = false,
+	charging_status = 0,
+	charge_percent = 0,
+	abnormal_type = 0,
+}
+
+--- Router->MCU byte-substitution transform, a clean-room Lua
+--- reimplementation of GL's documented wire format:
+---   1. In each string value: swap literal " : \ / for control bytes 4 3 2 1
+---   2. JSON-encode the resulting table
+---   3. Structural '{'/'}' bytes: subtract 100
+---   4. Escaped-quote bytes (\" produced by step 2 re-escaping the step-1
+---      control byte 0x04): subtract 30
+---   5. Structural ':' becomes ': ' (two chars)
+---   6. The JSON string-escape sequences .. (produced by step 2
+---      encoding the step-1 control bytes) are turned back into the literal
+---      / \ : " characters
+local function format_message(t)
+	local buf = {}
+	for k, v in pairs(t) do
+		if type(v) == 'string' then
+			v = v:gsub('"', string.char(4))
+			v = v:gsub(':', string.char(3))
+			v = v:gsub('\\', string.char(2))
+			v = v:gsub('/', string.char(1))
+		end
+		buf[k] = v
+	end
+
+	local msg = cjson.encode(buf)
+	local len = #msg - 1
+	local out = {}
+	local j = 2
+	out[1] = msg:sub(1, 1)
+
+	for i = 2, len do
+		local c = msg:sub(i, i)
+		if c == '{' or c == '}' then
+			out[j] = string.char(c:byte() - 100)
+		elseif c == '"' and msg:sub(i - 1, i - 1) == '\\' and msg:sub(i + 1, i + 1) ~= ' ' then
+			out[j] = string.char(c:byte() - 30)
+		elseif c == ':' then
+			out[j] = ': '
+		else
+			out[j] = c
+		end
+		j = j + 1
+	end
+	out[j] = '}'
+
+	msg = table.concat(out)
+	msg = msg:gsub('\\u0004', string.char(4))
+	msg = msg:gsub('\\u0003', ':')
+	msg = msg:gsub('\\u0002', '\\')
+	msg = msg:gsub('\\u0001', '/')
+	return msg
+end
+
+local serial_fd = nil
+local reader = nil
+
+local function open_serial()
+	local f, err = file.open(dev, file.O_RDWR)
+	if not f then
+		return nil, err
+	end
+
+	local attr, gerr = termios.tcgetattr(f.fd)
+	if not attr then
+		f:close()
+		return nil, gerr
+	end
+
+	attr:clr_flag('l', termios.ECHO)
+	attr:clr_flag('l', termios.ICANON)
+	attr:clr_flag('l', termios.ECHOE)
+	attr:clr_flag('l', termios.ISIG)
+	attr:set_cc(termios.VMIN, 0)
+	attr:set_cc(termios.VTIME, 5) -- 0.5s, matches GL's documented setting
+	attr:set_speed(speed_const)
+
+	local ok, serr = termios.tcsetattr(f.fd, termios.TCSANOW, attr)
+	if not ok then
+		f:close()
+		return nil, serr
+	end
+
+	return f
+end
+
+local function uart_write(t)
+	if not serial_fd then
+		return false, 'serial not open'
+	end
+	local msg = format_message(t)
+	return serial_fd:write(msg .. '\n')
+end
+
+-- Stock XE3000 status/version requests are sent as literal JSON with no
+-- terminator and without format_message().  The transform is used only for
+-- the richer router->MCU notification tables.
+local function uart_write_raw(msg)
+	if not serial_fd then
+		return false, 'serial not open'
+	end
+	return serial_fd:write(msg)
+end
+
+-- Applies incoming MCU state fields onto `state`, only overwriting known keys.
+local function apply_state(fields)
+	for k, v in pairs(fields) do
+		if state[k] ~= nil then
+			state[k] = v
+		end
+	end
+end
+
+local function handle_data(line)
+	local capacity, temp, chg, cycles = line:match('{OK},(%d+),(%-?[%d%.]+),(%d+),*(%d*)')
+	if capacity then
+		apply_state({
+			charge_percent = tonumber(capacity),
+			-- Same lua-eco unsigned-encoding issue as gl-cellular-atd's
+			-- rsrp/rsrq/rssi fix: math.floor() always returns an integer,
+			-- so a sub-zero temperature would wrap around too. + 0.0
+			-- forces a float, routing through the correctly-signed
+			-- blobmsg_add_double() path instead.
+			temperature = math.floor(tonumber(temp) or 0) + 0.0,
+			charging_status = tonumber(chg) or 0,
+			charge_cnt = tonumber(cycles) or state.charge_cnt,
+		})
+		return
+	end
+
+	local ok, decoded = pcall(cjson.decode, line)
+	if ok and type(decoded) == 'table' then
+		apply_state({
+			temperature = tonumber(decoded.temp or decoded.temperature),
+			charge_percent = tonumber(decoded.capacity or decoded.charge_percent),
+			charging_status = tonumber(decoded.chg_state or decoded.charging_status),
+			charge_cnt = tonumber(decoded.charge_cycle or decoded.charge_cnt),
+			fastcharge = tonumber(decoded.fastcharge),
+			abnormal = decoded.code == 1 or decoded.abnormal == true,
+			abnormal_type = tonumber(decoded.abnormal_type),
+		})
+	else
+		log.debug('gl-mcu: unrecognized data from MCU: ' .. line)
+	end
+end
+
+local receive_buffer = ''
+
+local function handle_chunk(chunk)
+	receive_buffer = receive_buffer .. chunk
+	-- eco.reader may return only a few UART bytes per read.  Reassemble a
+	-- complete JSON object before decoding it; the MCU currently delivers
+	-- its 70-byte status response as a series of six-byte fragments.
+	while true do
+		local start_pos = receive_buffer:find('{', 1, true)
+		if not start_pos then
+			receive_buffer = ''
+			return
+		end
+		if start_pos > 1 then
+			receive_buffer = receive_buffer:sub(start_pos)
+		end
+
+		-- The legacy CSV response begins with {OK} and continues outside
+		-- the braces.  It is not used by the current XE3000 MCU firmware,
+		-- but retain support once a complete cycle-count field is present.
+		if receive_buffer:sub(1, 5) == '{OK},' then
+			local complete = receive_buffer:match('^({OK},%d+,%-?[%d%.]+,%d+,%d+)')
+			if not complete then return end
+			handle_data(complete)
+			receive_buffer = receive_buffer:sub(#complete + 1)
+		else
+			local complete = receive_buffer:match('^(%b{})')
+			if not complete then return end
+			handle_data(complete)
+			receive_buffer = receive_buffer:sub(#complete + 1)
+		end
+	end
+end
+
+local function read_loop()
+	while true do
+		if not reader then
+			time.sleep(1)
+		else
+			-- MCU replies are not newline framed. Match the stock daemon's
+			-- bufio 1024-byte reads and treat timeout as end-of-message.
+			local data, err = reader:read(1024, 1)
+			if data then
+				handle_chunk(data)
+			elseif err and err ~= 'timeout' then
+				log.err('gl-mcu: serial read error: ' .. tostring(err))
+				time.sleep(1)
+			end
+		end
+	end
+end
+
+local function poll_loop()
+	while true do
+		uart_write_raw('{"mcu_status": "1"}')
+		time.sleep(poll_interval)
+	end
+end
+
+local methods = {
+	status = {
+		function(req, msg, con)
+			con:reply(req, state)
+		end
+	},
+
+	version = {
+		function(req, msg, con)
+			con:reply(req, { version = '1' })
+		end
+	},
+
+	reload = {
+		function(req, msg, con)
+			con:reply(req, {})
+		end
+	},
+
+	get_warning = {
+		function(req, msg, con)
+			local out = {}
+			cursor:foreach('mcu', 'warning', function(s)
+				out[s['.name']] = {
+					enable = s.enable == '1',
+					interval = tonumber(s.interval),
+					value = tonumber(s.value),
+				}
+			end)
+			con:reply(req, out)
+		end
+	},
+
+	set_warning = {
+		function(req, msg, con)
+			for _, name in ipairs({ 'temp_high', 'temp_low', 'capacity' }) do
+				local w = msg[name]
+				if type(w) == 'table' then
+					if w.enable ~= nil then
+						cursor:set('mcu', name, 'enable', w.enable and '1' or '0')
+					end
+					if w.interval ~= nil then
+						cursor:set('mcu', name, 'interval', tostring(w.interval))
+					end
+					if w.value ~= nil then
+						cursor:set('mcu', name, 'value', tostring(w.value))
+					end
+				end
+			end
+			cursor:commit('mcu')
+			con:reply(req, {})
+		end, { temp_high = ubus.TABLE, temp_low = ubus.TABLE, capacity = ubus.TABLE }
+	},
+
+	reset_button = {
+		function(req, msg, con)
+			uart_write({ reset_button = '1' })
+			con:reply(req, {})
+		end
+	},
+
+	system_reboot = {
+		function(req, msg, con)
+			uart_write({ system_reboot = '1' })
+			con:reply(req, {})
+		end
+	},
+
+	system_update = {
+		function(req, msg, con)
+			con:reply(req, ubus.STATUS_NOT_SUPPORTED)
+		end
+	},
+
+	system_reft = {
+		function(req, msg, con)
+			-- factory reset notification to MCU
+			uart_write({ system_reft = '1' })
+			con:reply(req, {})
+		end
+	},
+
+	system_renw = {
+		function(req, msg, con)
+			uart_write({ system_renw = '1' })
+			con:reply(req, {})
+		end
+	},
+
+	set_product_flag = {
+		function(req, msg, con)
+			con:reply(req, {})
+		end
+	},
+
+	send_custom_msg = {
+		function(req, msg, con)
+			if type(msg.data) == 'table' then
+				uart_write(msg.data)
+			end
+			con:reply(req, {})
+		end, { data = ubus.TABLE }
+	},
+
+	cmd_json = {
+		function(req, msg, con)
+			local ok, decoded = pcall(cjson.decode, msg.cmd)
+			if ok and type(decoded) == 'table' then
+				uart_write(decoded)
+				con:reply(req, {})
+			else
+				con:reply(req, ubus.STATUS_INVALID_ARGUMENT)
+			end
+		end, { cmd = ubus.STRING }
+	},
+
+	cmd_string = {
+		function(req, msg, con)
+			if serial_fd then
+				serial_fd:write(msg.cmd)
+			end
+			con:reply(req, {})
+		end, { cmd = ubus.STRING }
+	},
+
+	update_battery_state = {
+		function(req, msg, con)
+			uart_write_raw('{"mcu_status": "1"}')
+			con:reply(req, {})
+		end
+	},
+}
+
+local f, open_err = open_serial()
+if not f then
+	log.err('gl-mcu: failed to open ' .. dev .. ': ' .. tostring(open_err))
+	os.exit(1)
+end
+-- eco.file's file object supports both :read() and :write() directly, no
+-- separate reader/writer wrapping needed.
+serial_fd = f
+reader = eco.reader(f.fd)
+
+local con, err = ubus.connect(nil, true)
+if not con then
+	error('gl-mcu: ubus connect failed: ' .. tostring(err))
+end
+
+local obj, add_err = con:add('mcu', methods)
+if not obj then
+	error('gl-mcu: ubus add failed: ' .. tostring(add_err))
+end
+
+eco.run(read_loop)
+eco.run(poll_loop)
+
+log.info('gl-mcu started on ' .. dev .. ' @ ' .. tostring(baudrate))

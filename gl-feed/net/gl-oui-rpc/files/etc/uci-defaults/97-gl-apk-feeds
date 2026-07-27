@@ -1,0 +1,9 @@
+#!/bin/sh
+# gl_feed is a local image-builder feed, not a repository published by
+# downloads.openwrt.org. OpenWrt's generated distfeeds file nevertheless
+# includes it when this firmware is built, making every `apk update` finish
+# with one HTTP error. The custom GL packages are already installed in the
+# image; omit only that nonexistent remote line.
+
+sed -i '\|/gl_feed/packages\.adb$|d' /etc/apk/repositories.d/distfeeds.list
+exit 0

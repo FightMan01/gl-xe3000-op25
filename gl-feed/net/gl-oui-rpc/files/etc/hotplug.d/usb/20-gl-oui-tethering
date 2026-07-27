@@ -1,0 +1,21 @@
+#!/bin/sh
+# Bind the "tethering" logical interface to whatever USB network device just
+# appeared (Android RNDIS via kmod-usb-net-rndis, iPhone via
+# kmod-usb-net-ipheth+usbmuxd) and bring it up, if tethering is enabled.
+#
+# This is deliberately simple: the first usbN device to hotplug wins.
+# Multi-device arbitration, if ever needed, is follow-up work.
+
+[ "$ACTION" = "add" ] || exit 0
+[ "$(uci -q get network.tethering.auto)" = "0" ] && exit 0
+
+# net subsystem hotplug gives us $INTERFACE directly for net devices.
+[ -n "$INTERFACE" ] || exit 0
+
+case "$INTERFACE" in
+	usb*|rndis*|eth[1-9])
+		uci -q set network.tethering.device="$INTERFACE"
+		uci -q commit network
+		ifup tethering >/dev/null 2>&1
+		;;
+esac

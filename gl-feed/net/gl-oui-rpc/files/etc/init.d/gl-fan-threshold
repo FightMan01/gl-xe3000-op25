@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+
+START=19
+
+start() {
+	local temperature
+	temperature="$(uci -q get gl-oui-rpc.fan.temperature)"
+	case "$temperature" in
+		6[9]|7[0-9]|8[0-9]|9[01])
+			echo $((temperature * 1000)) > \
+				/sys/class/thermal/thermal_zone0/trip_point_3_temp 2>/dev/null
+			;;
+	esac
+}

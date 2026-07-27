@@ -1,0 +1,57 @@
+From: GL-XE3000 OpenWrt port
+Subject: [PATCH] umbim: resolve MBIM data interface on PCIe/MHI
+
+USB MBIM exposes the control port and network interface below the same
+device. PCIe/MHI exposes the control port below mhiN/wwan/wwanN while the
+associated data interface lives on a sibling IP_HW0 channel. Fall back to
+the MHI data channel when the conventional per-device net directory is
+absent.
+
+--- a/package/network/utils/umbim/files/lib/netifd/proto/mbim.sh
++++ b/package/network/utils/umbim/files/lib/netifd/proto/mbim.sh
+@@ -98,7 +98,31 @@ _proto_mbim_setup() {
+ 
+ 	devname="$(basename "$device")"
+ 	devpath="$(readlink -f /sys/class/usbmisc/$devname/device/ || readlink -f /sys/class/wwan/$devname/device/)"
+-	ifname="$( ls "$devpath"/net )"
++	ifname="$(ls "$devpath"/net 2>/dev/null)"
++
++	# USB MBIM exposes the control port and network interface below the same
++	# device, but PCIe/MHI keeps them on sibling channels.  For example the
++	# RM520N-GL control port resolves to:
++	#   .../mhi0/wwan/wwan0
++	# while its MBIM data interface is:
++	#   .../mhi0/mhi0_IP_HW0_MBIM/net/wwan0
++	# Some generic channel tables expose IP_HW0/IP_SW0 instead; keep those
++	# as fallbacks so netifd can still report the session during diagnosis.
++	# Resolve that sibling data channel when the normal USB lookup is empty.
++	if [ -z "$ifname" ]; then
++		case "$devpath" in
++			*/mhi[0-9]*/wwan/wwan[0-9]*)
++				local mhi_path net_path
++				mhi_path="${devpath%/wwan/*}"
++				for net_path in \
++				    "$mhi_path"/*_IP_HW0_MBIM/net/* \
++				    "$mhi_path"/*_IP_HW0/net/* \
++				    "$mhi_path"/*_IP_SW0/net/*; do
++					[ -e "$net_path" ] || continue
++					ifname="${net_path##*/}"
++					break
++				done
++			;;
++		esac
++	fi
+ 
+ 	[ -n "$ifname" ] || {
+ 		echo "mbim[$$]" "Failed to find matching interface"
+--- a/package/network/utils/umbim/Makefile
++++ b/package/network/utils/umbim/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=umbim
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+ 
+ PKG_SOURCE_PROTO:=git
+ PKG_SOURCE_URL=$(PROJECT_GIT)/project/umbim.git

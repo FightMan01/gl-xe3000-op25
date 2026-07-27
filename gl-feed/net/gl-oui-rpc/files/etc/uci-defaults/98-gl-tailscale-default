@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# Tailscale is opt-in.  Keep both the GL page's persisted state and procd's
+# boot enablement in sync so a previously attempted bind cannot make a fresh
+# installation start tailscaled before the user explicitly enables it.
+uci -q set tailscale.settings.enabled='0'
+uci -q set tailscale.settings.lan_enabled='0'
+uci -q set tailscale.settings.wan_enabled='0'
+uci -q set tailscale.settings.run_exit_node='0'
+uci -q set tailscale.settings.masq='0'
+uci -q set tailscale.settings.exit_node_ip=''
+uci -q commit tailscale
+
+/etc/init.d/tailscale stop >/dev/null 2>&1
+/etc/init.d/tailscale disable >/dev/null 2>&1
+
+exit 0

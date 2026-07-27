@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# Finder discovers SMB servers over mDNS, then uses the IPC$ share to list
+# their exported folders.  Guest data shares alone are not sufficient:
+# without guest IPC access macOS remains stuck at "Connecting…".
+if uci -q get ksmbd.@globals[0] >/dev/null; then
+	uci set ksmbd.@globals[0].allow_guest_ipc='1'
+	uci commit ksmbd
+fi
+
+exit 0

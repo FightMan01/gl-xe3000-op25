@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=18
+STOP=89
+
+start() {
+	# PCI/MHI probing may finish shortly after rcS reaches this service.
+	# Retry in the background; the PCI hotplug hook handles later reprobes.
+	(
+		for delay in 0 1 2 3 5 8 13; do
+			[ "$delay" -eq 0 ] || sleep "$delay"
+			/usr/sbin/gl-cellular-pcie-pm
+			for dev in /sys/bus/pci/devices/*; do
+				[ -r "$dev/subsystem_device" ] || continue
+				if [ "$(cat "$dev/subsystem_device")" = "0x5201" ]; then
+					exit 0
+				fi
+			done
+		done
+	) &
+}

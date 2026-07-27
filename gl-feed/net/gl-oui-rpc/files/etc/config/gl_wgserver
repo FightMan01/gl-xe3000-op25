@@ -1,0 +1,13 @@
+config server 'main'
+	option initialized '0'
+	option enabled '0'
+	option address_v4 '10.0.0.1/24'
+	option address_v6 'fd10:0:0:1::1/64'
+	option port '51820'
+	option private_key ''
+	option public_key ''
+	option mtu '1420'
+	option local_access '1'
+	option masq '1'
+	option client_to_client '0'
+

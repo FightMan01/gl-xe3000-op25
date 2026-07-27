@@ -1,0 +1,14 @@
+# ACL store for the gl-oui-rpc reimplementation.
+#
+# GL's original stack used a SQLite database (/etc/oui/oui.db) for this,
+# queried with string-interpolated SQL - a known SQL-injection vector. We
+# use plain UCI instead: no SQL, no injection surface, and no dependency
+# on a Lua 5.4 sqlite3 binding.
+#
+# 'root' is hardcoded to unconditional full access in gl-ngx-session and does
+# not need an entry here (matches GL's original behavior).
+
+config group 'admin'
+	option label 'Administrator'
+	# Full access to every rpc object/method.
+	list acl '*.*:rw'

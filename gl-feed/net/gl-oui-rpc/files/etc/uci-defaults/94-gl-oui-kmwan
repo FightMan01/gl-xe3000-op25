@@ -1,0 +1,122 @@
+#!/bin/sh
+# Multi-WAN failover, using OpenWrt's standard mwan3 (not a reimplementation
+# of GL's closed `kmwan` blob - mwan3 is a mature, official OpenWrt package
+# that already does this job). RPC object name/method surface lives in
+# kmwan.lua.
+#
+# The UI supports all four GL uplink families: Ethernet, cellular modem,
+# Wi-Fi repeater and USB tethering. Seed all of them even while disconnected
+# so they remain visible and reorderable on the Multi-WAN page.
+#
+# The real network/mwan3 interface for cellular is `wwan` (etc/uci-
+# defaults/90-gl-cellular-wwan's actual UCI section name) - kmwan.lua
+# translates between that real name and the "modem"-prefixed identifier
+# the frontend expects, so mwan3's own config below can just use the real
+# interface names directly.
+#
+# Enabled by default (mirrors GL's own out-of-the-box behavior) - safe
+# even when only `wan` is actually up (the common case right after
+# flashing, before a SIM is inserted): mwan3 simply skips an unreachable
+# backup member, so an idle `wwan` doesn't change routing behavior until
+# it's actually connected.
+
+uci -q batch <<-EOF
+	set mwan3.globals=globals
+	set mwan3.globals.mmx_mask='0x3F00'
+
+	set mwan3.wan=interface
+	set mwan3.wan.enabled='1'
+	set mwan3.wan.family='ipv4'
+	set mwan3.wan.track_method='ping'
+	add_list mwan3.wan.track_ip='1.1.1.1'
+	add_list mwan3.wan.track_ip='8.8.8.8'
+	set mwan3.wan.reliability='1'
+	set mwan3.wan.count='1'
+	set mwan3.wan.timeout='2'
+	set mwan3.wan.interval='5'
+	set mwan3.wan.down='3'
+	set mwan3.wan.up='3'
+
+	set mwan3.wwan_4=interface
+	set mwan3.wwan_4.enabled='1'
+	set mwan3.wwan_4.family='ipv4'
+	set mwan3.wwan_4.track_method='ping'
+	add_list mwan3.wwan_4.track_ip='1.1.1.1'
+	add_list mwan3.wwan_4.track_ip='8.8.8.8'
+	set mwan3.wwan_4.reliability='1'
+	set mwan3.wwan_4.count='1'
+	set mwan3.wwan_4.timeout='2'
+	set mwan3.wwan_4.interval='10'
+	set mwan3.wwan_4.down='3'
+	set mwan3.wwan_4.up='3'
+
+	set mwan3.repeater=interface
+	set mwan3.repeater.enabled='1'
+	set mwan3.repeater.family='ipv4'
+	set mwan3.repeater.track_method='ping'
+	add_list mwan3.repeater.track_ip='1.1.1.1'
+	add_list mwan3.repeater.track_ip='8.8.8.8'
+	set mwan3.repeater.reliability='1'
+	set mwan3.repeater.count='1'
+	set mwan3.repeater.timeout='2'
+	set mwan3.repeater.interval='10'
+	set mwan3.repeater.down='3'
+	set mwan3.repeater.up='3'
+
+	set mwan3.tethering=interface
+	set mwan3.tethering.enabled='1'
+	set mwan3.tethering.family='ipv4'
+	set mwan3.tethering.track_method='ping'
+	add_list mwan3.tethering.track_ip='1.1.1.1'
+	add_list mwan3.tethering.track_ip='8.8.8.8'
+	set mwan3.tethering.reliability='1'
+	set mwan3.tethering.count='1'
+	set mwan3.tethering.timeout='2'
+	set mwan3.tethering.interval='10'
+	set mwan3.tethering.down='3'
+	set mwan3.tethering.up='3'
+
+	set mwan3.wan_m1_w1=member
+	set mwan3.wan_m1_w1.interface='wan'
+	set mwan3.wan_m1_w1.metric='1'
+	set mwan3.wan_m1_w1.weight='1'
+
+	set mwan3.wwan4_m2_w1=member
+	set mwan3.wwan4_m2_w1.interface='wwan_4'
+	set mwan3.wwan4_m2_w1.metric='2'
+	set mwan3.wwan4_m2_w1.weight='1'
+
+	set mwan3.repeater_m3_w1=member
+	set mwan3.repeater_m3_w1.interface='repeater'
+	set mwan3.repeater_m3_w1.metric='3'
+	set mwan3.repeater_m3_w1.weight='1'
+
+	set mwan3.tethering_m4_w1=member
+	set mwan3.tethering_m4_w1.interface='tethering'
+	set mwan3.tethering_m4_w1.metric='4'
+	set mwan3.tethering_m4_w1.weight='1'
+
+	set mwan3.gl_failover=policy
+	add_list mwan3.gl_failover.use_member='wan_m1_w1'
+	add_list mwan3.gl_failover.use_member='wwan4_m2_w1'
+	add_list mwan3.gl_failover.use_member='repeater_m3_w1'
+	add_list mwan3.gl_failover.use_member='tethering_m4_w1'
+
+	set mwan3.gl_default_rule=rule
+	set mwan3.gl_default_rule.dest_ip='0.0.0.0/0'
+	set mwan3.gl_default_rule.family='ipv4'
+	set mwan3.gl_default_rule.use_policy='gl_failover'
+EOF
+
+# The upstream mwan3 sample configuration ships catch-all/HTTPS rules
+# pointing at its `balanced` policy. Keep the sections for UI compatibility,
+# but make failover the actual default behavior.
+for rule in https default_rule_v4; do
+	[ "$(uci -q get mwan3.$rule)" = "rule" ] &&
+		uci -q set mwan3.$rule.use_policy='gl_failover'
+done
+uci -q commit mwan3
+
+/etc/init.d/mwan3 enable
+
+exit 0

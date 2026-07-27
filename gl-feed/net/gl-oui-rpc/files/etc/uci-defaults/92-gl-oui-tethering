@@ -1,0 +1,15 @@
+#!/bin/sh
+# Seed a "tethering" logical interface, unbound until a USB modem/phone
+# hotplugs in (see /etc/hotplug.d/usb/20-gl-oui-tethering). No custom
+# kernel modules, just netifd + stock USB-net drivers.
+
+[ -n "$(uci -q get network.tethering)" ] && exit 0
+
+uci -q batch <<-EOF
+	set network.tethering=interface
+	set network.tethering.proto='dhcp'
+	set network.tethering.auto='1'
+EOF
+uci -q commit network
+
+exit 0

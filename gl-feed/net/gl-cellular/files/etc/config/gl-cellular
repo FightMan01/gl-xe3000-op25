@@ -1,0 +1,12 @@
+config atport 'atport'
+	# device set dynamically by /etc/hotplug.d/usb/11-gl-cellular-atport
+	# once the modem's AT interface enumerates.
+	option baudrate '115200'
+
+config state 'state'
+	option active_slot '1'
+	option switch_count '0'
+	option roaming_enabled '1'
+	# Desired dial state.  The built-in modem auto-connects after boot;
+	# the UI's Connect/Disconnect actions persistently toggle this.
+	option dial_enabled '1'

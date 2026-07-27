@@ -1,0 +1,36 @@
+#!/bin/sh
+# AT port detection for the Quectel RM520N-GL. The AT port is USB
+# interface 2, matching Quectel's standard 4-port composite layout (DM=0,
+# NMEA=1, AT=2, PPP/secondary=3). Matching on interface number rather
+# than ttyUSB ordinal since the interface number is the stable,
+# documented identifier; ttyUSB ordinals only happen to line up with it
+# on this device/enumeration order.
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$DEVPATH" in
+	*/ttyUSB*)
+		devname="${DEVPATH##*/}"
+		[ -c "/dev/$devname" ] || exit 0
+
+		# Only interested in interfaces belonging to the same USB device as
+		# the modem's already-bound QMI control interface, to avoid
+		# mismatching against some unrelated USB-serial gadget.
+		modem_usb_port="$(uci -q get gl-cellular.state.usb_port)"
+		case "$DEVPATH" in
+			*"$modem_usb_port"*) ;;
+			*) [ -z "$modem_usb_port" ] || exit 0 ;;
+		esac
+
+		# DEVPATH looks like ".../1-1.2/1-1.2:1.2/ttyUSB2" - the segment
+		# before the final "/ttyUSBn" ends in "<config>.<interface>".
+		ifpath="${DEVPATH%/ttyUSB*}"
+		ifnum="${ifpath##*.}"
+
+		if [ "$ifnum" = "2" ]; then
+			uci -q set gl-cellular.atport.dev="/dev/$devname"
+			uci -q commit gl-cellular
+			/etc/init.d/gl-cellular-atd restart >/dev/null 2>&1
+		fi
+		;;
+esac

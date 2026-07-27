@@ -1,0 +1,13 @@
+#!/bin/sh
+# Move stock uhttpd/LuCI to :8080/:8443 so the GL GUI (nginx) can take over
+# :80/:443, keeping LuCI available as a fallback.
+
+uci -q delete uhttpd.main.listen_http
+uci -q delete uhttpd.main.listen_https
+uci -q add_list uhttpd.main.listen_http='0.0.0.0:8080'
+uci -q add_list uhttpd.main.listen_http='[::]:8080'
+uci -q add_list uhttpd.main.listen_https='0.0.0.0:8443'
+uci -q add_list uhttpd.main.listen_https='[::]:8443'
+uci -q commit uhttpd
+
+exit 0

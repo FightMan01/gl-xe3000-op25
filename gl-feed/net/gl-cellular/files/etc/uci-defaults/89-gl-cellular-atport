@@ -1,0 +1,23 @@
+#!/bin/sh
+# gl-cellular-atd's own init script gates its start_service() on
+# `gl-cellular.atport.dev` already being set to a real character device.
+# That value is normally set by etc/hotplug.d/usb/11-gl-cellular-atport
+# when the modem's AT interface enumerates - but on a genuinely fresh
+# device, uci-defaults scripts run before that daemon has ever started,
+# so there's no prior hotplug event to have set it, and the daemon's
+# init script gate blocks it from ever starting at all (init.d
+# start_service() only runs at boot/manual restart, not continuously).
+#
+# The Quectel RM520N-GL's AT port is always /dev/ttyUSB2 on this device's
+# standard 4-port composite enumeration (DM=0, NMEA=1, AT=2,
+# PPP/secondary=3) - fixed hardware, safe to seed here. The hotplug
+# script still runs on actual re-enumeration events and will correct
+# this if the modem's USB layout is ever different on a given unit.
+
+[ -n "$(uci -q get gl-cellular.atport.dev)" ] && exit 0
+
+uci -q set gl-cellular.atport=atport
+uci -q set gl-cellular.atport.dev='/dev/ttyUSB2'
+uci -q commit gl-cellular
+
+exit 0

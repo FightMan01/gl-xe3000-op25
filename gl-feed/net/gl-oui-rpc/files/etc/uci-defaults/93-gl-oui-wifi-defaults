@@ -1,0 +1,154 @@
+#!/bin/sh
+# Default WiFi radio/AP config, matching GL's real out-of-box behavior:
+# WiFi enabled on both radios, WPA2-PSK (not open), single shared SSID
+# across 2.4G/5G in the pattern "GL-XE3000-<suffix>", with a per-device
+# password - both printed on the router's physical label. Guest/IoT
+# networks exist on GL's firmware but default to disabled. They must
+# still be pre-created here because the Wireless page only renders
+# networks returned as initialized wifi-iface entries; omitting the
+# disabled sections hides both cards.
+#
+# The SSID suffix and password are read directly from the eMMC "factory"
+# GPT partition (mmcblk0p3, PARTLABEL="factory"): the SSID-suffix source
+# string lives at byte offset 16 (7 bytes) and the WiFi password at byte
+# offset 64 (10 bytes), matching what's printed on the physical label.
+# This partition is factory-provisioned at manufacture time and is not
+# touched by sysupgrade, so it survives reflashing. Falls back to random
+# generation only if the partition/expected data isn't present (e.g. a
+# different manufacturing batch, or testing in a VM).
+#
+# Regulatory domain comes from the factory field at offset 0x88. If it is
+# absent or invalid, this image defaults to HU.
+
+[ -n "$(uci -q get wireless.gl_wifi2g)" ] && exit 0
+
+. /lib/functions.sh
+
+# Remove any auto-detected wifi-iface sections bound to radio0/radio1
+# before creating our own - avoids ending up with two AP SSIDs per radio
+# if mainline's own first-boot wifi detection already created one.
+remove_ifaces_on() {
+	local radio="$1"
+	config_load wireless
+	config_foreach _remove_iface_if_match wifi-iface "$radio"
+}
+_remove_iface_if_match() {
+	local section="$1" radio="$2"
+	local device
+	config_get device "$section" device
+	[ "$device" = "$radio" ] && uci -q delete wireless."$section"
+}
+remove_ifaces_on radio0
+remove_ifaces_on radio1
+
+# Hardcoded rather than looked up via blkid (not built into this image -
+# would need a new dependency just for this one read). Safe to hardcode:
+# this eMMC's GPT partition table is created by the bootloader/factory
+# tooling at manufacture time, entirely independent of which OS is
+# installed, and doesn't change when this port's OS gets flashed onto the
+# same physical unit.
+factory_dev="/dev/mmcblk0p3"
+[ -b "$factory_dev" ] || factory_dev=""
+
+suffix=""
+password=""
+country=""
+if [ -n "$factory_dev" ]; then
+	raw_suffix="$(dd if="$factory_dev" bs=1 skip=16 count=7 2>/dev/null | tr -dc 'A-Za-z0-9')"
+	raw_password="$(dd if="$factory_dev" bs=1 skip=64 count=10 2>/dev/null | tr -dc 'A-Za-z0-9')"
+	raw_country="$(dd if="$factory_dev" bs=1 skip=136 count=2 2>/dev/null | tr -dc 'A-Z')"
+	# Sanity-check before trusting factory-partition bytes as config
+	# values: suffix should be the expected length with at least 3
+	# trailing alnum chars, password should be exactly 10 alnum chars -
+	# anything else means this batch's factory partition doesn't match
+	# the offsets found on the live reference unit, fall back instead of
+	# writing garbage into the SSID/password.
+	if [ "${#raw_suffix}" -ge 3 ] && [ "${#raw_password}" -eq 10 ]; then
+		# Keep the case exactly as stored in the factory partition -
+		# the physical label prints it lowercase, matching the raw
+		# partition bytes as-is.
+		suffix="$(echo "$raw_suffix" | tail -c 4)"
+		password="$raw_password"
+	fi
+	[ "${#raw_country}" -eq 2 ] && country="$raw_country"
+fi
+
+[ "${#country}" -eq 2 ] || country="HU"
+
+if [ -z "$suffix" ] || [ -z "$password" ]; then
+	lan_mac="$(cat /sys/class/net/eth1/address 2>/dev/null)"
+	suffix="$(echo "$lan_mac" | tr -d ':' | tr 'a-f' 'A-F' | tail -c 4)"
+	[ -n "$suffix" ] || suffix="XXXX"
+	password="$(tr -dc 'A-Z0-9' < /dev/urandom | head -c 10)"
+fi
+
+ssid="GL-XE3000-${suffix}"
+
+uci -q batch <<-EOF
+	set wireless.radio0=wifi-device
+	set wireless.radio0.disabled='0'
+	set wireless.radio0.country='${country}'
+
+	set wireless.radio1=wifi-device
+	set wireless.radio1.disabled='0'
+	set wireless.radio1.country='${country}'
+
+	set wireless.gl_wifi2g=wifi-iface
+	set wireless.gl_wifi2g.device='radio0'
+	set wireless.gl_wifi2g.mode='ap'
+	set wireless.gl_wifi2g.network='lan'
+	set wireless.gl_wifi2g.ssid='${ssid}'
+	set wireless.gl_wifi2g.encryption='psk2'
+	set wireless.gl_wifi2g.key='${password}'
+
+	set wireless.gl_wifi5g=wifi-iface
+	set wireless.gl_wifi5g.device='radio1'
+	set wireless.gl_wifi5g.mode='ap'
+	set wireless.gl_wifi5g.network='lan'
+	set wireless.gl_wifi5g.ssid='${ssid}'
+	set wireless.gl_wifi5g.encryption='psk2'
+	set wireless.gl_wifi5g.key='${password}'
+
+	set wireless.guest2g=wifi-iface
+	set wireless.guest2g.device='radio0'
+	set wireless.guest2g.mode='ap'
+	set wireless.guest2g.network='guest'
+	set wireless.guest2g.ssid='${ssid}-Guest'
+	set wireless.guest2g.encryption='psk2'
+	set wireless.guest2g.key='${password}'
+	set wireless.guest2g.isolate='1'
+	set wireless.guest2g.disabled='1'
+
+	set wireless.guest5g=wifi-iface
+	set wireless.guest5g.device='radio1'
+	set wireless.guest5g.mode='ap'
+	set wireless.guest5g.network='guest'
+	set wireless.guest5g.ssid='${ssid}-5G-Guest'
+	set wireless.guest5g.encryption='psk2'
+	set wireless.guest5g.key='${password}'
+	set wireless.guest5g.isolate='1'
+	set wireless.guest5g.disabled='1'
+
+	set wireless.iot2g=wifi-iface
+	set wireless.iot2g.device='radio0'
+	set wireless.iot2g.mode='ap'
+	set wireless.iot2g.network='iot'
+	set wireless.iot2g.ssid='${ssid}-IoT'
+	set wireless.iot2g.encryption='psk2'
+	set wireless.iot2g.key='${password}'
+	set wireless.iot2g.isolate='1'
+	set wireless.iot2g.disabled='1'
+
+	set wireless.iot5g=wifi-iface
+	set wireless.iot5g.device='radio1'
+	set wireless.iot5g.mode='ap'
+	set wireless.iot5g.network='iot'
+	set wireless.iot5g.ssid='${ssid}-5G-IoT'
+	set wireless.iot5g.encryption='psk2'
+	set wireless.iot5g.key='${password}'
+	set wireless.iot5g.isolate='1'
+	set wireless.iot5g.disabled='1'
+EOF
+uci -q commit wireless
+
+exit 0

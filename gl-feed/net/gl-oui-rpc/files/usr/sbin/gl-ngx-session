@@ -1,0 +1,358 @@
+#!/usr/bin/env eco
+
+-- gl-ngx-session: session/auth daemon, reimplemented for the OpenWrt 25.12 port.
+--
+-- Registers ubus object "gl-session" with methods: has_websocket, status,
+-- resolve, console, touch, notify, session, call, challenge, login,
+-- logout, clear_session.
+--
+-- Auth is the same challenge-response-over-/etc/shadow scheme GL's original
+-- daemon used: the client computes crypt(password, "$alg$salt$") locally
+-- using the alg+salt this daemon hands back from /etc/shadow, so this
+-- daemon never needs to run crypt() itself - the value the client
+-- computes is, by construction, exactly the hash already stored in
+-- /etc/shadow when the password is correct. sha256(username:hash:nonce)
+-- is compared instead of the raw hash so it's never sent/logged in the
+-- clear.
+--
+-- Differs from GL's original in two deliberate ways:
+--   - ACL/account storage is UCI (/etc/config/gl-oui-acl), not SQLite -
+--     removes both the missing lsqlite3-lua5.4 package problem and the
+--     SQL-injection class of bug entirely (no SQL at all).
+--   - This is a clean-room implementation against the documented protocol,
+--     not a transplant of GL's code.
+
+local ubus = require 'eco.ubus'
+local file = require 'eco.file'
+local sha256 = require 'eco.hash.sha256'
+local uci = require 'eco.uci'
+local log = require 'eco.log'
+
+local MAX_SESSION = 5
+local CHALLENGE_TTL = 2
+
+local cursor = uci.cursor()
+
+local function get_config(section, option, default)
+	local v = cursor:get('gl-oui-rpc', 'main', option)
+	return v or default
+end
+
+local max_login_fail = tonumber(get_config('main', 'max_login_fail', '10'))
+local login_fail_wait = tonumber(get_config('main', 'login_fail_wait', '600'))
+
+local function session_timeout()
+	-- Management Control can change this at runtime. eco.uci cursors cache
+	-- packages, so use a fresh cursor rather than the daemon-global one.
+	local live = uci.cursor()
+	return tonumber(live:get('gl-oui-rpc', 'main', 'session_timeout') or '300') or 300
+end
+
+local challenges = {}   -- username -> { nonce, alg, salt, pw, expire }
+local sessions = {}     -- sid -> { username, aclgroup, expire }
+local login_fails = {}  -- username -> { count, locked_until }
+
+local function now()
+	return os.time()
+end
+
+local function random_hex(nbytes)
+	local f, err = file.open('/dev/urandom', file.O_RDONLY)
+	if not f then
+		error('cannot open /dev/urandom: ' .. tostring(err))
+	end
+	local data = f:readfull(nbytes)
+	f:close()
+	local hex = {}
+	for i = 1, #data do
+		hex[i] = string.format('%02x', data:byte(i))
+	end
+	return table.concat(hex)
+end
+
+-- /etc/shadow line: username:$id$salt$hash:lastchange:...
+-- OpenWrt's stock /etc/shadow ships `root:::0:99999:7:::` - an empty
+-- password field, which is OpenWrt's own convention for "no password
+-- required, allow login" (not "locked out") on a never-configured
+-- device. That must not be conflated with a genuinely locked/disabled
+-- account (enc == "!" or "*"), or first boot could never log in at all,
+-- blocking the entire GUI including the setup wizard.
+--
+-- Third field/enc format for the two real password states:
+--   "$<alg>$<salt>$<hash>"  -> a real password is set
+--   "" (empty)              -> no password set, login should succeed
+--                              trivially (matches OpenWrt's own passwordless
+--                              first-boot console/SSH/LuCI convention)
+--   "!" / "*" / "!<hash>"   -> account explicitly locked, reject
+local function read_shadow_entry(username)
+	local content = file.readfile('/etc/shadow')
+	if not content then
+		return nil
+	end
+	for line in content:gmatch('[^\n]+') do
+		local user, enc = line:match('^([^:]+):([^:]*):')
+		if user == username then
+			if enc == '' then
+				return { empty = true }
+			end
+			local id, salt, hash = enc:match('^%$([^%$]+)%$([^%$]+)%$(.+)$')
+			if id then
+				return { alg = id, salt = salt, hash = hash }
+			end
+			return nil -- explicitly locked ("!"/"*"/"!<hash>")
+		end
+	end
+	return nil
+end
+
+local function evict_oldest_session_if_full()
+	local count = 0
+	local oldest_sid, oldest_time = nil, math.huge
+	for sid, s in pairs(sessions) do
+		count = count + 1
+		if s.created < oldest_time then
+			oldest_sid, oldest_time = sid, s.created
+		end
+	end
+	if count >= MAX_SESSION and oldest_sid then
+		sessions[oldest_sid] = nil
+	end
+end
+
+local function lookup_aclgroup(username)
+	if username == 'root' then
+		return 'root'
+	end
+	local group = nil
+	cursor:foreach('gl-oui-acl', 'account', function(s)
+		if s.username == username then
+			group = s.group
+		end
+	end)
+	return group or 'guest'
+end
+
+local methods = {
+	has_websocket = {
+		function(req, msg, con)
+			con:reply(req, { result = true })
+		end
+	},
+
+	status = {
+		function(req, msg, con)
+			con:reply(req, { session_count = 0 })
+		end
+	},
+
+	resolve = {
+		function(req, msg, con)
+			con:reply(req, { address = msg.host })
+		end, { host = ubus.STRING }
+	},
+
+	console = {
+		function(req, msg, con)
+			con:reply(req, {})
+		end, { enable = ubus.BOOLEAN }
+	},
+
+	challenge = {
+		function(req, msg, con)
+			local username = msg.username
+			if type(username) ~= 'string' or username == '' then
+				return con:reply(req, { code = 1, message = 'invalid username' })
+			end
+
+			local fail = login_fails[username]
+			if fail and fail.locked_until and now() < fail.locked_until then
+				-- Exact string, matched literally by the frontend's response
+				-- interceptor to show the dedicated lockout UI - anything
+				-- else falls through to a generic "unknown" error type.
+				return con:reply(req, { code = 1, message = 'Login fail number over limit' })
+			end
+
+			local entry = read_shadow_entry(username)
+			if not entry then
+				return con:reply(req, { code = 1, message = 'invalid username or password' })
+			end
+
+			local nonce = random_hex(16)
+			challenges[username] = {
+				nonce = nonce,
+				empty = entry.empty,
+				alg = entry.alg,
+				salt = entry.salt,
+				hash = entry.hash,
+				expire = now() + CHALLENGE_TTL,
+			}
+
+			-- Defense-in-depth for the no-password-set state (see this
+			-- file's read_shadow_entry comment - primarily handled by
+			-- oui-rpc.lua's rpc_alive redirecting away from the login
+			-- form entirely on an uninitialized device, but this stays
+			-- correct even if login is somehow reached directly, e.g. a
+			-- bookmarked URL or the wizard being skipped by the user).
+			-- No real alg/salt exists to challenge against, so login
+			-- below accepts unconditionally once it sees `empty=true`.
+			con:reply(req, {
+				code = 0,
+				data = {
+					nonce = nonce,
+					alg = entry.empty and 'none' or entry.alg,
+					salt = entry.empty and '' or entry.salt,
+					['hash-method'] = 'sha256',
+				},
+			})
+		end, { username = ubus.STRING }
+	},
+
+	login = {
+		function(req, msg, con)
+			local username, client_hash = msg.username, msg.hash
+			if type(username) ~= 'string' or type(client_hash) ~= 'string' then
+				return con:reply(req, { code = 1, message = 'invalid params' })
+			end
+
+			local fail = login_fails[username]
+			if fail and fail.locked_until and now() < fail.locked_until then
+				return con:reply(req, { code = 1, message = 'Login fail number over limit' })
+			end
+
+			local ch = challenges[username]
+			challenges[username] = nil -- one-shot, always consume
+			if not ch or now() > ch.expire then
+				return con:reply(req, { code = 1, message = 'challenge expired' })
+			end
+
+			-- No password configured (see read_shadow_entry/rpc_alive) -
+			-- accept unconditionally, there's no real hash to verify
+			-- against. In practice oui-rpc.lua's rpc_alive already routes
+			-- an uninitialized device to the setup wizard instead of the
+			-- login form, so this mainly matters as defense-in-depth
+			-- (see challenge's own comment above).
+			if ch.empty then
+				login_fails[username] = nil
+				evict_oldest_session_if_full()
+				local sid = random_hex(16)
+				sessions[sid] = {
+					username = username,
+					aclgroup = lookup_aclgroup(username),
+					created = now(),
+					expire = now() + session_timeout(),
+				}
+				return con:reply(req, { code = 0, data = { username = username, sid = sid } })
+			end
+
+			-- client computed crypt(password, "$alg$salt$") locally, giving
+			-- back the FULL crypt string "$alg$salt$hash" (not just the
+			-- trailing hash portion) - then hashes
+			-- username+":"+fullCryptString+":"+nonce. Must use the full
+			-- "$alg$salt$hash" string here, not the bare trailing hash
+			-- read_shadow_entry splits out for shadow-file parsing.
+			-- sha256.sum() returns raw bytes needing the manual hex
+			-- encoding below.
+			local full_crypt = '$' .. ch.alg .. '$' .. ch.salt .. '$' .. ch.hash
+			local expected = sha256.sum(username .. ':' .. full_crypt .. ':' .. ch.nonce)
+			local expected_hex = {}
+			for i = 1, #expected do
+				expected_hex[i] = string.format('%02x', expected:byte(i))
+			end
+			expected_hex = table.concat(expected_hex)
+
+			if client_hash ~= expected_hex then
+				local f = login_fails[username] or { count = 0 }
+				f.count = f.count + 1
+				if f.count >= max_login_fail then
+					f.locked_until = now() + login_fail_wait
+					f.count = 0
+				end
+				login_fails[username] = f
+				return con:reply(req, { code = 1, message = 'invalid username or password' })
+			end
+
+			login_fails[username] = nil
+
+			evict_oldest_session_if_full()
+			local sid = random_hex(16)
+			sessions[sid] = {
+				username = username,
+				aclgroup = lookup_aclgroup(username),
+				created = now(),
+				expire = now() + session_timeout(),
+			}
+
+			con:reply(req, { code = 0, data = { username = username, sid = sid } })
+		end, { username = ubus.STRING, hash = ubus.STRING }
+	},
+
+	logout = {
+		function(req, msg, con)
+			if msg.sid then
+				sessions[msg.sid] = nil
+			end
+			con:reply(req, {})
+		end, { sid = ubus.STRING }
+	},
+
+	session = {
+		function(req, msg, con)
+			local s = msg.sid and sessions[msg.sid]
+			if not s or now() > s.expire then
+				if s then sessions[msg.sid] = nil end
+				return con:reply(req, {})
+			end
+			s.expire = now() + session_timeout() -- sliding expiry, matches "touch" semantics
+			con:reply(req, { username = s.username, aclgroup = s.aclgroup })
+		end, { sid = ubus.STRING }
+	},
+
+	touch = {
+		function(req, msg, con)
+			local s = msg.sid and sessions[msg.sid]
+			if s then
+				s.expire = now() + session_timeout()
+			end
+			con:reply(req, {})
+		end, { sid = ubus.STRING }
+	},
+
+	clear_session = {
+		function(req, msg, con)
+			sessions = {}
+			con:reply(req, {})
+		end
+	},
+
+	notify = {
+		-- websocket fan-out: would forward to any /ws clients subscribed
+		-- to `name`, if wired up. oui-ws.lua instead polls its subscribed
+		-- ubus objects directly rather than relying on this, so this stays
+		-- a stub that just satisfies callers.
+		function(req, msg, con)
+			con:reply(req, {})
+		end, { name = ubus.STRING, data = ubus.TABLE }
+	},
+
+	call = {
+		-- Generic shell-command-via-daemon proxy GL's oui-init.lua used
+		-- (ngx-cmd-proxy.sock equivalent). Not needed by anything in this
+		-- port yet - left unimplemented rather than guessed at. Revisit
+		-- when a concrete RPC object needs it.
+		function(req, msg, con)
+			con:reply(req, ubus.STATUS_NOT_SUPPORTED)
+		end, { func = ubus.STRING, module = ubus.STRING, params = ubus.TABLE }
+	},
+}
+
+local con, err = ubus.connect(nil, true)
+if not con then
+	error('gl-ngx-session: ubus connect failed: ' .. tostring(err))
+end
+
+local obj, add_err = con:add('gl-session', methods)
+if not obj then
+	error('gl-ngx-session: ubus add failed: ' .. tostring(add_err))
+end
+
+log.info('gl-ngx-session started')
