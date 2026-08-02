@@ -408,26 +408,32 @@ return {
 		return { res = res, dfs_support = true, bandmode = {} }
 	end,
 
-	-- Shape: {"device":"radio0","channel":1} - `device` identifies the
-	-- radio; otherwise reuses the same field set set_radio_config already
-	-- handles (ssid/password/encryption/hidden/channel/htmode/txpower/
-	-- beacon_int/rts_threshold/frag_threshold).
+	-- Shape: {"device":"radio0","channel":1} for radio-level edits from the
+	-- Advanced panel, or {"iface_name":"guest2g","enabled":true} for the
+	-- wifi-card quick-toggle switch - that switch only ever emits
+	-- iface_name/enabled/init, never device, so device is derived from the
+	-- interface's own UCI section when the caller didn't supply one.
 	set_config = function(args)
-		if type(args.device) ~= "string" then
-			return { code = 1, message = "missing device" }
-		end
-		local found = false
-		for _, r in ipairs(RADIOS) do
-			if r == args.device then found = true end
-		end
-		if not found then
-			return { code = 1, message = "unknown device" }
-		end
 		local cursor = uci.cursor()
 		local iface = type(args.iface_name) == "string"
 			and cursor:get("wireless", args.iface_name)
 			and args.iface_name
 			or nil
+
+		local device = args.device
+		if type(device) ~= "string" and iface then
+			device = cursor:get("wireless", iface, "device")
+		end
+		if type(device) ~= "string" then
+			return { code = 1, message = "missing device" }
+		end
+		local found = false
+		for _, r in ipairs(RADIOS) do
+			if r == device then found = true end
+		end
+		if not found then
+			return { code = 1, message = "unknown device" }
+		end
 		local network = iface and cursor:get("wireless", iface, "network") or "lan"
 
 		if network == GUEST_NETWORK or network == IOT_NETWORK then
@@ -459,7 +465,7 @@ return {
 				)
 			end
 		else
-			set_radio_config(cursor, args.device, args)
+			set_radio_config(cursor, device, args)
 		end
 		cursor:commit("wireless")
 		os.execute("wifi reload >/dev/null 2>&1")
