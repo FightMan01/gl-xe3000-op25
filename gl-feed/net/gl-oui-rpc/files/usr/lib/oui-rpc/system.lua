@@ -349,7 +349,9 @@ return {
 				  status = cursor:get("gl_wgserver", "main", "enabled") == "1"
 					and 1 or 0 },
 				{ name = "ovpnclient", status = 0 },
-				{ name = "ovpnserver", status = 0 },
+				{ name = "ovpnserver",
+				  status = cursor:get("gl_ovpnserver", "global", "enable") == "1"
+					and 1 or 0 },
 				{ name = "tailscale",
 				  status = cursor:get("tailscale", "settings", "enabled") == "1" and 1 or 0 },
 				{ name = "adguardhome",
@@ -437,10 +439,8 @@ return {
 
 		local have_ksmbd = ksmbd_available()
 		local hidden_features = {
-			"astrowarp", "bridge", "cloud", "contentprotection",
-			"dpifeatures", "dynamicdns", "edgerouter",
-			"ovpnserver", "parental-control", "qos",
-			"vpn-client", "vpndashboard",
+			"astrowarp", "bridge", "cloud",
+			"dpifeatures", "dynamicdns",
 		}
 		if not have_ksmbd then
 			hidden_features[#hidden_features + 1] = "nasview"
