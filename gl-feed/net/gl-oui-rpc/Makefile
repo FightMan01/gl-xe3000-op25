@@ -28,13 +28,22 @@ define Package/gl-oui-rpc
 	+libubus-lua +libuci-lua +lua-cjson +libiwinfo-lua \
 	+kmod-mt7915e +kmod-mt7981-firmware +mt7981-wo-firmware wpad-openssl \
 	+mwan3 +px5g-mbedtls +sqm-scripts +tailscale +adguardhome +zerotier +tor \
-	+ksmbd-server +avahi-nodbus-daemon +ksmbd-avahi-service +wireguard-tools
+	+ksmbd-server +avahi-nodbus-daemon +ksmbd-avahi-service +wireguard-tools \
+	+openvpn-openssl +openvpn-easy-rsa +openssl-util +kmod-ovpn-backports
 endef
 
 define Package/gl-oui-rpc/conffiles
 /etc/config/gl-oui-rpc
 /etc/config/gl-oui-acl
 /etc/config/gl_wgserver
+/etc/config/gl_wgclient
+/etc/config/gl_vpnclient
+/etc/config/gl_ovpnclient
+/etc/config/gl_edgerouter
+/etc/config/gl_qos
+/etc/config/gl_contentprotection
+/etc/config/gl_parentalcontrol
+/etc/config/gl_ovpnserver
 /etc/gl-oui-access.conf
 /etc/gl-oui-listen.conf
 endef
@@ -53,6 +62,7 @@ endef
 define Package/gl-oui-rpc/install
 	$(CP) ./files/* $(1)/
 	$(INSTALL_DIR) $(1)/usr/lib/oui-rpc
+	$(INSTALL_BIN) ./files/usr/lib/gl-oui-rpc/ovpnserver-auth.sh $(1)/usr/lib/gl-oui-rpc/ovpnserver-auth.sh
 endef
 
 define Package/gl-oui-rpc/postinst
@@ -63,6 +73,7 @@ define Package/gl-oui-rpc/postinst
 	/etc/init.d/sqm enable
 	/etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable
+	/etc/init.d/openvpn disable
 }
 exit 0
 endef
