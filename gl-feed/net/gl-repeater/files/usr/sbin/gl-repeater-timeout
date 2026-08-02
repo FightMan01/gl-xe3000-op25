@@ -1,0 +1,73 @@
+#!/bin/sh
+
+CONNECT_TIMEOUT=20
+RETRY_INTERVAL=30
+FAIL_FLAG=/tmp/gl-repeater-fail-type
+RETRY_FLAG=/tmp/gl-repeater-retry-at
+
+. /lib/functions.sh
+
+sta_section=""
+config_cb() {
+	if [ "$1" = "wifi-iface" ]; then
+		local mode network
+		config_get mode "$2" mode
+		config_get network "$2" network
+		[ "$mode" = "sta" ] && [ "$network" = "repeater" ] && sta_section="$2"
+	fi
+}
+
+connecting_since=""
+
+while true; do
+	sta_section=""
+	config_load wireless
+
+	if [ -z "$sta_section" ]; then
+		connecting_since=""
+		rm -f "$FAIL_FLAG" "$RETRY_FLAG"
+		sleep 5
+		continue
+	fi
+
+	if [ -f "$RETRY_FLAG" ]; then
+		retry_at=$(cat "$RETRY_FLAG")
+		[ "$(date +%s)" -ge "${retry_at:-0}" ] && {
+			rm -f "$RETRY_FLAG"
+			uci set wireless."$sta_section".disabled=0
+			uci commit wireless
+			wifi reload >/dev/null 2>&1
+		}
+		sleep 2
+		continue
+	fi
+
+	if [ "$(uci -q get wireless."$sta_section".disabled)" = "1" ]; then
+		connecting_since=""
+		sleep 5
+		continue
+	fi
+
+	up=$(ubus call network.interface.repeater status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	if [ "$up" = "true" ]; then
+		connecting_since=""
+		rm -f "$FAIL_FLAG"
+		sleep 5
+		continue
+	fi
+
+	now=$(date +%s)
+	if [ -z "$connecting_since" ]; then
+		connecting_since=$now
+		rm -f "$FAIL_FLAG"
+	elif [ $((now - connecting_since)) -ge "$CONNECT_TIMEOUT" ]; then
+		echo "not-found" > "$FAIL_FLAG"
+		echo $((now + RETRY_INTERVAL)) > "$RETRY_FLAG"
+		uci set wireless."$sta_section".disabled=1
+		uci commit wireless
+		wifi reload >/dev/null 2>&1
+		connecting_since=""
+	fi
+
+	sleep 2
+done

@@ -36,4 +36,13 @@ define Package/gl-repeater/install
 	$(CP) ./files/* $(1)/
 endef
 
+define Package/gl-repeater/postinst
+#!/bin/sh
+[ -n "$$IPKG_INSTROOT" ] || {
+	/etc/init.d/gl-repeater-timeout enable
+	/etc/init.d/gl-repeater-timeout start
+}
+exit 0
+endef
+
 $(eval $(call BuildPackage,gl-repeater))

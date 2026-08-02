@@ -23,6 +23,15 @@ local function as_array(t)
 	return t
 end
 
+local function read_trim(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local v = f:read("*l")
+	f:close()
+	if not v or v == "" then return nil end
+	return v
+end
+
 local RADIOS = { "radio0", "radio1" }
 
 local function radio_for_band(cursor, wanted_band)
@@ -385,10 +394,12 @@ return {
 	end,
 
 	-- state is an int enum (0=idle, 1=connecting, 2=connected,
-	-- 3=retrying), state_s its string label. portal_info is a fixed "no
-	-- captive portal pending" stub - this port has no captive-portal-login
-	-- flow. connected/ssid/ipaddr/signal are extra fields beyond the
-	-- minimal real shape.
+	-- 3=retrying), state_s its string label. fail_type is "not-found" while
+	-- gl-repeater-timeout is backing off an upstream network it couldn't
+	-- reach, matching the fail_type the stock UI already knows how to
+	-- render. portal_info is a fixed "no captive portal pending" stub -
+	-- this port has no captive-portal-login flow. connected/ssid/ipaddr/
+	-- signal are extra fields beyond the minimal real shape.
 	get_status = function(args)
 		local cursor = uci.cursor()
 		local iface = repeater_iface(cursor)
@@ -459,9 +470,16 @@ return {
 			end
 		end
 		local dns = net_status and net_status["dns-server"] or {}
-		local disabled = cursor:get("wireless", iface, "disabled") == "1"
+		local admin_disabled = cursor:get("wireless", iface, "disabled") == "1"
+		-- gl-repeater-timeout also flips this same "disabled" flag while it
+		-- backs off an upstream network it couldn't find, so a pending
+		-- retry (retry-at in the future) reads as "retrying", not "idle".
+		local retry_at = tonumber(read_trim("/tmp/gl-repeater-retry-at"))
+		local backing_off = admin_disabled and retry_at ~= nil and retry_at > os.time()
+		local disabled = admin_disabled and not backing_off
 		local connected = not disabled and net_status and net_status.up == true
 			and ipv4_address ~= nil or false
+		local fail_type = backing_off and read_trim("/tmp/gl-repeater-fail-type") or nil
 		local state
 		if disabled then
 			state = 0
@@ -499,6 +517,7 @@ return {
 			state_s = state == 2 and "connected"
 				or state == 1 and "connecting"
 				or state == 3 and "retrying" or "idle",
+			fail_type = fail_type,
 			portal_info = portal_info,
 			config = config,
 			ssid = ssid,
