@@ -72,7 +72,7 @@ return {
 		local port, protocol = 0, interface == "wgserver" and "udp" or "udp"
 		if interface == "wgserver" then
 			local cursor = uci.cursor()
-			port = tonumber(cursor:get("gl_wgserver", "main", "port")) or 51820
+			port = tonumber((cursor:get("gl_wgserver", "main", "port"))) or 51820
 		end
 		local v4 = ipv4 and ipv4.address or ""
 		local v6 = ipv6 and ipv6.address or ""

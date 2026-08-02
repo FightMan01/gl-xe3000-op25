@@ -27,7 +27,7 @@ local function command_output(command)
 	if not pipe then return "" end
 	local data = pipe:read("*a") or ""
 	pipe:close()
-	return data:gsub("%s+$", "")
+	return (data:gsub("%s+$", ""))
 end
 
 local function command_ok(command)
@@ -142,6 +142,25 @@ local function delete_type(cursor, package, section_type)
 	for _, name in ipairs(names) do cursor:delete(package, name) end
 end
 
+-- uci.cursor() has no section() method (add()/set() only) - the calls
+-- below used to call a nonexistent method and would crash the moment
+-- anyone actually pressed Start on the WireGuard Server page.
+local function new_section(cursor, config, section_type, name, values)
+	cursor:set(config, name, section_type)
+	for option, value in pairs(values) do
+		cursor:set(config, name, option, value)
+	end
+	return name
+end
+
+local function new_anon_section(cursor, config, section_type, values)
+	local name = cursor:add(config, section_type)
+	for option, value in pairs(values) do
+		cursor:set(config, name, option, value)
+	end
+	return name
+end
+
 local function apply_runtime(cursor)
 	local config = server_config(cursor)
 	if not config.initialization or config.private_key == "" then
@@ -159,7 +178,7 @@ local function apply_runtime(cursor)
 		end)
 	end
 	for _, name in ipairs(stale_routes) do cursor:delete("network", name) end
-	cursor:section("network", "interface", IFACE, {
+	new_section(cursor, "network", "interface", IFACE, {
 		proto = "wireguard",
 		private_key = config.private_key,
 		listen_port = tostring(config.port),
@@ -192,7 +211,7 @@ local function apply_runtime(cursor)
 			and peer.presharedkey ~= "" then
 				values.preshared_key = peer.presharedkey
 			end
-			cursor:section("network", "wireguard_" .. IFACE, nil, values)
+			new_anon_section(cursor, "network", "wireguard_" .. IFACE, values)
 		end
 	end
 	cursor:foreach(CONFIG, "route", function(route)
@@ -206,7 +225,7 @@ local function apply_runtime(cursor)
 			mtu = tostring(tonumber(route.mtu) or 0),
 		}
 		if route.scope and route.scope ~= "" then values.scope = route.scope end
-		cursor:section("network", version == 6 and "route6" or "route",
+		new_section(cursor, "network", version == 6 and "route6" or "route",
 			"gl_wg_route_" .. id, values)
 	end)
 	cursor:commit("network")
@@ -217,7 +236,7 @@ local function apply_runtime(cursor)
 	}) do
 		cursor:delete("firewall", name)
 	end
-	cursor:section("firewall", "zone", "gl_wgserver", {
+	new_section(cursor, "firewall", "zone", "gl_wgserver", {
 		name = IFACE,
 		network = IFACE,
 		input = "ACCEPT",
@@ -227,12 +246,12 @@ local function apply_runtime(cursor)
 		masq = cursor_get(cursor, "masq", "1"),
 	})
 	if cursor_get(cursor, "local_access", "1") == "1" then
-		cursor:section("firewall", "forwarding", "gl_wgserver_to_lan",
+		new_section(cursor, "firewall", "forwarding", "gl_wgserver_to_lan",
 			{ src = IFACE, dest = "lan" })
 	end
-	cursor:section("firewall", "forwarding", "gl_wgserver_to_wan",
+	new_section(cursor, "firewall", "forwarding", "gl_wgserver_to_wan",
 		{ src = IFACE, dest = "wan" })
-	cursor:section("firewall", "rule", "gl_wgserver_input", {
+	new_section(cursor, "firewall", "rule", "gl_wgserver_input", {
 		name = "Allow-WireGuard-Server",
 		src = "wan",
 		proto = "udp",
@@ -412,7 +431,7 @@ return {
 		args = args or {}
 		local cursor = uci.cursor()
 		args.peer_id = peer_id()
-		local section = cursor:section(CONFIG, "peer", "p_" .. args.peer_id, {})
+		local section = new_section(cursor, CONFIG, "peer", "p_" .. args.peer_id, {})
 		local ok, err = write_peer(cursor, section, args, true)
 		if not ok then
 			cursor:delete(CONFIG, section)
@@ -590,7 +609,7 @@ return {
 		args = args or {}
 		local cursor = uci.cursor()
 		local id = peer_id()
-		local section = cursor:section(CONFIG, "route", "r_" .. id,
+		local section = new_section(cursor, CONFIG, "route", "r_" .. id,
 			{ rule_id = id })
 		local ok, err = write_route(cursor, section, args)
 		if not ok then

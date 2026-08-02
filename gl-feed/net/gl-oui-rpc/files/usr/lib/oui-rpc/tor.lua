@@ -63,10 +63,7 @@ local function save_config(enabled, manual, countries)
 	end
 	cursor:set(CONFIG, "main", "enabled", enabled and "1" or "0")
 	cursor:set(CONFIG, "main", "manual", manual and "1" or "0")
-	cursor:delete(CONFIG, "main", "country")
-	for _, country in ipairs(countries) do
-		cursor:add_list(CONFIG, "main", "country", country)
-	end
+	cursor:set(CONFIG, "main", "country", countries)
 	cursor:commit(CONFIG)
 	cursor:close()
 end

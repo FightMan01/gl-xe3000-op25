@@ -18,13 +18,20 @@ local function command_ok(command)
 	return rc == true or rc == 0
 end
 
+-- uci.cursor() only has add()/set(), no section() - this used to crash the
+-- moment direct-DNS redirect was actually enabled.
+local function new_section(cursor, config, section_type, name, values)
+	cursor:set(config, name, section_type)
+	for option, value in pairs(values) do
+		cursor:set(config, name, option, value)
+	end
+	return name
+end
+
 local function backup_dnsmasq(cursor, section)
 	if cursor:get("dhcp", section, "gl_agh_backed_up") == "1" then return end
-	local servers = cursor:get_list("dhcp", section, "server") or {}
-	cursor:delete("dhcp", section, "gl_agh_server_backup")
-	for _, server in ipairs(servers) do
-		cursor:add_list("dhcp", section, "gl_agh_server_backup", server)
-	end
+	local servers = cursor:get("dhcp", section, "server") or {}
+	cursor:set("dhcp", section, "gl_agh_server_backup", servers)
 	cursor:set("dhcp", section, "gl_agh_noresolv_backup",
 		cursor:get("dhcp", section, "noresolv") or "")
 	cursor:set("dhcp", section, "gl_agh_cachesize_backup",
@@ -34,16 +41,14 @@ end
 
 local function enable_dnsmasq_upstream(cursor, section)
 	backup_dnsmasq(cursor, section)
-	cursor:delete("dhcp", section, "server")
-	cursor:add_list("dhcp", section, "server", "127.0.0.1#3053")
+	cursor:set("dhcp", section, "server", { "127.0.0.1#3053" })
 	cursor:set("dhcp", section, "noresolv", "1")
 end
 
 local function restore_dnsmasq(cursor, section)
 	if cursor:get("dhcp", section, "gl_agh_backed_up") ~= "1" then return end
-	local servers = cursor:get_list("dhcp", section, "gl_agh_server_backup") or {}
-	cursor:delete("dhcp", section, "server")
-	for _, server in ipairs(servers) do cursor:add_list("dhcp", section, "server", server) end
+	local servers = cursor:get("dhcp", section, "gl_agh_server_backup") or {}
+	cursor:set("dhcp", section, "server", servers)
 	for option, backup in pairs({
 		noresolv = "gl_agh_noresolv_backup",
 		cachesize = "gl_agh_cachesize_backup",
@@ -65,7 +70,7 @@ local function configure_direct_dns(cursor, enabled)
 	if enabled then
 		local lan_ip = cursor:get("network", "lan", "ipaddr") or "192.168.8.1"
 		for _, proto in ipairs({ "udp", "tcp" }) do
-			cursor:section("firewall", "redirect", "gl_agh_dns_" .. proto, {
+			new_section(cursor, "firewall", "redirect", "gl_agh_dns_" .. proto, {
 				name = "AdGuard Home direct DNS " .. proto:upper(),
 				src = "lan",
 				proto = proto,

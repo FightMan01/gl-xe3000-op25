@@ -30,6 +30,16 @@ local function bool_value(cursor, option)
 	return cursor:get("zerotier", "global", option) == "1"
 end
 
+-- uci.cursor() only has add()/set(), no section() - these used to crash
+-- the moment ZeroTier was actually enabled or a network id was set.
+local function new_section(cursor, config, section_type, name, values)
+	cursor:set(config, name, section_type)
+	for option, value in pairs(values) do
+		cursor:set(config, name, option, value)
+	end
+	return name
+end
+
 local function network_state()
 	local raw = read_command("/usr/bin/zerotier-cli -j listnetworks")
 	if not raw then return nil end
@@ -45,7 +55,7 @@ local function configure_firewall(cursor, enabled, lan_enabled, wan_enabled)
 		cursor:delete("firewall", section)
 	end
 	if enabled then
-		cursor:section("firewall", "zone", "gl_zerotier", {
+		new_section(cursor, "firewall", "zone", "gl_zerotier", {
 			name = "zerotier",
 			input = "ACCEPT",
 			output = "ACCEPT",
@@ -54,11 +64,11 @@ local function configure_firewall(cursor, enabled, lan_enabled, wan_enabled)
 			masq = wan_enabled and "1" or "0",
 		})
 		if lan_enabled then
-			cursor:section("firewall", "forwarding", "gl_zerotier_to_lan",
+			new_section(cursor, "firewall", "forwarding", "gl_zerotier_to_lan",
 				{ src = "zerotier", dest = "lan" })
 		end
 		if wan_enabled then
-			cursor:section("firewall", "forwarding", "gl_zerotier_to_wan",
+			new_section(cursor, "firewall", "forwarding", "gl_zerotier_to_wan",
 				{ src = "zerotier", dest = "wan" })
 		end
 	end
@@ -162,7 +172,7 @@ return {
 		local section = first_network(cursor)
 		if args.enabled then
 			if not section then
-				section = cursor:section("zerotier", "network", "gl_network", {})
+				section = new_section(cursor, "zerotier", "network", "gl_network", {})
 			end
 			cursor:set("zerotier", section, "id", args.id:lower())
 			cursor:set("zerotier", section, "allow_managed", "1")
