@@ -3,6 +3,7 @@
 -- tunnel, authentication and WireGuard transport remain entirely upstream.
 
 local cjson = require "cjson"
+local ubus = require "ubus"
 local uci = require "uci"
 
 local function read_command(command)
@@ -40,26 +41,50 @@ local function bool_arg(value, fallback)
 	return value == true
 end
 
-local function lan_prefix(cursor)
-	local ipaddr = cursor:get("network", "lan", "ipaddr")
-	local netmask = cursor:get("network", "lan", "netmask")
-	if not ipaddr or not netmask then return nil end
+local function interface_status(name)
+	local connected, conn = pcall(ubus.connect)
+	if not connected or not conn then return nil end
+	local ok, state = pcall(conn.call, conn,
+		"network.interface." .. name, "status", {})
+	conn:close()
+	return ok and type(state) == "table" and state or nil
+end
 
-	local function ip_number(value)
-		local a, b, c, d = value:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-		if not a then return nil end
-		return tonumber(a) * 16777216 + tonumber(b) * 65536 +
-			tonumber(c) * 256 + tonumber(d)
+local function read_ipaddr(cursor, network)
+	local raw = cursor:get("network", network, "ipaddr")
+	if type(raw) == "table" then raw = raw[1] end
+	if not raw then return nil, nil end
+	local ip, prefix = raw:match("^([^/]+)/?(%d*)$")
+	return ip or raw, tonumber(prefix)
+end
+
+local function ip_number(value)
+	local a, b, c, d = value:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+	a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+	if not a or not b or not c or not d or a > 255 or b > 255 or
+	   c > 255 or d > 255 then return nil end
+	return a * 16777216 + b * 65536 + c * 256 + d
+end
+
+local function prefix_length(value)
+	local numeric = tonumber(value)
+	if numeric and numeric >= 0 and numeric <= 32 and numeric % 1 == 0 then
+		return numeric
 	end
-
-	local address, mask = ip_number(ipaddr), ip_number(netmask)
-	if not address or not mask then return nil end
-	local prefix = 0
-	local n = mask
-	while n >= 2147483648 do
+	local mask = type(value) == "string" and ip_number(value)
+	if not mask then return nil end
+	local prefix, remainder = 0, mask
+	while remainder >= 2147483648 do
 		prefix = prefix + 1
-		n = (n - 2147483648) * 2
+		remainder = (remainder - 2147483648) * 2
 	end
+	return remainder == 0 and prefix or nil
+end
+
+local function network_prefix(ip, prefix)
+	local address = ip and ip_number(ip)
+	prefix = prefix_length(prefix)
+	if not address or not prefix then return nil end
 	local network = address - (address % (2 ^ (32 - prefix)))
 	return string.format("%d.%d.%d.%d/%d",
 		math.floor(network / 16777216) % 256,
@@ -68,15 +93,12 @@ local function lan_prefix(cursor)
 		network % 256, prefix)
 end
 
-local function wan_prefixes()
+local function interface_prefixes(name)
+	local state = interface_status(name)
 	local result, seen = {}, {}
-	local data = read_command("ip -4 -o route show scope link")
-	for prefix, dev in (data or ""):gmatch("(%d+%.%d+%.%d+%.%d+/%d+)%s+dev%s+(%S+)") do
-		-- Never advertise local bridge networks as "WAN".  Guest/IoT
-		-- bridges may exist even though only br-lan is displayed by the
-		-- current product page.
-		if not dev:match("^br%-") and dev ~= "tailscale0" and
-		   not dev:match("^ifb") and not seen[prefix] then
+	for _, address in ipairs(state and state["ipv4-address"] or {}) do
+		local prefix = network_prefix(address.address, address.mask)
+		if prefix and not seen[prefix] then
 			seen[prefix] = true
 			result[#result + 1] = prefix
 		end
@@ -84,15 +106,50 @@ local function wan_prefixes()
 	return result
 end
 
+local function lan_prefix(cursor)
+	local ip, prefix = read_ipaddr(cursor, "lan")
+	prefix = prefix or prefix_length(cursor:get("network", "lan", "netmask"))
+	if not prefix then
+		local state = interface_status("lan")
+		local address = state and state["ipv4-address"] and state["ipv4-address"][1]
+		if address then ip, prefix = address.address, address.mask end
+	end
+	return network_prefix(ip, prefix)
+end
+
+local function wan_prefixes(cursor)
+	local result = interface_prefixes("wan")
+	if #result > 0 then return result end
+	local ip, prefix = read_ipaddr(cursor, "wan")
+	prefix = prefix or prefix_length(cursor:get("network", "wan", "netmask"))
+	local fallback = network_prefix(ip, prefix)
+	if fallback then result[1] = fallback end
+	return result
+end
+
 local function set_named_section(cursor, config, name, section_type, values)
 	cursor:delete(config, name)
 	cursor:set(config, name, section_type)
 	for option, value in pairs(values or {}) do
-		cursor:set(config, name, option, tostring(value))
+		cursor:set(config, name, option,
+			type(value) == "table" and value or tostring(value))
 	end
 end
 
+local function configure_network(cursor)
+	local changed = cursor:get("network", "tailscale") ~= "interface" or
+		cursor:get("network", "tailscale", "proto") ~= "none" or
+		cursor:get("network", "tailscale", "device") ~= "tailscale0"
+	if not changed then return true end
+	cursor:set("network", "tailscale", "interface")
+	cursor:set("network", "tailscale", "proto", "none")
+	cursor:set("network", "tailscale", "device", "tailscale0")
+	cursor:commit("network")
+	return command_ok("/etc/init.d/network reload")
+end
+
 local function configure_firewall(cursor, lan_enabled, wan_enabled, masq, run_exit_node)
+	local zone_masq = masq or run_exit_node
 	for _, section in ipairs({
 		"gl_tailscale", "gl_tailscale_to_lan",
 		"gl_tailscale_to_wan", "gl_lan_to_tailscale",
@@ -103,7 +160,7 @@ local function configure_firewall(cursor, lan_enabled, wan_enabled, masq, run_ex
 	-- tailscaled is installing its own nftables chains can temporarily
 	-- remove LAN access on some fw4 versions.  Only create a dedicated
 	-- forwarding zone when the user explicitly enables a routing feature.
-	if not (lan_enabled or wan_enabled or masq or run_exit_node) then
+	if not (lan_enabled or wan_enabled or zone_masq or run_exit_node) then
 		cursor:commit("firewall")
 		return true
 	end
@@ -113,18 +170,19 @@ local function configure_firewall(cursor, lan_enabled, wan_enabled, masq, run_ex
 		input = "ACCEPT",
 		output = "ACCEPT",
 		forward = "ACCEPT",
-		device = "tailscale0",
-		masq = masq and "1" or "0",
+		network = { "tailscale" },
+		masq = zone_masq and "1" or "0",
+		mtu_fix = "1",
 	})
 	if lan_enabled then
 		set_named_section(cursor, "firewall", "gl_tailscale_to_lan",
 			"forwarding", { src = "tailscale", dest = "lan" })
 	end
-	if wan_enabled then
+	if wan_enabled or run_exit_node then
 		set_named_section(cursor, "firewall", "gl_tailscale_to_wan",
 			"forwarding", { src = "tailscale", dest = "wan" })
 	end
-	if run_exit_node or masq then
+	if masq then
 		set_named_section(cursor, "firewall", "gl_lan_to_tailscale",
 			"forwarding", { src = "lan", dest = "tailscale" })
 	end
@@ -135,17 +193,24 @@ end
 
 local function apply_settings(cursor)
 	local routes = {}
+	local route_seen = {}
+	local function add_route(prefix)
+		if prefix and not route_seen[prefix] then
+			route_seen[prefix] = true
+			routes[#routes + 1] = prefix
+		end
+	end
 	if bool_value(cursor, "lan_enabled") then
-		local prefix = lan_prefix(cursor)
-		if prefix then routes[#routes + 1] = prefix end
+		add_route(lan_prefix(cursor))
 	end
 	if bool_value(cursor, "wan_enabled") then
-		for _, prefix in ipairs(wan_prefixes()) do routes[#routes + 1] = prefix end
+		for _, prefix in ipairs(wan_prefixes(cursor)) do add_route(prefix) end
 	end
 
 	local exit_node = cursor:get("tailscale", "settings", "exit_node_ip") or ""
 	local run_exit_node = bool_value(cursor, "run_exit_node")
 	local masq = bool_value(cursor, "masq")
+	local effective_masq = masq or run_exit_node
 	local command = {
 		"/usr/sbin/tailscale set",
 		"--accept-dns=false",
@@ -160,11 +225,13 @@ local function apply_settings(cursor)
 		"--advertise-exit-node=" .. (run_exit_node and "true" or "false"),
 		"--exit-node=" .. shell_quote(exit_node),
 		"--exit-node-allow-lan-access=" .. (exit_node ~= "" and "true" or "false"),
-		"--snat-subnet-routes=" .. (masq and "true" or "false"),
+		"--snat-subnet-routes=" .. (effective_masq and "true" or "false"),
 	}
-	command_ok(table.concat(command, " "))
-	configure_firewall(cursor, bool_value(cursor, "lan_enabled"),
+	local tailscale_ok = command_ok(table.concat(command, " "))
+	local network_ok = configure_network(cursor)
+	local firewall_ok = configure_firewall(cursor, bool_value(cursor, "lan_enabled"),
 		bool_value(cursor, "wan_enabled"), masq, run_exit_node)
+	return tailscale_ok, network_ok and firewall_ok
 end
 
 local function exit_node_info(state)
@@ -207,8 +274,10 @@ return {
 			Starting = 4, NoState = 4, InUseOtherUser = 4,
 		}
 		result.status = states[state.BackendState] or 4
-		if type(state.TailscaleIPs) == "table" then
-			for _, address in ipairs(state.TailscaleIPs) do
+		local addresses = type(state.Self) == "table" and state.Self.TailscaleIPs or
+			state.TailscaleIPs
+		if type(addresses) == "table" then
+			for _, address in ipairs(addresses) do
 				if address:match("^%d+%.") then result.address_v4 = address break end
 			end
 		end
@@ -281,7 +350,8 @@ return {
 		if exit_node == nil then
 			exit_node = cursor:get("tailscale", "settings", "exit_node_ip") or ""
 		end
-		if exit_node ~= "" and not exit_node:match("^%d+%.%d+%.%d+%.%d+$") then
+		if type(exit_node) ~= "string" or
+		   (exit_node ~= "" and not ip_number(exit_node)) then
 			return { code = 1, message = "invalid exit_node_ip" }
 		end
 		if run_exit_node and exit_node ~= "" then
@@ -299,10 +369,17 @@ return {
 		if enabled then
 			command_ok("/etc/init.d/tailscale enable")
 			command_ok("/etc/init.d/tailscale start")
-			-- The first invocation creates AuthURL in daemon state.  Do not
-			-- block the RPC while the user has not yet authenticated.
-			command_ok("/usr/sbin/tailscale up --accept-dns=false --timeout=1s")
-			apply_settings(cursor)
+			local state = status_json()
+			if not state or state.BackendState == "NeedsLogin" then
+				command_ok("/usr/sbin/tailscale up --accept-dns=false --timeout=1s")
+			end
+			local tailscale_ok, routing_ok = apply_settings(cursor)
+			if not tailscale_ok and state and state.BackendState == "Running" then
+				return { code = 1, message = "failed to apply Tailscale settings" }
+			end
+			if not routing_ok then
+				return { code = 1, message = "failed to apply Tailscale network or firewall settings" }
+			end
 		else
 			command_ok("/usr/sbin/tailscale down")
 			command_ok("/etc/init.d/tailscale stop")

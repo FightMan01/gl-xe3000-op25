@@ -82,6 +82,7 @@ local TOPICS = {
 	["cellular.networks_info"] = { "cellular", "networks_info" },
 	["cellular.networks_status"] = { "cellular", "networks_status" },
 	["mcu.status"] = { "mcu", "status" },
+	["vpnclient.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/vpn-client.lua", method = "get_status" },
 }
 
 -- The Internet page also subscribes to "cloud.status" unconditionally on

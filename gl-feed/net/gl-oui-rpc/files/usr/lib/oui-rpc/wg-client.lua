@@ -266,7 +266,15 @@ return {
 		local cursor = uci.cursor()
 		local peer = peer_by_id(cursor, args.peer_id)
 		if not peer then return { err_code = 1, err_msg = "config not found" } end
-		local ok, err = write_peer(cursor, peer[".name"], args)
+		local group_id = args.group_id
+		if group_id == nil then group_id = peer.group_id end
+		if type(group_id) ~= "string" or not group_by_id(cursor, group_id) then
+			return { err_code = 1, err_msg = "group not found" }
+		end
+		local values = {}
+		for key, value in pairs(args) do values[key] = value end
+		values.group_id = group_id
+		local ok, err = write_peer(cursor, peer[".name"], values)
 		if not ok then return { err_code = 1, err_msg = err } end
 		return {}
 	end,

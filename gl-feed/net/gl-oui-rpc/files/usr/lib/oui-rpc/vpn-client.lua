@@ -93,6 +93,35 @@ local function iface_name(tunnel_id)
 	return "vpnc" .. tostring(tunnel_id):sub(1, 8)
 end
 
+local function interface_status(iface)
+	local ok, ubus = pcall(require, "ubus")
+	if not ok then return {} end
+	local conn = ubus.connect()
+	if not conn then return {} end
+	local status = conn:call("network.interface." .. iface, "status", {}) or {}
+	conn:close()
+	return status
+end
+
+local function wireguard_handshake(iface)
+	local latest = 0
+	for line in command_output("wg show " .. iface .. " latest-handshakes"):gmatch("[^\n]+") do
+		local timestamp = tonumber(line:match("^%S+%s+(%d+)$")) or 0
+		if timestamp > latest then latest = timestamp end
+	end
+	return latest
+end
+
+local function wireguard_transfer(iface)
+	local rx_bytes, tx_bytes = 0, 0
+	for line in command_output("wg show " .. iface .. " transfer"):gmatch("[^\n]+") do
+		local rx, tx = line:match("^%S+%s+(%d+)%s+(%d+)$")
+		rx_bytes = rx_bytes + (tonumber(rx) or 0)
+		tx_bytes = tx_bytes + (tonumber(tx) or 0)
+	end
+	return rx_bytes, tx_bytes
+end
+
 local function teardown(cursor, tunnel_id)
 	local iface = iface_name(tunnel_id)
 	command_ok("ifdown " .. iface)
@@ -104,6 +133,7 @@ local function teardown(cursor, tunnel_id)
 	for _, name in ipairs(peer_sections) do cursor:delete("network", name) end
 	cursor:delete("firewall", "gl_vpnc_" .. iface)
 	cursor:delete("firewall", "gl_vpnc_" .. iface .. "_fwd")
+	cursor:delete("firewall", "gl_vpnc_" .. iface .. "_lan_fwd")
 	cursor:commit("network")
 	cursor:commit("firewall")
 end
@@ -127,6 +157,7 @@ local function apply_runtime(cursor, tunnel)
 	local peer = wg_peer(cursor, tunnel.group_id, tunnel.ref_id)
 	if not peer then return false, "referenced config no longer exists" end
 
+	teardown(cursor, tunnel.tunnel_id)
 	teardown_all_except(cursor, tunnel.tunnel_id)
 
 	local iface = iface_name(tunnel.tunnel_id)
@@ -134,14 +165,29 @@ local function apply_runtime(cursor, tunnel)
 	if peer.address_v4 and peer.address_v4 ~= "" then addresses[#addresses + 1] = peer.address_v4 end
 	if peer.address_v6 and peer.address_v6 ~= "" then addresses[#addresses + 1] = peer.address_v6 end
 
-	local host, port = tostring(peer.end_point or ""):match("^([^:]+):(%d+)$")
+	local host, port = tostring(peer.end_point or ""):match("^%[(.-)%]:(%d+)$")
+	if not host then host, port = tostring(peer.end_point or ""):match("^([^:]+):(%d+)$") end
 	if not host then return false, "invalid endpoint" end
+	port = tonumber(port)
+	if not port or port < 1 or port > 65535 then return false, "invalid endpoint port" end
 
-	new_section(cursor, "network", "interface", iface, {
+	local interface_values = {
 		proto = "wireguard",
 		private_key = peer.private_key,
 		addresses = as_array(addresses),
-	})
+	}
+	local mtu = tonumber(tunnel.mtu) or tonumber(peer.mtu) or 0
+	if mtu > 0 then interface_values.mtu = tostring(mtu) end
+	local listen_port = tonumber(peer.listen_port) or 0
+	if listen_port > 0 and listen_port <= 65535 then
+		interface_values.listen_port = tostring(listen_port)
+	end
+	if peer.dns and peer.dns ~= "" then
+		local dns = {}
+		for server in tostring(peer.dns):gmatch("[^,%s]+") do dns[#dns + 1] = server end
+		if #dns > 0 then interface_values.dns = as_array(dns) end
+	end
+	new_section(cursor, "network", "interface", iface, interface_values)
 	local values = {
 		public_key = peer.public_key,
 		endpoint_host = host,
@@ -156,18 +202,26 @@ local function apply_runtime(cursor, tunnel)
 	new_anon_section(cursor, "network", "wireguard_" .. iface, values)
 	cursor:commit("network")
 
-	new_section(cursor, "firewall", "zone", "gl_vpnc_" .. iface, {
+	local local_access = tunnel.local_access == "1"
+	local zone_name = "gl_vpnc_" .. iface
+	new_section(cursor, "firewall", "zone", zone_name, {
 		name = iface,
 		network = iface,
-		input = "REJECT",
+		input = local_access and "ACCEPT" or "REJECT",
 		output = "ACCEPT",
 		forward = "REJECT",
-		masq = "1",
+		masq = tunnel.masq == "0" and "0" or "1",
 	})
 	new_section(cursor, "firewall", "forwarding", "gl_vpnc_" .. iface .. "_fwd", {
 		src = "lan",
 		dest = iface,
 	})
+	if local_access then
+		new_section(cursor, "firewall", "forwarding", "gl_vpnc_" .. iface .. "_lan_fwd", {
+			src = iface,
+			dest = "lan",
+		})
+	end
 	cursor:commit("firewall")
 
 	command_ok("ubus call network reload")
@@ -181,6 +235,14 @@ local function tunnel_result(tunnel)
 		tunnel_id = tunnel.tunnel_id or "",
 		name = tunnel.name or "",
 		enabled = tunnel.enabled == "1",
+		killswitch = tunnel.killswitch == "1",
+		options = {
+			mtu = tonumber(tunnel.mtu) or 0,
+			local_access = tunnel.local_access == "1",
+			masq = tunnel.masq ~= "0",
+			service_policy = tunnel.service_policy == "1",
+			killswitch = tunnel.killswitch == "1",
+		},
 		from = { type = "default" },
 		to = { type = "default" },
 		via = {
@@ -229,6 +291,7 @@ return {
 			group_id = first_config.group_id,
 			ref_id = ref_id,
 			enabled = args.enabled and "1" or "0",
+			masq = "1",
 			order = tostring(order),
 		})
 		cursor:commit(CONFIG)
@@ -254,10 +317,12 @@ return {
 			end
 			local first_config = (via.configs or {})[1] or {}
 			local ref_id = (first_config.id_list or {})[1]
-			if type(first_config.group_id) == "string" and type(ref_id) == "string" then
-				cursor:set(CONFIG, tunnel[".name"], "group_id", first_config.group_id)
-				cursor:set(CONFIG, tunnel[".name"], "ref_id", ref_id)
+			if type(first_config.group_id) ~= "string" or type(ref_id) ~= "string"
+				or not wg_peer(cursor, first_config.group_id, ref_id) then
+				return { err_code = 1, err_msg = "referenced config not found" }
 			end
+			cursor:set(CONFIG, tunnel[".name"], "group_id", first_config.group_id)
+			cursor:set(CONFIG, tunnel[".name"], "ref_id", ref_id)
 		end
 		if args.enabled ~= nil then
 			cursor:set(CONFIG, tunnel[".name"], "enabled", args.enabled and "1" or "0")
@@ -324,6 +389,31 @@ return {
 	end,
 
 	set_options = function(args)
+		args = args or {}
+		local cursor = uci.cursor()
+		local tunnel = tunnel_by_id(cursor, args.tunnel_id)
+		if not tunnel then return { err_code = 1, err_msg = "tunnel not found" } end
+
+		local mtu = tonumber(args.mtu) or 0
+		if mtu ~= 0 and (mtu < 68 or mtu > 65535) then
+			return { err_code = 1, err_msg = "invalid MTU" }
+		end
+		if args.killswitch == true or args.service_policy == true then
+			return { err_code = 1, err_msg = "kill switch options are not supported on this build" }
+		end
+
+		cursor:set(CONFIG, tunnel[".name"], "mtu", tostring(mtu))
+		cursor:set(CONFIG, tunnel[".name"], "local_access", args.local_access and "1" or "0")
+		cursor:set(CONFIG, tunnel[".name"], "masq", args.masq == false and "0" or "1")
+		cursor:set(CONFIG, tunnel[".name"], "service_policy", "0")
+		cursor:set(CONFIG, tunnel[".name"], "killswitch", "0")
+		cursor:commit(CONFIG)
+
+		tunnel = tunnel_by_id(cursor, args.tunnel_id)
+		if tunnel.enabled == "1" then
+			local ok, err = apply_runtime(cursor, tunnel)
+			if not ok then return { err_code = 1, err_msg = err } end
+		end
 		return {}
 	end,
 
@@ -333,26 +423,95 @@ return {
 
 	get_all_config_list = function()
 		local cursor = uci.cursor()
-		local groups = {}
+		local wireguard = {}
 		cursor:foreach(WGCLIENT_CONFIG, "group", function(group)
-			local configs = {}
+			local peers = {}
 			cursor:foreach(WGCLIENT_CONFIG, "peer", function(peer)
 				if peer.group_id == group.group_id then
-					configs[#configs + 1] = {
+					local allowed_ips = {}
+					local decoded = cjson.decode(peer.allowed_ips_json or "[]")
+					for _, ip in ipairs(decoded or {}) do
+						allowed_ips[#allowed_ips + 1] = { ip = ip }
+					end
+					peers[#peers + 1] = {
 						peer_id = peer.peer_id or "",
 						name = peer.name or "",
+						group_id = peer.group_id or "",
+						address_v4 = peer.address_v4 or "",
+						address_v6 = peer.address_v6 or "",
+						private_key = peer.private_key or "",
+						public_key = peer.public_key or "",
+						end_point = peer.end_point or "",
+						allowed_ips = as_array(allowed_ips),
+						dns = peer.dns or "",
+						mtu = tonumber(peer.mtu),
+						listen_port = tonumber(peer.listen_port),
+						persistent_keepalive = tonumber(peer.persistent_keepalive),
+						presharedkey_enable = peer.presharedkey_enable == "1",
+						preshared_key = peer.preshared_key or "",
 					}
 				end
 			end)
-			groups[#groups + 1] = {
+			wireguard[#wireguard + 1] = {
 				group_id = group.group_id or "",
 				group_name = group.group_name or "",
 				group_type = 3,
-				type = "wireguard",
-				configs = as_array(configs),
+				auth_type = 1,
+				procedure = 0,
+				show = 0,
+				peers = as_array(peers),
 			}
 		end)
-		return { groups = as_array(groups) }
+
+		local openvpn = {}
+		cursor:foreach("gl_ovpnclient", "group", function(group)
+			openvpn[#openvpn + 1] = {
+				group_id = group.group_id or "",
+				group_name = group.group_name or "",
+				group_type = 3,
+				auth_type = 1,
+				procedure = 0,
+				show = 0,
+				clients = cjson.empty_array,
+			}
+		end)
+		return { configs = { openvpn = as_array(openvpn), wireguard = as_array(wireguard) } }
+	end,
+
+	get_status = function()
+		local cursor = uci.cursor()
+		local status_list = {}
+		for _, tunnel in ipairs(tunnel_sections(cursor)) do
+			local iface = iface_name(tunnel.tunnel_id)
+			local status = 0
+			local rx_bytes, tx_bytes = 0, 0
+			local peer = wg_peer(cursor, tunnel.group_id, tunnel.ref_id)
+			if tunnel.enabled == "1" and tunnel.tunnel_type == "wireguard" then
+				local interface = interface_status(iface)
+				local handshake = wireguard_handshake(iface)
+				if interface.up and handshake > 0 and os.time() - handshake < 180 then
+					status = 1
+				elseif interface.up then
+					status = 2
+				end
+				rx_bytes, tx_bytes = wireguard_transfer(iface)
+			end
+			local endpoint = peer and peer.end_point or ""
+			local host, port = tostring(endpoint):match("^%[(.-)%]:(%d+)$")
+			if not host then host, port = tostring(endpoint):match("^([^:]+):(%d+)$") end
+			status_list[#status_list + 1] = {
+				tunnel_id = tunnel.tunnel_id or "",
+				type = tunnel.tunnel_type or "wireguard",
+				group_id = tunnel.group_id or "",
+				peer_id = tunnel.ref_id or "",
+				status = status,
+				domain = host and { host } or cjson.empty_array,
+				port = tonumber(port),
+				rx_bytes = rx_bytes,
+				tx_bytes = tx_bytes,
+			}
+		end
+		return { status_list = as_array(status_list) }
 	end,
 
 	get_connection_methods = function()
