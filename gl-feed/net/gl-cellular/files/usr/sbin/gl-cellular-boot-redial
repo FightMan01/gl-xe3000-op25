@@ -1,7 +1,32 @@
 #!/bin/sh
 
 TAG=gl-cellular-wwan-watchdog
-failures=0
+
+opt() {
+	local val
+	val="$(uci -q get gl-cellular.watchdog.$1)"
+	echo "${val:-$2}"
+}
+
+CHECK_PERIOD=$(opt check_period_sec 30)
+OFFLINE_THRESHOLD=$(opt offline_threshold 3)
+TRIGGER_WINDOW=$(opt restore_trigger_window_sec 300)
+TRIGGER_MAX=$(opt restore_trigger_max_cnt 3)
+BLOCK_SEC=$(opt restore_block_sec 300)
+GRACE_SEC=$(opt redial_grace_sec 120)
+CFUN_AFTER_CYCLES=$(opt cfun_after_cycles 2)
+CFUN_COOLDOWN=$(opt cfun_cooldown_sec 1800)
+
+consec_bad=0
+redial_count=0
+window_start=0
+blocked_until=0
+grace_until=0
+failed_cycles=0
+last_cfun=0
+last_device=""
+last_rx=""
+nosignal_logged=0
 
 enabled() {
 	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
@@ -9,49 +34,221 @@ enabled() {
 	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ]
 }
 
-traffic_ok() {
-	local device up target
-	device="$(ifstatus wwan_4 2>/dev/null |
-		jsonfilter -e '@.l3_device' 2>/dev/null)"
-	up="$(ifstatus wwan_4 2>/dev/null |
-		jsonfilter -e '@.up' 2>/dev/null)"
-	[ "$up" = "true" ] && [ -n "$device" ] || return 2
+reset_state() {
+	consec_bad=0
+	redial_count=0
+	window_start=0
+	blocked_until=0
+	grace_until=0
+	failed_cycles=0
+	last_rx=""
+}
 
-	for target in 1.1.1.1 8.8.8.8; do
-		ping -I "$device" -c 1 -W 2 "$target" >/dev/null 2>&1 && return 0
+# Sends an AT command through gl-cellular-atd's serialized port access
+# (the AT port is a separate USB composition from the PCIe/MHI MBIM data
+# path, so this never touches the live session). Echoes the raw response,
+# or nothing if the daemon/port is unavailable - callers must treat an
+# empty result as "unknown", not as a failure.
+at_query() {
+	ubus -t 5 call cellular.at command "{\"cmd\":\"$1\",\"timeout\":3}" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null
+}
+
+# Packet-switched attach state: 1 = attached, 0 = not attached (no
+# coverage, in a tunnel, airplane mode, still searching...). Empty means
+# the query itself failed, not that attach is down.
+modem_attached() {
+	at_query 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1
+}
+
+modem_ip() {
+	at_query 'AT+CGPADDR=1' | grep '^+CGPADDR:' |
+		grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1
+}
+
+# 0 = grew since last sample, 1 = flat, 2 = no baseline yet for this
+# device (just redialed, or first run) - treat 2 like "fine, check again
+# next tick" rather than guessing.
+traffic_advancing() {
+	local dev="$1" now
+	now="$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)"
+	[ -n "$now" ] || return 1
+	if [ "$dev" != "$last_device" ] || [ -z "$last_rx" ]; then
+		last_device="$dev"
+		last_rx="$now"
+		return 2
+	fi
+	last_device="$dev"
+	if [ "$now" -gt "$last_rx" ]; then
+		last_rx="$now"
+		return 0
+	fi
+	return 1
+}
+
+# Fallback liveness probe for when rx_bytes is flat and the AT port can't
+# tell us why. Uses the bearer's own DNS server (from the MBIM config
+# response, already installed on wwan_4) ahead of a public fallback, so
+# this isn't just re-pinging the exact two IPs mwan3 already probes on
+# the same interface every 10s.
+ping_confirms() {
+	local dev="$1" target bearer_dns
+	bearer_dns="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@["dns-server"][0]' 2>/dev/null)"
+	for target in $bearer_dns 9.9.9.9 208.67.222.222; do
+		ping -I "$dev" -c 1 -W 2 "$target" >/dev/null 2>&1 && return 0
 	done
 	return 1
+}
+
+log_diag() {
+	local dev="$1"
+	logger -p daemon.warning -t "$TAG" \
+		"stalled, device=$dev cgatt=[$(modem_attached)] cgpaddr=[$(modem_ip)]"
+}
+
+# Tears down and rebuilds the MBIM session. Rate-limited: at most
+# TRIGGER_MAX attempts inside any TRIGGER_WINDOW, then a BLOCK_SEC
+# cooldown - mirrors GL's own stock cellular manager, which guards its
+# equivalent restore path the same way rather than redialing on every
+# single bad tick.
+do_redial() {
+	local now
+	now="$(date +%s)"
+	if [ $((now - window_start)) -gt "$TRIGGER_WINDOW" ]; then
+		window_start=$now
+		redial_count=0
+	fi
+	redial_count=$((redial_count + 1))
+	if [ "$redial_count" -gt "$TRIGGER_MAX" ]; then
+		blocked_until=$((now + BLOCK_SEC))
+		logger -p daemon.warning -t "$TAG" \
+			"$redial_count redials in ${TRIGGER_WINDOW}s, backing off for ${BLOCK_SEC}s"
+		return 1
+	fi
+
+	logger -p daemon.warning -t "$TAG" \
+		"cellular traffic stalled; redialing (attempt $redial_count/$TRIGGER_MAX)"
+	ifdown wwan >/dev/null 2>&1
+	sleep 4
+	if enabled; then ifup wwan >/dev/null 2>&1; fi
+
+	# mbim.sh's own caps/pin/registration/attach/connect handshake can
+	# easily take longer than one poll tick, especially on 5G. Give it a
+	# grace window before judging the redial a failure.
+	grace_until=$((now + GRACE_SEC))
+	consec_bad=0
+	last_rx=""
+	return 0
+}
+
+# Last resort: power-cycle the radio itself. This is the one lever that
+# reaches past MBIM to a wedged PCIe/MHI link or stuck baseband state
+# that a plain ifdown/ifup can't clear - but it costs 15-30s of
+# guaranteed downtime, so it's gated far more conservatively than a
+# redial and must never become the steady state.
+do_cfun_cycle() {
+	local now
+	now="$(date +%s)"
+	[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] || return 1
+
+	last_cfun=$now
+	logger -p daemon.err -t "$TAG" \
+		"$failed_cycles redial cycles did not restore traffic; power-cycling modem radio"
+	at_query 'AT+CFUN=0' >/dev/null
+	sleep 5
+	at_query 'AT+CFUN=1' >/dev/null
+	sleep 10
+	failed_cycles=0
+	do_redial
 }
 
 sleep 25
 while :; do
 	if ! enabled; then
-		failures=0
-		sleep 30
+		reset_state
+		sleep "$CHECK_PERIOD"
 		continue
 	fi
 
-	traffic_ok
-	status=$?
-	case "$status" in
-	0)
-		failures=0
-		;;
-	1)
-		failures=$((failures + 1))
-		if [ "$failures" -ge 3 ]; then
-			logger -p daemon.warning -t "$TAG" \
-				"cellular interface has no traffic; performing recovery redial"
-			ifdown wwan >/dev/null 2>&1
-			sleep 4
-			if enabled; then ifup wwan >/dev/null 2>&1; fi
-			failures=0
-		fi
-		;;
-	*)
-		failures=0
-		;;
-	esac
+	now="$(date +%s)"
 
-	sleep 30
+	if [ "$now" -lt "$blocked_until" ]; then
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	if [ "$now" -lt "$grace_until" ]; then
+		# Just redialed; let mbim.sh finish registering before judging it.
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+
+	good=1
+	if [ "$up" != "true" ] || [ -z "$device" ]; then
+		good=0
+	else
+		traffic_advancing "$device"
+		[ "$?" -eq 1 ] && good=0
+	fi
+
+	if [ "$good" -eq 0 ]; then
+		# Rule out "no coverage" (train tunnel, elevator, airplane mode)
+		# before treating this as a fault. A missing radio attach isn't
+		# something a redial or CFUN cycle can fix any faster than the
+		# baseband re-registering on its own once signal returns, and
+		# redialing into a dead radio would just add churn right as
+		# service comes back.
+		attach="$(modem_attached)"
+		if [ "$attach" = "0" ]; then
+			if [ "$nosignal_logged" -eq 0 ]; then
+				logger -t "$TAG" "no cellular signal/attach; waiting for it to return"
+				nosignal_logged=1
+			fi
+			consec_bad=0
+			sleep "$CHECK_PERIOD"
+			continue
+		fi
+		nosignal_logged=0
+
+		if [ "$up" = "true" ] && [ -n "$device" ]; then
+			# Attached and interface up, but rx_bytes is flat: check for
+			# a stale address before spending a ping. If the network
+			# reassigned the IP mid-session, netifd is still holding the
+			# old static one - mbim.sh only ever reads it once at ifup -
+			# and no ping will fix that, only a redial will.
+			iface_ip="$(ifstatus wwan_4 2>/dev/null |
+				jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+			mip="$(modem_ip)"
+			if [ -n "$mip" ] && [ -n "$iface_ip" ] && [ "$mip" != "$iface_ip" ]; then
+				logger -p daemon.warning -t "$TAG" \
+					"modem IP ($mip) differs from interface IP ($iface_ip); stale address"
+			elif ping_confirms "$device"; then
+				good=1
+			fi
+		fi
+	fi
+
+	if [ "$good" -eq 1 ]; then
+		consec_bad=0
+		failed_cycles=0
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	consec_bad=$((consec_bad + 1))
+	if [ "$consec_bad" -lt "$OFFLINE_THRESHOLD" ]; then
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	log_diag "$device"
+	if do_redial; then
+		failed_cycles=$((failed_cycles + 1))
+		[ "$failed_cycles" -ge "$CFUN_AFTER_CYCLES" ] && do_cfun_cycle
+	fi
+
+	sleep "$CHECK_PERIOD"
 done

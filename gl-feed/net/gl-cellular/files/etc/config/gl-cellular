@@ -10,3 +10,18 @@ config state 'state'
 	# Desired dial state.  The built-in modem auto-connects after boot;
 	# the UI's Connect/Disconnect actions persistently toggle this.
 	option dial_enabled '1'
+
+config watchdog 'watchdog'
+	# Tunables for /usr/sbin/gl-cellular-boot-redial.  All optional - the
+	# script uses these same values as defaults if unset.  Modeled on the
+	# equivalent knobs in GL's own stock cellular manager
+	# (check_period_sec/offline_threshold/restore_trigger_window_sec/
+	# restore_trigger_max_cnt/restore_block_sec there).
+	option check_period_sec '30'
+	option offline_threshold '3'
+	option restore_trigger_window_sec '300'
+	option restore_trigger_max_cnt '3'
+	option restore_block_sec '300'
+	option redial_grace_sec '120'
+	option cfun_after_cycles '2'
+	option cfun_cooldown_sec '1800'

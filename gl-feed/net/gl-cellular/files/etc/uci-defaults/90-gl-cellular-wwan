@@ -27,6 +27,21 @@
 # proto script). Since this is a fixed PCIe device (not USB, no
 # enumeration-order ambiguity), no hotplug-based device detection is
 # needed the way the AT port required.
+#
+# No `dhcp` option is set here, so mbim.sh installs the IPv4 address the
+# bearer hands back as a one-time static address (see mbim.sh's own
+# `dhcp` handling). Setting `option dhcp '1'` on network.wwan would make
+# mbim.sh hand wwan_4 to netifd's generic dhcp proto (real udhcpc lease
+# renewal) instead - closer to how GL's own stock firmware runs udhcpc
+# against its rmnet interface. Left off by default here because it's
+# unverified whether the RM520N-GL's MBIM bearer actually serves DHCP on
+# the data interface (MBIM normally expects the host to take the static
+# config the bearer reports); if it doesn't, wwan never comes up at all,
+# which is worse than the bug this is meant to fix. gl-cellular-boot-
+# redial's own stale-IP check (comparing AT+CGPADDR against netifd's
+# address) covers the same carrier-reassigns-the-IP failure mode without
+# that risk. Safe to try `uci set network.wwan.dhcp=1; uci commit
+# network; ifup wwan` by hand to test on real hardware.
 
 [ -n "$(uci -q get network.wwan)" ] && exit 0
 
