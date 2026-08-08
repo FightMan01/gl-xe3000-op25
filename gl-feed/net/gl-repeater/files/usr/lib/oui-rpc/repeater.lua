@@ -169,9 +169,15 @@ local function apply_config(args)
 	local secret = args.key or args.password
 	local enterprise = args.identity ~= nil or args.eap_type ~= nil
 	if enterprise then
+		local eap_type = (args.eap_type or "peap"):lower()
 		cursor:set("wireless", iface, "encryption", "wpa2")
-		cursor:set("wireless", iface, "eap_type", (args.eap_type or "peap"):lower())
-		cursor:set("wireless", iface, "auth", args.auth or "MSCHAPV2")
+		cursor:set("wireless", iface, "eap_type", eap_type)
+		-- PEAP/FAST only tunnel actual EAP inner methods (EAP-MSCHAPV2, ...);
+		-- the plain PAP/CHAP/MSCHAP/MSCHAPV2 names are TTLS-only. Defaulting
+		-- to plain MSCHAPV2 here made every PEAP network (the common case -
+		-- carrier hotspots, most enterprise APs) fail auth.
+		cursor:set("wireless", iface, "auth",
+			args.auth or (eap_type == "ttls" and "MSCHAPV2" or "EAP-MSCHAPV2"))
 		cursor:set("wireless", iface, "identity", args.identity or "")
 		cursor:set("wireless", iface, "password", secret or "")
 		if args.anonymous_identity then
