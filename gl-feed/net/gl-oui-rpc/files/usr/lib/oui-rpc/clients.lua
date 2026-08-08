@@ -219,6 +219,34 @@ local function build_client_list()
 		end
 	end
 
+	access_cursor:foreach("gl-oui-rpc", "offline_client", function(s)
+		local mac = s.macaddr and s.macaddr:lower()
+		if mac and not seen[mac] then
+			table.insert(out, {
+				mac = mac,
+				ip = s.ip or "",
+				name = s.name or "",
+				alias = s.name or "",
+				iface = "",
+				type = 0,
+				online = false,
+				blocked = is_blocked(mac),
+				remote = false,
+				rx = 0,
+				tx = 0,
+				total_rx = "0",
+				total_tx = "0",
+				total_rx_init = "0",
+				total_tx_init = "0",
+				limit_rx = 0,
+				limit_tx = 0,
+				online_time = tonumber(s.last_seen) or 0,
+				last_update_rate = 0,
+				ipv6 = as_array({}),
+			})
+		end
+	end)
+
 	return out
 end
 

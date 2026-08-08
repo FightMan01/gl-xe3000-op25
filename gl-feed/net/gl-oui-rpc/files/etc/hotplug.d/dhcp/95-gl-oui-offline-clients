@@ -1,0 +1,25 @@
+#!/bin/sh
+# dnsmasq fires this on every lease add/old/del. Nothing previously wrote to
+# gl-oui-rpc's offline_client table, so clients.lua's get_list had nothing
+# to merge in and "Offline Clients" always showed empty - this is the
+# missing write side.
+
+[ -n "$DHCP_MAC" ] || exit 0
+mac="$(echo "$DHCP_MAC" | tr 'A-Z' 'a-z')"
+
+section="$(uci show gl-oui-rpc 2>/dev/null |
+	sed -n "s/^gl-oui-rpc\.\([^.]*\)\.macaddr='$mac'\$/\1/p")"
+
+case "$ACTION" in
+add)
+	[ -n "$section" ] && uci -q delete gl-oui-rpc."$section"
+	;;
+del)
+	[ -n "$section" ] || section="$(uci add gl-oui-rpc offline_client)"
+	uci -q set gl-oui-rpc."$section".macaddr="$mac"
+	uci -q set gl-oui-rpc."$section".ip="$DHCP_IP"
+	uci -q set gl-oui-rpc."$section".name="$DHCP_HOSTNAME"
+	uci -q set gl-oui-rpc."$section".last_seen="$(date +%s)"
+	;;
+esac
+uci -q commit gl-oui-rpc
