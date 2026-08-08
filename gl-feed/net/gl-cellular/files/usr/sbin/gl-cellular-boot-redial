@@ -1,43 +1,57 @@
 #!/bin/sh
 
-# On the XE3000 the first MBIM activation can race MHI's data-channel
-# readiness during boot: the modem reports an activated PDP context and
-# netifd installs addresses/routes, but mhi_hwip0 receives no packets.
-# A later clean redial is reliable.  Detect that exact boot-only condition
-# and recover once; never create a persistent reconnect loop.
+TAG=gl-cellular-wwan-watchdog
+failures=0
 
-TAG=gl-cellular-boot-redial
+enabled() {
+	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
+	[ "$(uci -q get network.wwan.disabled)" != "1" ] || return 1
+	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ]
+}
 
-[ "$(uci -q get network.wwan.auto)" != "0" ] || exit 0
-[ "$(uci -q get network.wwan.disabled)" != "1" ] || exit 0
-
-# Allow PCI/MHI, SIM unlock, registration, and the initial MBIM session to
-# settle.  Quit silently if cellular was not configured or was disconnected.
-sleep 25
-device=
-attempt=0
-while [ "$attempt" -lt 12 ]; do
+traffic_ok() {
+	local device up target
 	device="$(ifstatus wwan_4 2>/dev/null |
 		jsonfilter -e '@.l3_device' 2>/dev/null)"
 	up="$(ifstatus wwan_4 2>/dev/null |
 		jsonfilter -e '@.up' 2>/dev/null)"
-	[ "$up" = "true" ] && [ -n "$device" ] && break
-	attempt=$((attempt + 1))
-	sleep 5
-done
+	[ "$up" = "true" ] && [ -n "$device" ] || return 2
 
-[ "$up" = "true" ] && [ -n "$device" ] || exit 0
+	for target in 1.1.1.1 8.8.8.8; do
+		ping -I "$device" -c 1 -W 2 "$target" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
 
-for target in 1.1.1.1 8.8.8.8; do
-	if ping -I "$device" -c 1 -W 2 "$target" >/dev/null 2>&1; then
-		logger -t "$TAG" "initial cellular session is passing traffic"
-		exit 0
+sleep 25
+while :; do
+	if ! enabled; then
+		failures=0
+		sleep 30
+		continue
 	fi
-done
 
-logger -p daemon.warning -t "$TAG" \
-	"initial MBIM session has no traffic; performing one recovery redial"
-ifdown wwan
-sleep 4
-ifup wwan
-exit 0
+	traffic_ok
+	status=$?
+	case "$status" in
+	0)
+		failures=0
+		;;
+	1)
+		failures=$((failures + 1))
+		if [ "$failures" -ge 3 ]; then
+			logger -p daemon.warning -t "$TAG" \
+				"cellular interface has no traffic; performing recovery redial"
+			ifdown wwan >/dev/null 2>&1
+			sleep 4
+			if enabled; then ifup wwan >/dev/null 2>&1; fi
+			failures=0
+		fi
+		;;
+	*)
+		failures=0
+		;;
+	esac
+
+	sleep 30
+done
