@@ -107,11 +107,17 @@ return {
 		for _, entry in ipairs(args.interfaces) do
 			local m = find_member(entry.interface)
 			if m then
-				if entry.metric then
-					cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(entry.metric) or 1)))
+				-- An unparseable metric/weight must never silently become 1
+				-- (top priority) - that's the one value most likely to
+				-- collide with whatever interface is already prioritized,
+				-- scrambling failover tiering for every member sharing this
+				-- mwan3 policy, not just this one. Leave the existing UCI
+				-- value alone instead of guessing.
+				if entry.metric and tonumber(entry.metric) then
+					cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(entry.metric))))
 				end
-				if entry.weight then
-					cursor:set("mwan3", m.member, "weight", tostring(math.floor(tonumber(entry.weight) or 1)))
+				if entry.weight and tonumber(entry.weight) then
+					cursor:set("mwan3", m.member, "weight", tostring(math.floor(tonumber(entry.weight))))
 				end
 				if entry.enabled ~= nil then
 					cursor:set("mwan3", m.real, "enabled", entry.enabled and "1" or "0")
@@ -129,11 +135,11 @@ return {
 			return { code = 1, message = "unknown interface" }
 		end
 		local cursor = uci.cursor()
-		if args.metric then
-			cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(args.metric) or 1)))
+		if args.metric and tonumber(args.metric) then
+			cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(args.metric))))
 		end
-		if args.weight then
-			cursor:set("mwan3", m.member, "weight", tostring(math.floor(tonumber(args.weight) or 1)))
+		if args.weight and tonumber(args.weight) then
+			cursor:set("mwan3", m.member, "weight", tostring(math.floor(tonumber(args.weight))))
 		end
 		if args.enabled ~= nil then
 			cursor:set("mwan3", m.real, "enabled", args.enabled and "1" or "0")
