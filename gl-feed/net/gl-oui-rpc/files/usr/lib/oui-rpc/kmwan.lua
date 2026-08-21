@@ -125,7 +125,7 @@ return {
 			end
 		end
 		cursor:commit("mwan3")
-		os.execute("/etc/init.d/mwan3 restart >/dev/null 2>&1 &")
+		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -145,7 +145,7 @@ return {
 			cursor:set("mwan3", m.real, "enabled", args.enabled and "1" or "0")
 		end
 		cursor:commit("mwan3")
-		os.execute("/etc/init.d/mwan3 restart >/dev/null 2>&1 &")
+		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -181,7 +181,7 @@ return {
 			cursor:set("mwan3", m.real, "up", tostring(preset.up))
 		end
 		cursor:commit("mwan3")
-		os.execute("/etc/init.d/mwan3 restart >/dev/null 2>&1 &")
+		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
 		return {}
 	end,
 

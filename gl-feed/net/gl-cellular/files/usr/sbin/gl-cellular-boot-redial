@@ -1,6 +1,7 @@
 #!/bin/sh
 
 TAG=gl-cellular-wwan-watchdog
+NET_LOCK=/var/run/gl-net-reconfig.lock
 
 opt() {
 	local val
@@ -130,9 +131,12 @@ do_redial() {
 
 	logger -p daemon.warning -t "$TAG" \
 		"cellular traffic stalled; redialing (attempt $redial_count/$TRIGGER_MAX)"
-	ifdown wwan >/dev/null 2>&1
-	sleep 4
-	if enabled; then ifup wwan >/dev/null 2>&1; fi
+	(
+		flock -w 10 9
+		ifdown wwan >/dev/null 2>&1
+		sleep 4
+		if enabled; then ifup wwan >/dev/null 2>&1; fi
+	) 9>"$NET_LOCK"
 
 	# mbim.sh's own caps/pin/registration/attach/connect handshake can
 	# easily take longer than one poll tick, especially on 5G. Give it a

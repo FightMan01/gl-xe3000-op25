@@ -6,6 +6,7 @@ FAIL_FLAG=/tmp/gl-repeater-fail-type
 RETRY_FLAG=/tmp/gl-repeater-retry-at
 AUTOFIX_COUNT_FLAG=/tmp/gl-repeater-eap-autofix-count
 AUTOFIX_MAX=3
+NET_LOCK=/var/run/gl-net-reconfig.lock
 
 . /lib/functions.sh
 
@@ -64,7 +65,7 @@ try_eap_autofix() {
 	auth=$(uci -q get wireless."$sta_section".auth)
 	[ -z "$auth" ] && uci set wireless."$sta_section".auth=MSCHAPV2
 	uci commit wireless
-	wifi reload >/dev/null 2>&1
+	( flock -w 10 9; wifi reload >/dev/null 2>&1 ) 9>"$NET_LOCK"
 	return 0
 }
 
@@ -88,7 +89,7 @@ while true; do
 			rm -f "$RETRY_FLAG"
 			uci set wireless."$sta_section".disabled=0
 			uci commit wireless
-			wifi reload >/dev/null 2>&1
+			( flock -w 10 9; wifi reload >/dev/null 2>&1 ) 9>"$NET_LOCK"
 		}
 		sleep 2
 		continue
@@ -121,7 +122,7 @@ while true; do
 		echo $((now + RETRY_INTERVAL)) > "$RETRY_FLAG"
 		uci set wireless."$sta_section".disabled=1
 		uci commit wireless
-		wifi reload >/dev/null 2>&1
+		( flock -w 10 9; wifi reload >/dev/null 2>&1 ) 9>"$NET_LOCK"
 		connecting_since=""
 		last_nak_line=""
 	fi
