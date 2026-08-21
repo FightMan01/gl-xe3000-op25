@@ -16,6 +16,7 @@ BLOCK_SEC=$(opt restore_block_sec 300)
 GRACE_SEC=$(opt redial_grace_sec 120)
 CFUN_AFTER_CYCLES=$(opt cfun_after_cycles 2)
 CFUN_COOLDOWN=$(opt cfun_cooldown_sec 1800)
+CFUN_RECHECK_TICKS=$(opt cfun_recheck_ticks 20)
 
 consec_bad=0
 redial_count=0
@@ -27,6 +28,7 @@ last_cfun=0
 last_device=""
 last_rx=""
 nosignal_logged=0
+nosignal_ticks=0
 
 enabled() {
 	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
@@ -147,7 +149,7 @@ do_redial() {
 # guaranteed downtime, so it's gated far more conservatively than a
 # redial and must never become the steady state.
 do_cfun_cycle() {
-	local now
+	local now attempt resp
 	now="$(date +%s)"
 	[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] || return 1
 
@@ -156,7 +158,24 @@ do_cfun_cycle() {
 		"$failed_cycles redial cycles did not restore traffic; power-cycling modem radio"
 	at_query 'AT+CFUN=0' >/dev/null
 	sleep 5
-	at_query 'AT+CFUN=1' >/dev/null
+
+	# AT+CFUN=1 is the one command standing between a live radio and a
+	# router that stays dead until someone physically power-cycles it. A
+	# lost/timed-out response here (AT port contention right after the
+	# power-down, modem still settling) must not be silently accepted as
+	# done - that's exactly how a redial escalation turns into a
+	# permanent outage instead of a 15-30s blip.
+	attempt=0
+	resp=""
+	while [ "$attempt" -lt 3 ] && ! echo "$resp" | grep -q 'OK'; do
+		attempt=$((attempt + 1))
+		resp="$(at_query 'AT+CFUN=1')"
+		echo "$resp" | grep -q 'OK' || sleep 3
+	done
+	if ! echo "$resp" | grep -q 'OK'; then
+		logger -p daemon.err -t "$TAG" \
+			"AT+CFUN=1 did not confirm after $attempt attempts; radio may still be off"
+	fi
 	sleep 10
 	failed_cycles=0
 	do_redial
@@ -207,11 +226,33 @@ while :; do
 				logger -t "$TAG" "no cellular signal/attach; waiting for it to return"
 				nosignal_logged=1
 			fi
+			# CGATT=0 is also what a modem reports when its own radio is
+			# off (CFUN=0) - indistinguishable from a real tunnel/no-
+			# coverage tick by tick. Waiting patiently is correct for the
+			# latter, but after CFUN_RECHECK_TICKS still stuck here,
+			# confirm it isn't the former: a do_cfun_cycle() whose
+			# AT+CFUN=1 never got through would otherwise sit in this
+			# branch forever, since nothing else in this loop ever
+			# revisits CFUN state once attach reads 0.
+			nosignal_ticks=$((nosignal_ticks + 1))
+			if [ "$nosignal_ticks" -ge "$CFUN_RECHECK_TICKS" ]; then
+				nosignal_ticks=0
+				now="$(date +%s)"
+				if [ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] &&
+					[ "$(at_query 'AT+CFUN?' | grep '^+CFUN:' | grep -oE '[0-9]+' | head -n1)" = "0" ]; then
+					logger -p daemon.err -t "$TAG" \
+						"radio reports CFUN=0 during a no-signal wait; resending AT+CFUN=1"
+					last_cfun=$now
+					at_query 'AT+CFUN=1' >/dev/null
+					sleep 10
+				fi
+			fi
 			consec_bad=0
 			sleep "$CHECK_PERIOD"
 			continue
 		fi
 		nosignal_logged=0
+		nosignal_ticks=0
 
 		if [ "$up" = "true" ] && [ -n "$device" ]; then
 			# Attached and interface up, but rx_bytes is flat: check for
