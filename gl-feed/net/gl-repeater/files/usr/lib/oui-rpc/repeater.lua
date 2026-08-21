@@ -34,6 +34,15 @@ end
 
 local RADIOS = { "radio0", "radio1" }
 
+-- gl-repeater-timeout persists a scheduled re-enable time across a manual
+-- disconnect/reconfigure: without clearing it here, Abort (or picking a new
+-- network) sets disabled=1 for only as long as it takes the watchdog to hit
+-- its already-pending retry_at, at which point it flips disabled back to 0
+-- and reconnects on its own - the abort silently "does nothing".
+local function clear_retry_state()
+	os.execute("rm -f /tmp/gl-repeater-retry-at /tmp/gl-repeater-fail-type /tmp/gl-repeater-eap-autofix-count")
+end
+
 local function radio_for_band(cursor, wanted_band)
 	if wanted_band ~= "2g" and wanted_band ~= "5g" then return nil end
 	for _, radio in ipairs(RADIOS) do
@@ -316,6 +325,7 @@ return {
 	end,
 
 	disconnect = function(args)
+		clear_retry_state()
 		local cursor = uci.cursor()
 		local iface = repeater_iface(cursor)
 		if iface then
@@ -329,6 +339,7 @@ return {
 	-- Re-enable an already-configured (but disabled) repeater uplink -
 	-- distinct from set_config, which creates/replaces the config itself.
 	connect = function(args)
+		clear_retry_state()
 		if args and args.ssid then return apply_config(args) end
 		local cursor = uci.cursor()
 		local iface = repeater_iface(cursor)

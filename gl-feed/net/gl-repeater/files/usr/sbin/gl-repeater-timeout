@@ -4,6 +4,8 @@ CONNECT_TIMEOUT=20
 RETRY_INTERVAL=30
 FAIL_FLAG=/tmp/gl-repeater-fail-type
 RETRY_FLAG=/tmp/gl-repeater-retry-at
+AUTOFIX_COUNT_FLAG=/tmp/gl-repeater-eap-autofix-count
+AUTOFIX_MAX=3
 
 . /lib/functions.sh
 
@@ -17,6 +19,55 @@ config_cb() {
 	fi
 }
 
+# Map an EAP method number (RFC 3748 / RFC 5247 registry, restricted to the
+# subset /lib/netifd/hostapd.sh actually knows how to configure) to the
+# UCI eap_type value that will make wpa_supplicant offer it.
+eap_type_for_method() {
+	case "$1" in
+		13) echo tls ;;
+		21) echo ttls ;;
+		25) echo peap ;;
+		43) echo fast ;;
+	esac
+}
+
+# The carrier/enterprise AP - not us - decides which inner EAP method it
+# wants (CTRL-EVENT-EAP-PROPOSED-METHOD in the log); if our configured
+# eap_type doesn't match, wpa_supplicant NAKs it and the AP deauths us
+# (IEEE8021X_FAILED) every single time, forever - no amount of retrying
+# the same eap_type fixes that.  Watch for that specific NAK, and if it
+# names a method our netifd script actually supports, self-correct the
+# UCI eap_type and retry immediately instead of waiting out the full
+# CONNECT_TIMEOUT/RETRY_INTERVAL cycle - and instead of leaving the user
+# stuck having to go diagnose it by hand in LuCI. Bounded by AUTOFIX_MAX
+# per "session" (reset by clear_retry_state() in repeater.lua whenever the
+# user picks a network or hits Abort) so a genuinely broken credential
+# doesn't thrash forever.
+last_nak_line=""
+try_eap_autofix() {
+	local nak_line method new_type count auth
+	nak_line=$(logread | grep 'CTRL-EVENT-EAP-PROPOSED-METHOD.*-> NAK' | tail -n1)
+	[ -z "$nak_line" ] && return 1
+	[ "$nak_line" = "$last_nak_line" ] && return 1
+	last_nak_line="$nak_line"
+
+	method=$(echo "$nak_line" | sed -n 's/.*method=\([0-9]*\).*/\1/p')
+	new_type=$(eap_type_for_method "$method")
+	[ -z "$new_type" ] && return 1
+	[ "$new_type" = "$(uci -q get wireless."$sta_section".eap_type)" ] && return 1
+
+	count=$(cat "$AUTOFIX_COUNT_FLAG" 2>/dev/null || echo 0)
+	[ "$count" -ge "$AUTOFIX_MAX" ] && return 1
+	echo $((count + 1)) > "$AUTOFIX_COUNT_FLAG"
+
+	uci set wireless."$sta_section".eap_type="$new_type"
+	auth=$(uci -q get wireless."$sta_section".auth)
+	[ -z "$auth" ] && uci set wireless."$sta_section".auth=MSCHAPV2
+	uci commit wireless
+	wifi reload >/dev/null 2>&1
+	return 0
+}
+
 connecting_since=""
 
 while true; do
@@ -25,6 +76,7 @@ while true; do
 
 	if [ -z "$sta_section" ]; then
 		connecting_since=""
+		last_nak_line=""
 		rm -f "$FAIL_FLAG" "$RETRY_FLAG"
 		sleep 5
 		continue
@@ -44,6 +96,7 @@ while true; do
 
 	if [ "$(uci -q get wireless."$sta_section".disabled)" = "1" ]; then
 		connecting_since=""
+		last_nak_line=""
 		sleep 5
 		continue
 	fi
@@ -51,7 +104,8 @@ while true; do
 	up=$(ubus call network.interface.repeater status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
 	if [ "$up" = "true" ]; then
 		connecting_since=""
-		rm -f "$FAIL_FLAG"
+		last_nak_line=""
+		rm -f "$FAIL_FLAG" "$AUTOFIX_COUNT_FLAG"
 		sleep 5
 		continue
 	fi
@@ -60,6 +114,8 @@ while true; do
 	if [ -z "$connecting_since" ]; then
 		connecting_since=$now
 		rm -f "$FAIL_FLAG"
+	elif try_eap_autofix; then
+		connecting_since=$now
 	elif [ $((now - connecting_since)) -ge "$CONNECT_TIMEOUT" ]; then
 		echo "not-found" > "$FAIL_FLAG"
 		echo $((now + RETRY_INTERVAL)) > "$RETRY_FLAG"
@@ -67,6 +123,7 @@ while true; do
 		uci commit wireless
 		wifi reload >/dev/null 2>&1
 		connecting_since=""
+		last_nak_line=""
 	fi
 
 	sleep 2
