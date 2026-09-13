@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# Runs once per boot after network comes up: waits for the modem's MHI
+# control port to appear and corrects network.wwan's proto/device if
+# what's fitted needs qmi rather than mbim.  See
+# usr/sbin/gl-cellular-wwan-autoproto for the full story.
+
+START=98
+STOP=01
+
+start() {
+	/usr/sbin/gl-cellular-wwan-autoproto &
+}

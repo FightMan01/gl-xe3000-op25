@@ -18,7 +18,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-cellular
 PKG_VERSION:=1
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -29,7 +29,7 @@ define Package/gl-cellular
   CATEGORY:=Network
   TITLE:=GL.iNet XE3000 cellular/modem management, reimplemented
   DEPENDS:= \
-	+umbim +luci-proto-mbim +kmod-mhi-bus +kmod-mhi-net +kmod-mhi-pci-generic +kmod-mhi-wwan-ctrl +kmod-mhi-wwan-mbim \
+	+umbim +luci-proto-mbim +uqmi +kmod-mhi-bus +kmod-mhi-net +kmod-mhi-pci-generic +kmod-mhi-wwan-ctrl +kmod-mhi-wwan-mbim \
 	+kmod-usb-serial-option +kmod-usb-acm \
 	+lua-eco +lua-eco-termios +lua-eco-ubus +lua-eco-uci +lua-eco-log \
 	+lua-cjson-lua5.4 +libubus-lua +libuci-lua +lua-cjson +gl-oui-rpc
@@ -42,6 +42,12 @@ define Package/gl-cellular/description
   package adds AT-port-based signal/cell detail and SIM/band configuration
   (a separate, parallel USB path) to match GL's original GUI screens, plus
   persistent data-usage accounting.
+
+  Also includes best-effort PCIe/MHI data-path support for the Quectel
+  RM551E-GL (Qualcomm SDX75), which needs netifd's qmi proto instead of
+  mbim - see usr/sbin/gl-cellular-wwan-autoproto. Untested against real
+  RM551E-GL hardware; the AT-port signal/SIM/band features above remain
+  RM520N-GL-only.
 endef
 
 define Package/gl-cellular/conffiles
@@ -62,6 +68,7 @@ define Package/gl-cellular/postinst
 	/etc/init.d/gl-cellular-atd enable
 	/etc/init.d/gl-cellular-pcie-pm enable
 	/etc/init.d/gl-cellular-boot-redial enable
+	/etc/init.d/gl-cellular-wwan-autoproto enable
 }
 exit 0
 endef

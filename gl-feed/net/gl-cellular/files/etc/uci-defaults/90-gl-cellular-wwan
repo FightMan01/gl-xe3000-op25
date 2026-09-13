@@ -42,6 +42,12 @@
 # address) covers the same carrier-reassigns-the-IP failure mode without
 # that risk. Safe to try `uci set network.wwan.dhcp=1; uci commit
 # network; ifup wwan` by hand to test on real hardware.
+#
+# This mbim/wwan0mbim0 pairing is specific to the RM520N-GL's MHI
+# firmware personality. gl-cellular-wwan-autoproto runs once after
+# network starts and switches these two options to qmi/wwan0qmi0
+# instead if that's the control port that actually shows up (e.g. a
+# Quectel RM551E-GL) - see that script for why.
 
 [ -n "$(uci -q get network.wwan)" ] && exit 0
 

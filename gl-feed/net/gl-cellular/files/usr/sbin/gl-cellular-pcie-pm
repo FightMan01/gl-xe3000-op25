@@ -17,4 +17,17 @@ for dev in /sys/bus/pci/devices/*; do
 	[ -w "$dev/power/control" ] && echo on > "$dev/power/control"
 done
 
+# Quectel RM551E-GL (Qualcomm SDX75, PCI device 17cb:0309).  Applied on
+# the same theory as the RM520N-GL above, ahead of having a real unit
+# to confirm it against - this board's exact subsystem ID pairing for
+# the RM551E-GL is not yet known, so match on vendor/device only (no
+# subsystem check).  That's still narrow enough to only ever touch an
+# SDX75 MHI modem function, never an unrelated PCIe device.
+for dev in /sys/bus/pci/devices/*; do
+	[ -r "$dev/vendor" ] || continue
+	[ "$(cat "$dev/vendor")" = "0x17cb" ] || continue
+	[ "$(cat "$dev/device")" = "0x0309" ] || continue
+	[ -w "$dev/power/control" ] && echo on > "$dev/power/control"
+done
+
 exit 0
