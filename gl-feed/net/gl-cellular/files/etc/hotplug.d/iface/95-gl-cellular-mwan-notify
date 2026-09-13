@@ -1,0 +1,25 @@
+#!/bin/sh
+# mwan3track's own ping-based tracking (interval=10s here) notices a wwan_4
+# failure and flips to "disconnecting" well before its own down=3 (~30s)
+# threshold, let alone gl-cellular-boot-redial's own poll tick. Nudge the
+# watchdog awake immediately instead of leaving it to find out on its next
+# tick - it re-runs the exact same validated check, this only saves the
+# wait. A missed/late signal (daemon not running yet, races) just falls
+# back to the normal poll cadence, so this is a pure latency optimization,
+# never a correctness dependency.
+
+[ "$INTERFACE" = "wwan_4" ] || exit 0
+case "$ACTION" in
+	disconnecting|disconnected) ;;
+	*) exit 0 ;;
+esac
+
+# Signaled via ubus (procd's service.signal), not pgrep -f: a pgrep -f
+# invocation's own command line contains the very pattern it searches
+# for, so it can self-match and, under an unlucky PID sort, target the
+# wrong (transient) process instead of the daemon.
+ubus call service signal \
+	'{"name":"gl-cellular-boot-redial","instance":"instance1","signal":10}' \
+	>/dev/null 2>&1
+
+exit 0

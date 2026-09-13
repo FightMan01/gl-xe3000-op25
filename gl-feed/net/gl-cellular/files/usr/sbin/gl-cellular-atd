@@ -646,6 +646,11 @@ local cellular_methods = {
 				cell.dl_bandwidth = cell.nr.dl_bandwidth
 				cell.lte_anchor = anchor
 			end
+			-- The frontend's cell-info drawer renders a generic field list
+			-- (cellInfoKeys, includes ["id","ID"]) keyed off `cellInfo.id`,
+			-- not `cell_id` - without this the Cell ID row silently never
+			-- renders even though the value was computed all along.
+			if cell then cell.id = cell.cell_id end
 			add_signal_levels(cell)
 			con:reply(req, { networks = {
 				{

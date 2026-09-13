@@ -9,7 +9,12 @@ opt() {
 	echo "${val:-$2}"
 }
 
-CHECK_PERIOD=$(opt check_period_sec 30)
+# 3 bad ticks at 10s = ~30s to detect a stalled/stale-address session,
+# down from ~90s at the old 30s period. ping_confirms() (real reachability
+# check, not just rx_bytes) already keeps this from firing on normal
+# link idleness, so the shorter period buys faster recovery from a
+# post-handover stale session without meaningfully raising false positives.
+CHECK_PERIOD=$(opt check_period_sec 10)
 OFFLINE_THRESHOLD=$(opt offline_threshold 3)
 TRIGGER_WINDOW=$(opt restore_trigger_window_sec 300)
 TRIGGER_MAX=$(opt restore_trigger_max_cnt 3)
@@ -30,6 +35,27 @@ last_device=""
 last_rx=""
 nosignal_logged=0
 nosignal_ticks=0
+
+# mwan3track fires ACTION=disconnecting/disconnected on wwan_4 the moment
+# its own ping tracking flips away from online - well before its own
+# down=3 (~30s) threshold, let alone a full poll tick here. A hotplug
+# script (95-gl-cellular-mwan-notify) signals this PID so a real mwan3-
+# observed failure is checked immediately instead of waiting out
+# CHECK_PERIOD. This only ever wakes the loop early into the *same*
+# validated check - it changes nothing about what counts as bad or how
+# redials are rate-limited. SLEEP_PID is read at signal-delivery time
+# (single-quoted), so this one trap serves every do_sleep call for the
+# life of the process; if a signal arrives between calls (mid-check),
+# killing a stale/empty SLEEP_PID is a harmless no-op and the next tick
+# proceeds normally.
+SLEEP_PID=""
+trap 'kill "$SLEEP_PID" 2>/dev/null' USR1
+
+do_sleep() {
+	sleep "$1" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" 2>/dev/null
+}
 
 enabled() {
 	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
@@ -189,20 +215,20 @@ sleep 25
 while :; do
 	if ! enabled; then
 		reset_state
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 
 	now="$(date +%s)"
 
 	if [ "$now" -lt "$blocked_until" ]; then
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 
 	if [ "$now" -lt "$grace_until" ]; then
 		# Just redialed; let mbim.sh finish registering before judging it.
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 
@@ -252,7 +278,7 @@ while :; do
 				fi
 			fi
 			consec_bad=0
-			sleep "$CHECK_PERIOD"
+			do_sleep "$CHECK_PERIOD"
 			continue
 		fi
 		nosignal_logged=0
@@ -279,13 +305,13 @@ while :; do
 	if [ "$good" -eq 1 ]; then
 		consec_bad=0
 		failed_cycles=0
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 
 	consec_bad=$((consec_bad + 1))
 	if [ "$consec_bad" -lt "$OFFLINE_THRESHOLD" ]; then
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 
@@ -295,5 +321,5 @@ while :; do
 		[ "$failed_cycles" -ge "$CFUN_AFTER_CYCLES" ] && do_cfun_cycle
 	fi
 
-	sleep "$CHECK_PERIOD"
+	do_sleep "$CHECK_PERIOD"
 done
