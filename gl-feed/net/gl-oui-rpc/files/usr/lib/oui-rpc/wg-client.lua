@@ -148,9 +148,18 @@ local function write_peer(cursor, section, args)
 	if type(args.public_key) ~= "string" or args.public_key == "" then
 		return nil, "missing server public key"
 	end
-	if (type(args.address_v4) ~= "string" or args.address_v4 == "")
+	local address_v4 = args.address_v4
+	if (type(address_v4) ~= "string" or address_v4 == "")
 		and (type(args.address_v6) ~= "string" or args.address_v6 == "") then
-		return nil, "missing tunnel address"
+		-- A peer entered by hand often only has private_key/public_key/
+		-- end_point - the WireGuard interface still needs *some* local
+		-- tunnel address to come up, so fall back to one derived from
+		-- the peer id instead of hard-failing on a field the manual-
+		-- entry form doesn't make obviously required. Deterministic
+		-- per section, so set_config re-saves don't drift it.
+		local h = 0
+		for i = 1, #section do h = (h * 31 + section:byte(i)) % 65536 end
+		address_v4 = string.format("10.250.%d.%d/32", math.floor(h / 256), h % 256)
 	end
 	local ips = {}
 	if type(args.allowed_ips) == "table" then
@@ -164,7 +173,7 @@ local function write_peer(cursor, section, args)
 
 	cursor:set(CONFIG, section, "name", args.name)
 	cursor:set(CONFIG, section, "group_id", args.group_id or "")
-	cursor:set(CONFIG, section, "address_v4", args.address_v4 or "")
+	cursor:set(CONFIG, section, "address_v4", address_v4 or "")
 	cursor:set(CONFIG, section, "address_v6", args.address_v6 or "")
 	cursor:set(CONFIG, section, "private_key", args.private_key)
 	cursor:set(CONFIG, section, "public_key", args.public_key)
