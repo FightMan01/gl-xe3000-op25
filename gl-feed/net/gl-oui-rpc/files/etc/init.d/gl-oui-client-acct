@@ -1,0 +1,13 @@
+#!/bin/sh /etc/rc.common
+# One-shot: installs the standalone nftables table clients.lua's
+# wired_client_macs() reads for per-MAC wired traffic accounting (see
+# /etc/gl-oui-client-acct.nft). Not a daemon - nftables interface-name
+# matches (iifname/oifname "br-lan") resolve at packet time, not load
+# time, so this is safe to apply before br-lan exists and never needs
+# re-running after a firewall reload (separate table from fw4's own).
+
+START=99
+
+start_service() {
+	nft -f /etc/gl-oui-client-acct.nft 2>&1 | logger -t gl-oui-client-acct
+}

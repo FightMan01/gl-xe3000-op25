@@ -1,0 +1,10 @@
+table inet gl_client_acct {
+	chain upload {
+		type filter hook forward priority filter - 5; policy accept;
+		iifname "br-lan" meter lan_upload_meter { ether saddr timeout 4h counter }
+	}
+	chain download {
+		type filter hook forward priority filter - 5; policy accept;
+		oifname "br-lan" meter lan_download_meter { ether daddr timeout 4h counter }
+	}
+}

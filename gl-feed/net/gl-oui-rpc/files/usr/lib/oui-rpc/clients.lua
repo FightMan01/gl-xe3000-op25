@@ -80,6 +80,60 @@ local function wifi_client_macs()
 	return by_mac
 end
 
+-- Wired clients have no hostapd-style per-station counter, so
+-- /etc/gl-oui-client-acct.nft installs a standalone nftables table (own
+-- name, forward hook, policy accept - never touches fw4's own tables or
+-- any accept/drop decision) with two dynamic meters keyed by MAC:
+-- packets/bytes entering the router from br-lan (a LAN client's upload)
+-- and packets/bytes leaving toward br-lan (a LAN client's download).
+-- Survives `/etc/init.d/firewall reload` since it's a completely
+-- separate table from fw4's.
+local function nft_meter_bytes(meter)
+	local by_mac = {}
+	local f = io.popen("nft -j list meter inet gl_client_acct " .. meter .. " 2>/dev/null")
+	if not f then return by_mac end
+	local raw = f:read("*a")
+	f:close()
+	local ok, data = pcall(cjson.decode, raw)
+	if not ok or type(data) ~= "table" then return by_mac end
+	for _, obj in ipairs(data.nftables or {}) do
+		local set = obj.set
+		if set and set.elem then
+			for _, e in ipairs(set.elem) do
+				local el = e.elem
+				if el and el.val and el.counter then
+					by_mac[el.val:lower()] = tonumber(el.counter.bytes) or 0
+				end
+			end
+		end
+	end
+	return by_mac
+end
+
+-- Same {rx_bytes, tx_bytes} shape as wifi_client_macs() so both feed
+-- update_traffic() identically. Only fills in MACs the WiFi meter didn't
+-- already cover - a WiFi client's forwarded traffic passes through
+-- br-lan too and would otherwise double-count here, but hostapd's own
+-- per-station counter is authoritative for it already.
+local function wired_client_macs(wifi_macs)
+	local upload = nft_meter_bytes("lan_upload_meter")
+	local download = nft_meter_bytes("lan_download_meter")
+	local by_mac = {}
+	for mac, bytes in pairs(upload) do
+		if not wifi_macs[mac] then
+			by_mac[mac] = by_mac[mac] or {}
+			by_mac[mac].tx_bytes = bytes
+		end
+	end
+	for mac, bytes in pairs(download) do
+		if not wifi_macs[mac] then
+			by_mac[mac] = by_mac[mac] or {}
+			by_mac[mac].rx_bytes = bytes
+		end
+	end
+	return by_mac
+end
+
 local function load_client_state()
 	local f = io.open(CLIENT_STATE, "r")
 	if not f then return {} end
@@ -130,9 +184,11 @@ local function update_traffic(state, wifi_macs, now)
 end
 
 -- total_rx/total_tx are cumulative byte counters returned as strings to
--- avoid JS double-precision loss above 2^53. WiFi rx/tx come from hostapd;
--- wired per-client accounting has no backend yet so it stays at zero
--- rather than being faked.
+-- avoid JS double-precision loss above 2^53. WiFi rx/tx come from
+-- hostapd; wired rx/tx comes from the nftables meters in
+-- wired_client_macs() (only covers LAN<->WAN routed traffic - two wired
+-- clients talking directly to each other over the bridge isn't seen by
+-- either, since that never reaches the forward hook these meters sit on).
 --
 -- "Offline cache": every client this ever sees gets a row in the
 -- persistent state file (last-known ip/name/iface + cumulative traffic,
@@ -146,11 +202,20 @@ end
 local function build_client_list()
 	local leases = dhcp_leases()
 	local wifi_macs = wifi_client_macs()
+	local wired_macs = wired_client_macs(wifi_macs)
 	local seen = {}
 	local out = {}
 	local now = os.time()
 	local state = load_client_state()
-	local traffic = update_traffic(state, wifi_macs, now)
+	-- update_traffic() only cares about the {rx_bytes, tx_bytes} shape,
+	-- not the source - merging is safe since wired_client_macs() already
+	-- excludes anything wifi_macs covers. Classification (iface/type)
+	-- below still keys strictly off wifi_macs, so this merge only
+	-- widens traffic accounting, never reclassifies a client.
+	local traffic_sources = {}
+	for mac, v in pairs(wifi_macs) do traffic_sources[mac] = v end
+	for mac, v in pairs(wired_macs) do traffic_sources[mac] = v end
+	local traffic = update_traffic(state, traffic_sources, now)
 	local access_cursor = uci.cursor()
 	local access_mode = access_cursor:get("gl-oui-rpc", "black_white_list", "mode") or "black"
 	local access_list = access_cursor:get(
@@ -177,39 +242,68 @@ local function build_client_list()
 
 	for mac, lease in pairs(leases) do
 		local wifi = wifi_macs[mac]
-		local custom_name = client_info(mac)
-		local display_name = custom_name or lease.hostname or ""
-		local counters = traffic[mac] or {
-			rx = 0, tx = 0, total_rx = "0", total_tx = "0",
-		}
-		table.insert(out, {
-			mac = mac,
-			ip = lease.ipaddr,
-			name = display_name,
-			alias = custom_name or "",
-			iface = wifi and wifi.band or "cable",
-			type = wifi and 1 or 2,
-			online = true,
-			blocked = is_blocked(mac),
-			remote = false,
-			rx = counters.rx,
-			tx = counters.tx,
-			total_rx = counters.total_rx,
-			total_tx = counters.total_tx,
-			total_rx_init = "0",
-			total_tx_init = "0",
-			limit_rx = 0,
-			limit_tx = 0,
-			online_time = now,
-			last_update_rate = now,
-			ipv6 = as_array({}),
-		})
-		seen[mac] = true
-		local row = state[mac] or {}
-		state[mac] = row
-		row.ip, row.name, row.iface = lease.ipaddr, display_name, (wifi and wifi.band or "cable")
-		row.first_seen = row.first_seen or now
-		row.last_seen = now
+		-- A DHCP lease outlives a WiFi association by hours - it's proof a
+		-- MAC was assigned an IP at some point, not that it's connected
+		-- right now. For a MAC we've only ever seen over WiFi, a lease
+		-- with no current association means it disassociated (deauth,
+		-- sleep, out of range), not that it suddenly became a wired
+		-- client - without this check it would report online=true,
+		-- iface="cable" until the lease itself expires, hours later. A
+		-- MAC with no prior WiFi history keeps the old
+		-- cable/online-while-leased behavior, since that's the best
+		-- signal genuinely wired clients have (no live link-state feed
+		-- for them here - see get_status's wired-traffic comment).
+		-- `iface` alone isn't a safe signal here: it gets overwritten to
+		-- "cable" by this very branch the first time a WiFi client
+		-- disassociates, so a MAC already mis-tagged by that bug before
+		-- this fix landed would otherwise look like it was always wired.
+		-- `ever_wifi` is sticky (set below, never cleared) and immune to
+		-- that. (raw_rx/raw_tx are NOT a safe fallback here - they get
+		-- written for every traffic_sources entry, wired included, once
+		-- update_traffic() also covers wired MACs via the nftables
+		-- meters, so their mere presence no longer implies WiFi history.)
+		local prior = state[mac]
+		local was_wifi_only = prior and (prior.ever_wifi
+			or prior.iface == "2G" or prior.iface == "5G")
+		if wifi or not was_wifi_only then
+			local custom_name = client_info(mac)
+			local display_name = custom_name or lease.hostname or ""
+			local counters = traffic[mac] or {
+				rx = 0, tx = 0, total_rx = "0", total_tx = "0",
+			}
+			table.insert(out, {
+				mac = mac,
+				ip = lease.ipaddr,
+				name = display_name,
+				alias = custom_name or "",
+				iface = wifi and wifi.band or "cable",
+				type = wifi and 1 or 2,
+				online = true,
+				blocked = is_blocked(mac),
+				remote = false,
+				rx = counters.rx,
+				tx = counters.tx,
+				total_rx = counters.total_rx,
+				total_tx = counters.total_tx,
+				total_rx_init = "0",
+				total_tx_init = "0",
+				limit_rx = 0,
+				limit_tx = 0,
+				online_time = now,
+				last_update_rate = now,
+				ipv6 = as_array({}),
+			})
+			seen[mac] = true
+			local row = state[mac] or {}
+			state[mac] = row
+			row.ip, row.name, row.iface = lease.ipaddr, display_name, (wifi and wifi.band or "cable")
+			if wifi then row.ever_wifi = true end
+			row.first_seen = row.first_seen or now
+			row.last_seen = now
+		end
+		-- else: leave state[mac] untouched and don't mark seen - the
+		-- offline-history pass below reports it correctly (offline,
+		-- last-known wifi iface/ip/name/time) from the last real sighting.
 	end
 
 	for mac, wifi in pairs(wifi_macs) do
@@ -244,6 +338,7 @@ local function build_client_list()
 			local row = state[mac] or {}
 			state[mac] = row
 			row.ip, row.name, row.iface = "", custom_name or "", wifi.band
+			row.ever_wifi = true
 			row.first_seen = row.first_seen or now
 			row.last_seen = now
 		end

@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -70,6 +70,8 @@ define Package/gl-oui-rpc/postinst
 [ -n "$$IPKG_INSTROOT" ] || {
 	/etc/init.d/gl-ngx-session enable
 	/etc/init.d/gl-internet-led enable
+	/etc/init.d/gl-oui-client-acct enable
+	/etc/init.d/gl-oui-client-acct start
 	/etc/init.d/sqm enable
 	/etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable
