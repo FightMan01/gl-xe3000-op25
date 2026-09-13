@@ -178,15 +178,24 @@ return {
 		for _, p in ipairs(PORTS) do
 			local role = (p == lan_dev) and "lan" or (p == wan_dev) and "wan" or DEFAULT_ROLE[p]
 			local link = link_state(p)
+			-- The frontend's port-icon color (hasSpeed) treats *any*
+			-- present, non-empty `speed` - including 0 - as "linked",
+			-- and its "Speed" row only renders a clean "--" when BOTH
+			-- speed and duplex are absent (otherwise, e.g. duplex set
+			-- but speed missing, it falls through to the literal text
+			-- "undefined Mbps"). So both fields must be omitted
+			-- together when down, not sent as 0/"unknown".
+			-- /sys/class/net/*/duplex also reads a stale "half" even
+			-- with no carrier, so it's only trustworthy while up too.
 			local entry = {
 				name = NAMES[p] or p,
 				mode = role,
-				duplex = link.duplex or "unknown",
 				pvid = 1,
 				vlan_mode = "Standard",
 			}
 			if link.link_up and link.speed_mbps then
 				entry.speed = link.speed_mbps
+				entry.duplex = link.duplex or "full"
 			end
 			table.insert(ports, entry)
 		end
