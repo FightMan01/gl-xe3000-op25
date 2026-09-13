@@ -11,7 +11,7 @@ GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the origi
 
 ## What's here
 
-- **gl-oui-rpc** - the `/rpc` and `/ws` handlers, the session/login daemon, and most per-page backends (wifi, LAN/guest/IoT, firewall, multi-WAN, system status, clients, scheduled tasks, DNS, IPv6, USB, tailscale, and more)
+- **gl-oui-rpc** - the `/rpc` and `/ws` handlers, the session/login daemon, and most per-page backends (wifi, LAN/guest/IoT, native VLAN subnets, firewall, multi-WAN, system status, clients, scheduled tasks, DNS, IPv6, USB, tailscale, VPN client/server, and more)
 - **gl-oui-runtime** - a small vanilla-JS file that keeps the Internet/Multi-WAN status cards live without needing a page refresh, plus a fallback restore page for getting the GL GUI back after flashing (both original code, not vendored from GL)
 - **gl-cellular** - RM520N-GL modem management over its AT port (SIM/APN config, band locking, cell tower scanning, SMS), plus the PCIe/MHI wiring for the actual data connection
 - **gl-mcu** - the onboard battery/MCU controller daemon (UART, JSON wire protocol with GL's byte-substitution framing)
@@ -76,6 +76,6 @@ The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what y
 
 ## Status
 
-Day-to-day this runs wifi, LAN/guest/IoT networks, the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, and the battery/MCU controller. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, and OLED screen scheduling (this device has no screen).
+Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, and the battery/MCU controller. Best-effort, untested-on-real-hardware support for a Quectel RM551E-GL (Qualcomm SDX75) alongside the RM520N-GL this is otherwise built around - see `gl-cellular-wwan-autoproto`. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, and OLED screen scheduling (this device has no screen).
 
 Tested on a physical XE3000. Issues and pull requests welcome.
