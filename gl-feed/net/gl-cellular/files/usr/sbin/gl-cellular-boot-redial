@@ -158,7 +158,23 @@ do_redial() {
 	logger -p daemon.warning -t "$TAG" \
 		"cellular traffic stalled; redialing (attempt $redial_count/$TRIGGER_MAX)"
 	(
-		flock -w 10 9
+		# This router's BusyBox flock has no -w (timeout): only
+		# -s/-x/-u/-n (confirmed via `flock --help` against the actual
+		# device, v1.38.0). The old `flock -w 10 9` therefore failed
+		# immediately with an "unrecognized option" usage message on
+		# every single call - and since nothing checked its exit
+		# status, execution fell through to ifdown/ifup completely
+		# unprotected every time. This lock has never actually
+		# serialized anything. Poll -n in a bounded loop instead, and
+		# actually bail if it can't be acquired - needed now that
+		# gl-cellular-wwan-reconnect (settings-driven reconnects) takes
+		# this same $NET_LOCK too.
+		tries=0
+		until flock -n 9; do
+			tries=$((tries + 1))
+			[ "$tries" -ge 10 ] && exit 0
+			sleep 1
+		done
 		ifdown wwan >/dev/null 2>&1
 		sleep 4
 		if enabled; then ifup wwan >/dev/null 2>&1; fi

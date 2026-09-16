@@ -1,0 +1,53 @@
+#!/bin/sh
+# Applies a settings-driven "wwan" reconnect (APN/PDP-type edit, band
+# mask apply/clear, ...). Two callers used to each run their own bare
+# `ifdown wwan; ifup wwan`: this script (formerly inlined in modem.lua's
+# set_sim_config) and gl-cellular-wwan-watchdog's do_redial(). Neither
+# coordinated with the other, so a watchdog redial firing while a
+# settings-driven reconnect was still in flight could interleave two
+# concurrent ifdown/ifup sequences on the same interface and leave
+# netifd/mbim wedged - reporting "connected" with an address but passing
+# no traffic - recoverable only by a full router reboot. Both now take
+# the same lock (also honored by gl-cellular-wwan-watchdog's do_redial).
+#
+# A band mask change also measurably takes the radio 10-20s to rescan
+# and reattach (observed on RM520N-GL going from a blocked n1 to n78),
+# not the ~2s a plain APN/PDP-type-only change needs. Poll CGATT after
+# ifdown instead of guessing a fixed delay: an APN-only change leaves
+# the radio already attached and this returns almost immediately, while
+# a real band change waits out the actual rescan instead of racing
+# ifup against a modem that hasn't reattached yet - the connect handshake
+# resolving from a stale/pre-rescan session was exactly how "up" with no
+# working traffic happened.
+
+NET_LOCK=/var/run/gl-net-reconfig.lock
+MAX_WAIT_SEC=20
+
+# This BusyBox's flock has no -w (timeout): only -s/-x/-u/-n. Poll -n in
+# a bounded loop instead - confirmed against the actual router (v1.38.0,
+# `flock --help` lists only -sxun); a bare `flock 9` here would just
+# block forever if the lock were ever stuck, and `flock -w` fails
+# immediately with "unrecognized option" while still returning nonzero,
+# which an unchecked call (as this used to be) silently ignored.
+exec 9>"$NET_LOCK"
+tries=0
+until flock -n 9; do
+	tries=$((tries + 1))
+	[ "$tries" -ge "$MAX_WAIT_SEC" ] && exit 0
+	sleep 1
+done
+
+ifdown wwan >/dev/null 2>&1
+
+tries=0
+while [ "$tries" -lt "$MAX_WAIT_SEC" ]; do
+	cgatt="$(ubus -t 3 call cellular.at command '{"cmd":"AT+CGATT?","timeout":3}' 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null | grep -oE '\+CGATT: 1')"
+	[ -n "$cgatt" ] && break
+	tries=$((tries + 1))
+	sleep 1
+done
+
+if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ]; then
+	ifup wwan >/dev/null 2>&1
+fi

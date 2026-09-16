@@ -715,7 +715,13 @@ return {
 		-- then remains cosmetically up with an address but silently drops
 		-- every packet.  Tear it down first so the new APN/IP profile always
 		-- receives a fresh MBIM activation and gateway.
-		os.execute("(ifdown wwan >/dev/null 2>&1; sleep 2; ifup wwan >/dev/null 2>&1) &")
+		--
+		-- Delegated to gl-cellular-wwan-reconnect rather than inlined here:
+		-- it takes the same lock gl-cellular-wwan-watchdog's do_redial()
+		-- uses, and waits for the radio to actually reattach (a band mask
+		-- change takes 10-20s to rescan, not the ~2s this used to sleep)
+		-- instead of racing ifup against a modem still mid-rescan.
+		os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
 		return {}
 	end,
 
