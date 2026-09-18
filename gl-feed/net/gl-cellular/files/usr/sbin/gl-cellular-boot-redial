@@ -9,26 +9,45 @@ opt() {
 	echo "${val:-$2}"
 }
 
-# 3 bad ticks at 10s = ~30s to detect a stalled/stale-address session,
-# down from ~90s at the old 30s period. ping_confirms() (real reachability
-# check, not just rx_bytes) already keeps this from firing on normal
-# link idleness, so the shorter period buys faster recovery from a
-# post-handover stale session without meaningfully raising false positives.
+# 5 bad ticks before redialing (up from 3): on a moving vehicle, a single
+# ping_confirms() miss can be a genuine WWAN handover-latency spike
+# (observed RTTs up to ~3s in the field) rather than a real outage, and
+# this check now runs ping-first (see the up==true branch below) so it is
+# the sole gate on "bad" - it has to be patient enough not to fire on
+# normal handover jitter.
+#
+# CHECK_PERIOD (10s) is only the floor between ticks, not the tick's own
+# duration: each bad tick also runs ping_confirms (up to 3 targets x 2
+# packets x 4s) and, if that fails, https_confirms (up to 3 URLs x 3s) -
+# worst case (every target and every URL genuinely unreachable) adds up to
+# ~33s to that single tick, not counted in CHECK_PERIOD. So 5 confirmed-bad
+# ticks is *at least* ~50s, but can run up to a few minutes in the worst
+# case where nothing responds to anything. That worst case only occurs
+# when the link is actually down end to end, so a slower confirmation
+# there trades against redialing sooner into a connection that wasn't
+# coming back anyway - just don't mistake OFFLINE_THRESHOLD x CHECK_PERIOD
+# for the real elapsed time.
 CHECK_PERIOD=$(opt check_period_sec 10)
-OFFLINE_THRESHOLD=$(opt offline_threshold 3)
+OFFLINE_THRESHOLD=$(opt offline_threshold 5)
 TRIGGER_WINDOW=$(opt restore_trigger_window_sec 300)
 TRIGGER_MAX=$(opt restore_trigger_max_cnt 3)
 BLOCK_SEC=$(opt restore_block_sec 300)
-GRACE_SEC=$(opt redial_grace_sec 120)
+GRACE_SEC=$(opt redial_grace_sec 180)
 CFUN_AFTER_CYCLES=$(opt cfun_after_cycles 2)
 CFUN_COOLDOWN=$(opt cfun_cooldown_sec 1800)
 CFUN_RECHECK_TICKS=$(opt cfun_recheck_ticks 20)
+# Off by default - see sync_mtu()'s own comment. Enable with
+# `uci set gl-cellular.watchdog.sync_mtu=1; uci commit gl-cellular` only
+# after confirming AT+qnvfr's actual response format against real hardware
+# (a `logger`'d dry-run read is exactly what to check first).
+SYNC_MTU=$(opt sync_mtu 0)
 
 consec_bad=0
 redial_count=0
 window_start=0
 blocked_until=0
 grace_until=0
+redial_pending=0
 failed_cycles=0
 last_cfun=0
 last_device=""
@@ -55,6 +74,7 @@ do_sleep() {
 	sleep "$1" &
 	SLEEP_PID=$!
 	wait "$SLEEP_PID" 2>/dev/null
+	SLEEP_PID=""
 }
 
 enabled() {
@@ -69,8 +89,10 @@ reset_state() {
 	window_start=0
 	blocked_until=0
 	grace_until=0
+	redial_pending=0
 	failed_cycles=0
 	last_rx=""
+	nosignal_ticks=0
 }
 
 # Sends an AT command through gl-cellular-atd's serialized port access
@@ -90,8 +112,44 @@ modem_attached() {
 	at_query 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1
 }
 
+# GL's own stock cellular_manager (decompiled: common_get_runtime_apn +
+# common_get_cid_ip in libcm_modem.so) never assumes a fixed CID - it
+# parses AT+CGDCONT? for the context whose APN matches the one actually
+# configured, and only then queries AT+CGPADDR against that CID. Mirrors
+# that here instead of the hardcoded CGPADDR=1 this used to send: on this
+# modem/carrier combo CID 1 was consistently a different, unrelated
+# context (see modem_ip's own history), not the one MBIM's session
+# data-connects on. Falls back to CID 1 if nothing matches - the same
+# guess this replaces, just as a last resort instead of the only option.
+pdp_cid_for_apn() {
+	local configured_apn resp line rest cid apn
+	configured_apn="$(uci -q get network.wwan.apn)"
+	resp="$(at_query 'AT+CGDCONT?')"
+	if [ -n "$configured_apn" ] && [ -n "$resp" ]; then
+		while IFS= read -r line; do
+			case "$line" in
+			'+CGDCONT:'*)
+				rest="${line#*:}"
+				rest="${rest# }"
+				cid="${rest%%,*}"
+				apn="$(echo "$rest" | cut -d',' -f3 | tr -d '"' | tr -d '[:space:]')"
+				if [ "$apn" = "$configured_apn" ]; then
+					echo "$cid"
+					return
+				fi
+				;;
+			esac
+		done <<-EOF
+			$resp
+			EOF
+	fi
+	echo 1
+}
+
 modem_ip() {
-	at_query 'AT+CGPADDR=1' | grep '^+CGPADDR:' |
+	local cid
+	cid="$(pdp_cid_for_apn)"
+	at_query "AT+CGPADDR=$cid" | grep '^+CGPADDR:' |
 		grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1
 }
 
@@ -102,7 +160,16 @@ traffic_advancing() {
 	local dev="$1" now
 	now="$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)"
 	[ -n "$now" ] || return 1
-	if [ "$dev" != "$last_device" ] || [ -z "$last_rx" ]; then
+	if [ "$dev" != "$last_device" ] || [ -z "$last_rx" ] || [ "$now" -lt "$last_rx" ]; then
+		# Device name changed, first sample, or the counter went backwards
+		# (an ifdown/ifup - ours or netifd/mbim's own, e.g. after a real
+		# network-side reattach - resets rx_bytes to ~0 while last_rx still
+		# holds the old session's larger value). None of these mean the
+		# link is stalled; they mean there's no valid baseline yet for this
+		# session. Without this guard, a reattach that this script never
+		# itself triggered leaves last_rx permanently ahead of the new
+		# counter, so every following tick misreads "not advancing" and the
+		# watchdog immediately starts counting toward a needless redial.
 		last_device="$dev"
 		last_rx="$now"
 		return 2
@@ -115,16 +182,61 @@ traffic_advancing() {
 	return 1
 }
 
-# Fallback liveness probe for when rx_bytes is flat and the AT port can't
-# tell us why. Uses the bearer's own DNS server (from the MBIM config
-# response, already installed on wwan_4) ahead of a public fallback, so
-# this isn't just re-pinging the exact two IPs mwan3 already probes on
-# the same interface every 10s.
+# Fallback liveness probe for when rx_bytes is flat. This is the ONLY real
+# reachability check in this script - everything else (rx_bytes, the
+# CGPADDR-vs-interface-IP comparison) is a proxy that can be wrong. Uses
+# the bearer's own DNS server (from the MBIM config response, already
+# installed on wwan_4) ahead of a public fallback, so this isn't just
+# re-pinging the exact two IPs mwan3 already probes on the same interface
+# every 10s.
+#
+# 2 packets / 4s timeout per target (up from 1/2s): the user has measured
+# ~3s RTTs to public targets while the vehicle is moving, comfortably
+# inside a single WWAN handover's latency spike - a 2s timeout would
+# misreport that as a miss on every target and hand a false "bad" straight
+# to the caller, which (since this function is now the sole gate on
+# good/bad) would turn ordinary handover jitter back into the same
+# reconnect-loop this rewrite exists to stop.
 ping_confirms() {
 	local dev="$1" target bearer_dns
 	bearer_dns="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@["dns-server"][0]' 2>/dev/null)"
 	for target in $bearer_dns 9.9.9.9 208.67.222.222; do
-		ping -I "$dev" -c 1 -W 2 "$target" >/dev/null 2>&1 && return 0
+		ping -I "$dev" -c 2 -W 4 "$target" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+# Decompiled GL's own stock cellular_manager (network_online_detector.c,
+# FUN_001145a0) against this exact modem/carrier combo: its "active"
+# reachability check never trusts a bare ping failure alone - it always
+# ORs the ping result with a real HTTP(S) request to a genuine internet
+# endpoint (their own list: msftconnecttest.com, Apple's captive-portal
+# check, Cloudflare's connectivity trace) via literally
+# `curl --interface <dev> --connect-timeout 2 -m 3 -k -sS -o /dev/null`,
+# because carriers are known to deprioritize or rate-limit bare ICMP under
+# load while HTTP traffic keeps flowing fine - a ping-only check can
+# misreport that as offline.
+#
+# Uses curl now, not uclient-fetch: this router's mwan3 config (see
+# gl-oui-rpc's kmwan defaults) has repeater/tethering members alongside
+# wwan, so it is NOT this router's only WAN in general - uclient-fetch has
+# no equivalent to curl's --interface (no source-interface/address bind),
+# so an earlier unbound version of this check could have reported "online"
+# over a different live WAN while wwan itself was actually dead, silently
+# defeating the whole point of this check. curl's own -k matches GL's
+# exact flag (skip cert verification - this is a reachability probe, not
+# an identity check), which also means no ca-bundle dependency is needed,
+# just a TLS-capable curl build.
+https_confirms() {
+	local dev="$1" url
+	command -v curl >/dev/null 2>&1 || return 1
+	for url in \
+		http://www.msftconnecttest.com/connecttest.txt \
+		https://cp.cloudflare.com/generate_204 \
+		https://captive.apple.com/hotspot-detect.html
+	do
+		curl --interface "$dev" --connect-timeout 2 -m 3 -k -sS -o /dev/null \
+			"$url" >/dev/null 2>&1 && return 0
 	done
 	return 1
 }
@@ -133,6 +245,89 @@ log_diag() {
 	local dev="$1"
 	logger -p daemon.warning -t "$TAG" \
 		"stalled, device=$dev cgatt=[$(modem_attached)] cgpaddr=[$(modem_ip)]"
+}
+
+# Mirrors GL's own stock cellular_manager (fix_ip_type_before_dial,
+# decompiled from libcm_modem.so): before dialing, confirm the SIM
+# actually in the tray still matches the one network.wwan's pdptype was
+# last derived for, and correct it if not - a physical SIM swap can leave
+# a stale IPv4-only/IPv6-only pdptype from the previous card's carrier
+# profile in place, which the new SIM may not need or support.
+#
+# GL's own daemon gates its single dial-initiation choke point on this
+# check. This script has no equivalent choke point - netifd's mbim proto
+# dials independently at boot, outside this script's control - so this
+# runs at script startup (catches a swap made while powered off, correcting
+# it within this script's own ~25s startup delay) and again right before
+# every redial this script itself triggers (catches a hot-swap made while
+# running). That covers the same intent without needing to gate netifd's
+# very first post-boot dial attempt.
+check_sim_swap() {
+	local iccid last_iccid
+	iccid="$(at_query 'AT+QCCID' | grep -oE '[0-9A-Fa-f]{18,20}')"
+	[ -n "$iccid" ] || return 0
+	last_iccid="$(uci -q get gl-cellular.state.last_iccid)"
+	[ "$last_iccid" = "$iccid" ] && return 0
+	if [ -n "$last_iccid" ]; then
+		logger -p daemon.notice -t "$TAG" \
+			"SIM ICCID changed ($last_iccid -> $iccid); re-deriving PDP IP type before dial"
+		# IPv4v6 is the safe default for an unknown/new SIM - netifd's
+		# mbim proto happily drops whichever family the network doesn't
+		# grant, so this never blocks a connection; it only stops a
+		# previous SIM's possibly narrower type (e.g. an IPv4-only MVNO)
+		# from silently carrying over onto a new SIM that supports dual-stack.
+		uci -q set network.wwan.pdptype='IPV4V6'
+		uci -q commit network
+	fi
+	uci -q set "gl-cellular.state.last_iccid=$iccid"
+	uci -q commit gl-cellular
+}
+
+# Mirrors GL's own stock cellular_manager (decompiled: libcm_sim.so's
+# process_mtu_config/rg650v_set_mtu - despite the "rg650v" name, it's
+# actually gated on bus type ("cpu", i.e. any built-in modem including
+# this RM520N-GL), not on that specific model). GL keeps the modem's own
+# baseband NV-stored 3GPP MTU value converged to a per-SIM config value
+# that defaults to 1500 when unset. We have no equivalent per-SIM/carrier
+# database to drive this from, so the faithful adaptation of GL's own
+# default is: converge the NV item to 1500 if it's ever found to be
+# anything else - e.g. a leftover value from a prior stock-firmware flash
+# on the same hardware, which nothing in a netifd/mbim-only stack (which
+# only ever sets the *interface* MTU, never the baseband's own NV value)
+# would notice or correct on its own.
+#
+# Off by default (SYNC_MTU): the write path's target value (1500) and
+# encoding (little-endian hex, e.g. 1500 -> "DC05") are confirmed from the
+# decompile, but the exact AT+qnvfr READ response format was not - the
+# regex below is a best guess. A wrong parse can only ever cause a
+# harmless redundant re-write of the same safe, standard 1500 value (the
+# write payload is a fixed constant, never derived from the possibly-
+# misparsed read), but this still touches modem NV/EFS storage, so it
+# should run at least once with SYNC_MTU=0 (logging what it *would* do
+# only if uncommented for a dry run) before flipping it on for real.
+sync_mtu() {
+	[ "$SYNC_MTU" = "1" ] || return 0
+	local target=1500 resp cur_hex low high cur new_hex
+	resp="$(at_query 'AT+qnvfr="/nv/item_files/data/3gpp/ds_3gpp_mtu"')"
+	cur_hex="$(echo "$resp" | grep -oE '[0-9A-Fa-f]{4}' | head -n1)"
+	if [ -z "$cur_hex" ]; then
+		logger -p daemon.warning -t "$TAG" \
+			"sync_mtu: couldn't parse AT+qnvfr response [$resp]; skipping"
+		return 0
+	fi
+	low=$((16#${cur_hex%??}))
+	high=$((16#${cur_hex#??}))
+	cur=$((high * 256 + low))
+	[ "$cur" -eq "$target" ] && return 0
+
+	logger -p daemon.notice -t "$TAG" \
+		"sync_mtu: modem NV MTU is $cur, expected $target; syncing (matches GL's own default)"
+	low=$((target % 256))
+	high=$((target / 256))
+	new_hex="$(printf '%02X%02X' "$low" "$high")"
+	at_query 'AT+qnvfw="/nv/item_files/modem/data/3gpp/ps/disable_mtu_request",01' >/dev/null
+	at_query "AT+qnvfw=\"/nv/item_files/data/3gpp/ds_3gpp_mtu\",$new_hex" >/dev/null
+	at_query 'AT+QEFSSYNC=1' >/dev/null
 }
 
 # Tears down and rebuilds the MBIM session. Rate-limited: at most
@@ -155,6 +350,10 @@ do_redial() {
 		return 1
 	fi
 
+	# Only worth the AT round-trip once we've actually decided to redial -
+	# a backed-off attempt above returns before ever reaching this.
+	check_sim_swap
+
 	logger -p daemon.warning -t "$TAG" \
 		"cellular traffic stalled; redialing (attempt $redial_count/$TRIGGER_MAX)"
 	(
@@ -168,25 +367,59 @@ do_redial() {
 		# serialized anything. Poll -n in a bounded loop instead, and
 		# actually bail if it can't be acquired - needed now that
 		# gl-cellular-wwan-reconnect (settings-driven reconnects) takes
-		# this same $NET_LOCK too.
+		# this same $NET_LOCK too. Exits 1 (not 0) on failure to acquire,
+		# so the caller can tell a genuinely skipped attempt apart from
+		# one that ran - it used to exit 0 either way, so a contended lock
+		# was indistinguishable from a completed redial and still counted
+		# toward failed_cycles/the CFUN escalation for nothing.
 		tries=0
 		until flock -n 9; do
 			tries=$((tries + 1))
-			[ "$tries" -ge 10 ] && exit 0
+			[ "$tries" -ge 10 ] && exit 1
 			sleep 1
 		done
 		ifdown wwan >/dev/null 2>&1
-		sleep 4
+		# A fixed sleep here raced ifup against a modem that hadn't
+		# finished tearing down - the field logs' "ERROR: mbim message
+		# timeout" / "Failed to read modem caps" right after a redial is
+		# consistent with ifup firing before the modem was ready to answer
+		# even a basic capabilities query. Poll attach state instead (same
+		# bounded pattern gl-cellular-wwan-reconnect already uses for its
+		# own settings-driven reconnects), up to 20s, and proceed as soon
+		# as it responds rather than guessing a fixed delay either way.
+		tries=0
+		while [ "$tries" -lt 20 ]; do
+			[ "$(modem_attached)" = "1" ] && break
+			tries=$((tries + 1))
+			sleep 1
+		done
 		if enabled; then ifup wwan >/dev/null 2>&1; fi
 	) 9>"$NET_LOCK"
+	if [ "$?" -ne 0 ]; then
+		logger -p daemon.warning -t "$TAG" \
+			"could not acquire $NET_LOCK after 10s; skipping this redial attempt"
+		return 1
+	fi
 
 	# mbim.sh's own caps/pin/registration/attach/connect handshake can
 	# easily take longer than one poll tick, especially on 5G. Give it a
-	# grace window before judging the redial a failure.
+	# grace window before judging the redial a failure - but redial_pending
+	# (checked at the top of the main loop) lets that judgment happen as
+	# soon as the interface comes up, not just when GRACE_SEC elapses.
 	grace_until=$((now + GRACE_SEC))
+	redial_pending=1
 	consec_bad=0
 	last_rx=""
 	return 0
+}
+
+# Ground truth for "is the radio actually on", via AT+CFUN? - never trust
+# the SET command's own "OK" echo for this. An "OK" just means the modem
+# accepted the command, not that the radio finished coming back up, and an
+# empty/timed-out response (AT port busy servicing the dashboard's poll or
+# a parallel gloui/at.lua caller) must not be misread as either.
+cfun_is_full() {
+	[ "$(at_query 'AT+CFUN?' | grep '^+CFUN:' | grep -oE '[0-9]+' | head -n1)" = "1" ]
 }
 
 # Last resort: power-cycle the radio itself. This is the one lever that
@@ -195,7 +428,7 @@ do_redial() {
 # guaranteed downtime, so it's gated far more conservatively than a
 # redial and must never become the steady state.
 do_cfun_cycle() {
-	local now attempt resp
+	local now attempt
 	now="$(date +%s)"
 	[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] || return 1
 
@@ -206,28 +439,73 @@ do_cfun_cycle() {
 	sleep 5
 
 	# AT+CFUN=1 is the one command standing between a live radio and a
-	# router that stays dead until someone physically power-cycles it. A
-	# lost/timed-out response here (AT port contention right after the
-	# power-down, modem still settling) must not be silently accepted as
-	# done - that's exactly how a redial escalation turns into a
-	# permanent outage instead of a 15-30s blip.
+	# router that stays dead until someone physically power-cycles it.
+	# Confirm it with AT+CFUN? after each attempt (not the SET's "OK") and
+	# be patient about it - 5 tries at 5s apart gives real headroom over
+	# transient AT port contention, instead of the 3-tries-at-3s-apart
+	# window this used to have, which was easy to lose to a busy AT port
+	# and then declare the radio recovered when it never was.
 	attempt=0
-	resp=""
-	while [ "$attempt" -lt 3 ] && ! echo "$resp" | grep -q 'OK'; do
+	while [ "$attempt" -lt 5 ] && ! cfun_is_full; do
 		attempt=$((attempt + 1))
-		resp="$(at_query 'AT+CFUN=1')"
-		echo "$resp" | grep -q 'OK' || sleep 3
+		at_query 'AT+CFUN=1' >/dev/null
+		sleep 5
 	done
-	if ! echo "$resp" | grep -q 'OK'; then
+
+	if ! cfun_is_full; then
+		# Do NOT fall through to do_redial(): dialing wwan against a radio
+		# that was never confirmed back on just burns a redial attempt for
+		# nothing and can look like "it tried and failed" when it never had
+		# a chance. Leave it for the main loop's own no-signal/
+		# CFUN_RECHECK_TICKS path, which keeps resending AT+CFUN=1 on its
+		# own cadence - this must never be the last attempt.
 		logger -p daemon.err -t "$TAG" \
-			"AT+CFUN=1 did not confirm after $attempt attempts; radio may still be off"
+			"AT+CFUN=1 not confirmed after $attempt attempts; leaving recovery to the no-signal watchdog"
+		return 1
 	fi
+
 	sleep 10
 	failed_cycles=0
 	do_redial
 }
 
+# Shared by both places that conclude "this needs a redial": the normal
+# OFFLINE_THRESHOLD countdown below, and the fast-path in the main loop
+# for a redial whose GRACE_SEC fully elapsed without the interface ever
+# coming up. Keeps the CFUN-escalation bookkeeping (failed_cycles) and
+# do_redial's own rate limiting as the single path both go through.
+#
+# Backgrounds log_diag: it's two-to-three serialized AT round-trips
+# (modem_attached, modem_ip -> pdp_cid_for_apn -> another AT query), each
+# up to a 5s ubus timeout, purely for logging - it must never delay the
+# actual fix. The state it captures may end up a couple seconds stale
+# against the redial that follows; that's an acceptable trade for a
+# diagnostic line.
+#
+# Never calls do_redial and do_cfun_cycle for the same bad tick: that used
+# to happen whenever this tick's redial pushed failed_cycles up to
+# CFUN_AFTER_CYCLES, which meant do_cfun_cycle's AT+CFUN=0 could land
+# seconds after ifup, killing the radio mid-handshake on the very redial
+# meant to fix things. Decide up front which one this tick gets.
+# do_cfun_cycle does its own redial internally once AT+CFUN=1 is
+# confirmed and resets failed_cycles itself; if it declines to run
+# (CFUN_COOLDOWN still active, or a previous cycle never confirmed the
+# radio back on) this falls back to a plain redial instead of doing
+# nothing this tick.
+escalate() {
+	log_diag "$device" &
+	if [ "$((failed_cycles + 1))" -ge "$CFUN_AFTER_CYCLES" ]; then
+		if ! do_cfun_cycle; then
+			do_redial && failed_cycles=$((failed_cycles + 1))
+		fi
+	else
+		do_redial && failed_cycles=$((failed_cycles + 1))
+	fi
+}
+
 sleep 25
+check_sim_swap
+sync_mtu
 while :; do
 	if ! enabled; then
 		reset_state
@@ -242,21 +520,49 @@ while :; do
 		continue
 	fi
 
-	if [ "$now" -lt "$grace_until" ]; then
-		# Just redialed; let mbim.sh finish registering before judging it.
-		do_sleep "$CHECK_PERIOD"
-		continue
+	if [ "$redial_pending" -eq 1 ]; then
+		up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+		if [ "$up" = "true" ]; then
+			# Came back up - no need to wait out the rest of GRACE_SEC.
+			# Fall straight into this tick's normal evaluation below;
+			# last_rx is already "" from do_redial, so traffic_advancing
+			# will correctly treat this as "no baseline yet" rather than
+			# misjudging the fresh session.
+			redial_pending=0
+			grace_until=0
+		elif [ "$now" -lt "$grace_until" ]; then
+			do_sleep "$CHECK_PERIOD"
+			continue
+		else
+			# GRACE_SEC fully elapsed and the interface never came up at
+			# all - e.g. mbim.sh stuck on "Reading capabilities"/"Failed
+			# to read modem caps", a harder wedge than slow registration.
+			# This is already conclusive: waiting out a fresh
+			# OFFLINE_THRESHOLD countdown as if this were an ordinary
+			# flat-traffic tick would add minutes of total downtime before
+			# a second redial, let alone a radio power-cycle, even gets a
+			# chance to run.
+			redial_pending=0
+			logger -p daemon.warning -t "$TAG" \
+				"interface still down ${GRACE_SEC}s after a redial; escalating immediately"
+			device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+			escalate
+			do_sleep "$CHECK_PERIOD"
+			continue
+		fi
 	fi
 
 	device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
 
 	good=1
+	traffic_state=""
 	if [ "$up" != "true" ] || [ -z "$device" ]; then
 		good=0
 	else
 		traffic_advancing "$device"
-		[ "$?" -eq 1 ] && good=0
+		traffic_state=$?
+		[ "$traffic_state" -eq 1 ] && good=0
 	fi
 
 	if [ "$good" -eq 0 ]; then
@@ -301,26 +607,59 @@ while :; do
 		nosignal_ticks=0
 
 		if [ "$up" = "true" ] && [ -n "$device" ]; then
-			# Attached and interface up, but rx_bytes is flat: check for
-			# a stale address before spending a ping. If the network
-			# reassigned the IP mid-session, netifd is still holding the
-			# old static one - mbim.sh only ever reads it once at ifup -
-			# and no ping will fix that, only a redial will.
-			iface_ip="$(ifstatus wwan_4 2>/dev/null |
-				jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
-			mip="$(modem_ip)"
-			if [ -n "$mip" ] && [ -n "$iface_ip" ] && [ "$mip" != "$iface_ip" ]; then
-				logger -p daemon.warning -t "$TAG" \
-					"modem IP ($mip) differs from interface IP ($iface_ip); stale address"
-			elif ping_confirms "$device"; then
+			# Attached and interface up, but rx_bytes is flat: ping is the
+			# only check here that verifies actual reachability, so it goes
+			# first and decides good/bad on its own.
+			#
+			# modem_ip() (AT+CGPADDR) was previously checked *before* the
+			# ping and, on a mismatch, skipped the ping entirely - treating
+			# a bare address mismatch as proof of a stalled session. That
+			# used a hardcoded CID 1, which field logs showed answering a
+			# PDP context unrelated to the one MBIM's own session actually
+			# data-connects on: the exact same address, unchanged, for
+			# minutes on end, on a link a plain ping confirmed was fine
+			# throughout. modem_ip() now resolves the CID dynamically
+			# against the configured APN (pdp_cid_for_apn, matching GL's
+			# own stock manager), which should make this label accurate
+			# more often - but it's still demoted to a diagnostic attached
+			# to a confirmed ping+HTTP failure, never a standalone trigger,
+			# until that's actually verified against real hardware.
+			#
+			# ping_confirms is now OR'd with https_confirms (GL's own
+			# stock manager does the exact same OR, decompiled from their
+			# shipped cellular_manager - see https_confirms' own comment):
+			# a carrier deprioritizing/rate-limiting bare ICMP under load
+			# is common enough that a ping-only check can misreport a
+			# perfectly working data path as offline.
+			if ping_confirms "$device" || https_confirms "$device"; then
 				good=1
+			else
+				iface_ip="$(ifstatus wwan_4 2>/dev/null |
+					jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+				mip="$(modem_ip)"
+				if [ -n "$mip" ] && [ -n "$iface_ip" ] && [ "$mip" != "$iface_ip" ]; then
+					logger -p daemon.warning -t "$TAG" \
+						"modem IP ($mip) differs from interface IP ($iface_ip); stale address (ping and HTTP probe also failed)"
+				fi
 			fi
 		fi
 	fi
 
 	if [ "$good" -eq 1 ]; then
 		consec_bad=0
-		failed_cycles=0
+		# Only a *confirmed* good tick (real traffic growth, or a
+		# ping/HTTP probe that actually verified reachability) clears the
+		# CFUN-escalation counter. traffic_state=2 ("no baseline yet") is
+		# just the absence of evidence, immediately after every redial
+		# (do_redial clears last_rx) - it used to reset failed_cycles on
+		# this same tick every single time, which meant a redial that
+		# brought the interface up but never restored real traffic could
+		# never accumulate the failed_cycles needed to reach
+		# CFUN_AFTER_CYCLES: the very next tick always zeroed it first.
+		# That made the radio power-cycle escalation effectively
+		# unreachable via this path - only the grace-timeout fast path in
+		# the main loop could ever trigger it.
+		[ "$traffic_state" = "2" ] || failed_cycles=0
 		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
@@ -331,11 +670,7 @@ while :; do
 		continue
 	fi
 
-	log_diag "$device"
-	if do_redial; then
-		failed_cycles=$((failed_cycles + 1))
-		[ "$failed_cycles" -ge "$CFUN_AFTER_CYCLES" ] && do_cfun_cycle
-	fi
+	escalate
 
 	do_sleep "$CHECK_PERIOD"
 done

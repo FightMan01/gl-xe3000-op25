@@ -32,7 +32,8 @@ define Package/gl-cellular
 	+umbim +luci-proto-mbim +uqmi +kmod-mhi-bus +kmod-mhi-net +kmod-mhi-pci-generic +kmod-mhi-wwan-ctrl +kmod-mhi-wwan-mbim \
 	+kmod-usb-serial-option +kmod-usb-acm \
 	+lua-eco +lua-eco-termios +lua-eco-ubus +lua-eco-uci +lua-eco-log \
-	+lua-cjson-lua5.4 +libubus-lua +libuci-lua +lua-cjson +gl-oui-rpc
+	+lua-cjson-lua5.4 +libubus-lua +libuci-lua +lua-cjson +gl-oui-rpc \
+	+curl
 endef
 
 define Package/gl-cellular/description

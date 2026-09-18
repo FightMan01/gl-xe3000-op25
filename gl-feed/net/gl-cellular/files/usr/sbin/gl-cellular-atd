@@ -359,6 +359,54 @@ local SIGNAL_LEVELS = {
 local signal_history = {}
 local SIGNAL_HISTORY_MAX = 181
 
+-- oui-ws.lua's dashboard WebSocket polls the "cellular" object every 2s
+-- (POLL_INTERVAL_MS) and, on a page subscribed to all cellular.* topics,
+-- that fans out into sims_status/networks_info/networks_status on every
+-- single tick - each of which used to run its own independent
+-- AT+QENG="servingcell" round-trip. That's up to 3 redundant queries
+-- every 2 seconds through the one serialized AT port, on top of
+-- signal_loop's own 10s sampling below and gl-cellular-boot-redial's/
+-- gloui/at.lua's on-demand AT traffic through the same "cellular.at"
+-- object - real contention that can make any one caller (including a
+-- watchdog AT+CFUN? recovery check) wait behind a backlog of near-
+-- duplicate reads. A serving-cell reading doesn't need to be live to the
+-- second, so share one query across callers within a short window.
+local cell_cache = nil
+local cell_cache_at = 0
+local CELL_CACHE_TTL_SEC = 5
+
+local function refresh_serving_cell()
+	cell_cache = serving_cell_snapshot()
+	cell_cache_at = os.time()
+	return cell_cache
+end
+
+-- networks_info mutates its `cell` in place (overwrites band/cell_id/rsrp
+-- etc. with the NR sub-cell's values, nils out rssi/ul_bandwidth, adds
+-- .id/.lte_anchor) rather than building a fresh table. Handing out
+-- cell_cache directly let those mutations persist in the shared cache
+-- itself: within the same 5s TTL window, a second call (from another
+-- topic, or the same one on the next 2s poll) got back an
+-- already-corrupted table - e.g. lte_anchor built from values that were
+-- themselves already overwritten with the NR reading, and rssi
+-- permanently nil until the next refresh. Only the top level needs
+-- copying - nothing mutates cell.nr itself, only reads from it - so a
+-- shallow copy is sufficient and each caller can freely rewrite its own
+-- copy without touching what the next caller sees.
+local function shallow_copy(t)
+	if not t then return nil end
+	local copy = {}
+	for k, v in pairs(t) do copy[k] = v end
+	return copy
+end
+
+local function cached_serving_cell()
+	if not cell_cache or (os.time() - cell_cache_at) >= CELL_CACHE_TTL_SEC then
+		refresh_serving_cell()
+	end
+	return shallow_copy(cell_cache)
+end
+
 local function update_signal_leds(strength)
 	local live = uci.cursor()
 	local enabled = live:get('system', 'gl_led', 'led_enable') ~= '0'
@@ -373,7 +421,10 @@ local function update_signal_leds(strength)
 end
 
 local function signal_sample()
-	local cell = serving_cell_snapshot()
+	-- Always a fresh query here (not the shared cache): this is the one
+	-- reading recorded into history, and it doubles as the cache refresh
+	-- other callers reuse for the next CELL_CACHE_TTL_SEC.
+	local cell = refresh_serving_cell()
 	local sample = nil
 	if cell and cell.nr then
 		sample = {
@@ -577,7 +628,7 @@ local cellular_methods = {
 				and operator == '' then
 				sim_status = 5
 			end
-			local cell = serving_cell_snapshot() or {}
+			local cell = cached_serving_cell() or {}
 			local technology = 0
 			if cell.nr or (cell.mode and cell.mode:find('^5G NSA'))
 				or network_name:find('NR5G%-NSA') then
@@ -618,7 +669,7 @@ local cellular_methods = {
 
 	networks_info = {
 		function(req, msg, con)
-			local cell = serving_cell_snapshot()
+			local cell = cached_serving_cell()
 			local status = wwan_status()
 			local status4 = interface_status('wwan_4')
 			local status6 = interface_status('wwan_6')
@@ -677,7 +728,7 @@ local cellular_methods = {
 
 	networks_status = {
 		function(req, msg, con)
-			local cell = serving_cell_snapshot()
+			local cell = cached_serving_cell()
 			local status = wwan_status()
 			local status4 = interface_status('wwan_4')
 			local status6 = interface_status('wwan_6')
