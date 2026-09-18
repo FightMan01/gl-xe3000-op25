@@ -80,7 +80,25 @@ do_sleep() {
 enabled() {
 	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
 	[ "$(uci -q get network.wwan.disabled)" != "1" ] || return 1
-	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ]
+	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ] || return 1
+
+	# Stand down while the operator-scan RPC owns the modem: AT+COPS=??
+	# deliberately drops the MBIM session and can run for minutes. The
+	# timestamp guards against a scan whose browser request was aborted
+	# before it could clear the flag - after 15 minutes it is treated as
+	# stale so a wedged flag can never permanently disable recovery.
+	if [ "$(uci -q get gl-cellular.state.scan_in_progress)" = "1" ]; then
+		local started now
+		started="$(uci -q get gl-cellular.state.scan_started_at)"
+		now="$(date +%s)"
+		if [ -z "$started" ] || [ $((now - started)) -lt 900 ]; then
+			return 1
+		fi
+		uci -q delete gl-cellular.state.scan_in_progress
+		uci -q delete gl-cellular.state.scan_started_at
+		uci -q commit gl-cellular
+	fi
+	return 0
 }
 
 reset_state() {
@@ -112,45 +130,86 @@ modem_attached() {
 	at_query 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1
 }
 
+# Maps netifd's `pdptype` to the AT+CGDCONT PDP_type token the modem uses.
+configured_pdp_type() {
+	case "$(uci -q get network.wwan.pdptype)" in
+	ipv4v6|IPV4V6) echo IPV4V6 ;;
+	ipv6|IPV6) echo IPV6 ;;
+	ipv4|ip|IP|IPV4) echo IP ;;
+	*) echo "" ;;
+	esac
+}
+
 # GL's own stock cellular_manager (decompiled: common_get_runtime_apn +
 # common_get_cid_ip in libcm_modem.so) never assumes a fixed CID - it
 # parses AT+CGDCONT? for the context whose APN matches the one actually
 # configured, and only then queries AT+CGPADDR against that CID. Mirrors
-# that here instead of the hardcoded CGPADDR=1 this used to send: on this
-# modem/carrier combo CID 1 was consistently a different, unrelated
-# context (see modem_ip's own history), not the one MBIM's session
-# data-connects on. Falls back to CID 1 if nothing matches - the same
-# guess this replaces, just as a last resort instead of the only option.
-pdp_cid_for_apn() {
-	local configured_apn resp line rest cid apn
+# that here instead of the hardcoded CGPADDR=1 this used to send.
+#
+# Emits the matching CIDs best-first: contexts whose PDP type also matches
+# the configured one before any other APN match, so a live IPV4V6 context
+# is preferred over a stale same-APN IPV4 one.
+#
+# Deliberately avoids `tr` character classes: this BusyBox's tr was built
+# without CONFIG_FEATURE_TR_CLASSES, so `tr -d '[:space:]'` silently
+# deletes the literal letters s,p,a,c,e instead of whitespace. That made
+# the APN compare fail on every real modem (confirmed on-device: the
+# string "internet.telekom" came back as "intrnt.tlkom"), silently
+# reverting this whole function to its CID 1 fallback. Parse with POSIX
+# parameter expansion instead.
+pdp_cids_for_apn() {
+	local configured_apn want_type resp line rest cid ptype apn exact other
 	configured_apn="$(uci -q get network.wwan.apn)"
+	want_type="$(configured_pdp_type)"
 	resp="$(at_query 'AT+CGDCONT?')"
-	if [ -n "$configured_apn" ] && [ -n "$resp" ]; then
-		while IFS= read -r line; do
-			case "$line" in
-			'+CGDCONT:'*)
-				rest="${line#*:}"
-				rest="${rest# }"
-				cid="${rest%%,*}"
-				apn="$(echo "$rest" | cut -d',' -f3 | tr -d '"' | tr -d '[:space:]')"
-				if [ "$apn" = "$configured_apn" ]; then
-					echo "$cid"
-					return
+	[ -n "$configured_apn" ] && [ -n "$resp" ] || return 0
+
+	exact=""
+	other=""
+	while IFS= read -r line; do
+		case "$line" in
+		'+CGDCONT:'*)
+			rest="${line#*:}"
+			rest="${rest# }"
+			cid="${rest%%,*}"
+			rest="${rest#*,}"
+			ptype="${rest%%,*}"
+			rest="${rest#*,}"
+			apn="${rest%%,*}"
+			ptype="${ptype#\"}"; ptype="${ptype%\"}"
+			apn="${apn#\"}"; apn="${apn%\"}"
+			if [ "$apn" = "$configured_apn" ]; then
+				if [ -n "$want_type" ] && [ "$ptype" = "$want_type" ]; then
+					exact="$exact $cid"
+				else
+					other="$other $cid"
 				fi
-				;;
-			esac
-		done <<-EOF
-			$resp
-			EOF
-	fi
-	echo 1
+			fi
+			;;
+		esac
+	done <<-EOF
+		$resp
+		EOF
+
+	for cid in $exact $other; do echo "$cid"; done
 }
 
+# CGPADDR against each candidate CID in turn, skipping the all-zero
+# placeholder an inactive context reports (on this Telekom HU SIM the
+# first APN/type match is CID 7 = 0.0.0.0 while the live context is CID 8
+# = 10.203.142.20). Falls back to CID 1 as a last resort, exactly like the
+# hardcoded query this replaces.
 modem_ip() {
-	local cid
-	cid="$(pdp_cid_for_apn)"
-	at_query "AT+CGPADDR=$cid" | grep '^+CGPADDR:' |
-		grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1
+	local cid addr
+	for cid in $(pdp_cids_for_apn) 1; do
+		addr="$(at_query "AT+CGPADDR=$cid" | grep '^+CGPADDR:' |
+			grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)"
+		case "$addr" in
+		""|0.0.0.0) continue ;;
+		*) echo "$addr"; return 0 ;;
+		esac
+	done
+	return 0
 }
 
 # 0 = grew since last sample, 1 = flat, 2 = no baseline yet for this
@@ -453,20 +512,22 @@ do_cfun_cycle() {
 	done
 
 	if ! cfun_is_full; then
-		# Do NOT fall through to do_redial(): dialing wwan against a radio
-		# that was never confirmed back on just burns a redial attempt for
-		# nothing and can look like "it tried and failed" when it never had
-		# a chance. Leave it for the main loop's own no-signal/
-		# CFUN_RECHECK_TICKS path, which keeps resending AT+CFUN=1 on its
-		# own cadence - this must never be the last attempt.
+		# Distinguish this from the cooldown case above (also a nonzero
+		# return) so escalate() does NOT fall through to do_redial():
+		# dialing wwan against a radio that was never confirmed back on
+		# just burns a redial attempt for nothing and can look like "it
+		# tried and failed" when it never had a chance. Leave it for the
+		# main loop's own no-signal/CFUN_RECHECK_TICKS path, which keeps
+		# resending AT+CFUN=1 on its own cadence.
 		logger -p daemon.err -t "$TAG" \
 			"AT+CFUN=1 not confirmed after $attempt attempts; leaving recovery to the no-signal watchdog"
-		return 1
+		return 2
 	fi
 
 	sleep 10
 	failed_cycles=0
 	do_redial
+	return 0
 }
 
 # Shared by both places that conclude "this needs a redial": the normal
@@ -495,9 +556,22 @@ do_cfun_cycle() {
 escalate() {
 	log_diag "$device" &
 	if [ "$((failed_cycles + 1))" -ge "$CFUN_AFTER_CYCLES" ]; then
-		if ! do_cfun_cycle; then
+		do_cfun_cycle
+		case "$?" in
+		0)
+			# Radio confirmed back on; do_cfun_cycle already redialed.
+			;;
+		1)
+			# CFUN cooldown still active - the radio is presumed fine,
+			# so a plain redial is the right (and only) move.
 			do_redial && failed_cycles=$((failed_cycles + 1))
-		fi
+			;;
+		2)
+			# AT+CFUN=1 never confirmed: do_redial would be dialing into
+			# a radio that may be off. The main loop's no-signal path
+			# owns recovery from here and keeps resending AT+CFUN=1.
+			;;
+		esac
 	else
 		do_redial && failed_cycles=$((failed_cycles + 1))
 	fi

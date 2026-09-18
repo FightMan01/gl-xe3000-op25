@@ -140,9 +140,55 @@ end
 -- gl-mcu uses for state that must survive restarts.
 local last_rx, last_tx = nil, nil
 
-local function traffic_total()
+-- Live total = the last value checkpointed in UCI plus the bytes sampled
+-- since. Keeping the unsaved delta in memory instead of committing on
+-- every poll does three things: it honors the UI's save_to_flash toggle
+-- (previously ignored - the counter was committed every 60s no matter
+-- what), it still reports a live figure through the ubus `traffic`
+-- method below, and it cuts flash writes from every poll to once per
+-- commit interval.
+local base_total = nil
+local mem_delta = 0
+local last_persist = 0
+local persist_interval = 300
+
+local function read_uci_total()
 	local live = uci.cursor()
 	return tonumber(live:get('gl-cellular', 'state', 'data_used_bytes') or '0') or 0
+end
+
+local function save_to_flash()
+	local live = uci.cursor()
+	return live:get('gl-cellular', 'state', 'save_traffic') ~= '0'
+end
+
+local function traffic_total()
+	if base_total == nil then base_total = read_uci_total() end
+	return base_total + mem_delta
+end
+
+-- Checkpoints the live total to UCI. No-op when saving is disabled; when
+-- enabled, refuses to touch flash more often than persist_interval unless
+-- forced (reset).
+local function persist_traffic(force)
+	if not save_to_flash() then return end
+	local now = os.time()
+	if not force and (now - last_persist) < persist_interval then return end
+	base_total = (base_total or read_uci_total()) + mem_delta
+	mem_delta = 0
+	local live = uci.cursor()
+	live:set('gl-cellular', 'state', 'data_used_bytes', tostring(math.floor(base_total)))
+	live:commit('gl-cellular')
+	last_persist = now
+end
+
+local function reset_traffic()
+	base_total = 0
+	mem_delta = 0
+	last_persist = 0
+	local live = uci.cursor()
+	live:set('gl-cellular', 'state', 'data_used_bytes', '0')
+	live:commit('gl-cellular')
 end
 
 local function traffic_sample()
@@ -164,10 +210,19 @@ local function traffic_sample()
 	if last_rx and last_tx and rx >= last_rx and tx >= last_tx then
 		local delta = (rx - last_rx) + (tx - last_tx)
 		if delta > 0 then
-			local live = uci.cursor()
-			local total = tonumber(live:get('gl-cellular', 'state', 'data_used_bytes') or '0')
-			live:set('gl-cellular', 'state', 'data_used_bytes', tostring(total + delta))
-			live:commit('gl-cellular')
+			-- Someone else (the UI reset, or set_traffic_config) may have
+			-- changed the persisted counter since we last read it. If so,
+			-- adopt their value and drop our unsaved delta so the reset
+			-- isn't clobbered on the next checkpoint.
+			local persisted = read_uci_total()
+			if base_total == nil then
+				base_total = persisted
+			elseif persisted ~= base_total then
+				base_total = persisted
+				mem_delta = 0
+			end
+			mem_delta = mem_delta + delta
+			persist_traffic(false)
 		end
 	end
 	-- else: counters went backwards (interface bounced) - don't add a
@@ -177,6 +232,8 @@ end
 
 local function traffic_loop()
 	local poll_interval = tonumber(cursor:get('gl-cellular', 'atport', 'traffic_poll_interval') or '60')
+	persist_interval = tonumber(cursor:get('gl-cellular', 'atport', 'traffic_commit_interval') or '300')
+	if base_total == nil then base_total = read_uci_total() end
 	while true do
 		time.sleep(poll_interval)
 		local ok, err = pcall(traffic_sample)
@@ -476,8 +533,7 @@ local methods = {
 
 	reset_data_usage = {
 		function(req, msg, con)
-			cursor:set('gl-cellular', 'state', 'data_used_bytes', '0')
-			cursor:commit('gl-cellular')
+			reset_traffic()
 			con:reply(req, {})
 		end
 	},
@@ -522,6 +578,15 @@ local function numeric_result(resp, min_len)
 end
 
 local cellular_methods = {
+	-- Live data total for the settings page, which otherwise only sees the
+	-- periodic UCI checkpoint (and would show a stale/zero figure while
+	-- save_to_flash is off).
+	traffic = {
+		function(req, msg, con)
+			con:reply(req, { total = tostring(traffic_total()) })
+		end
+	},
+
 	modems_info = {
 		function(req, msg, con)
 			local resp = send_at('AT+CGSN', 2)

@@ -291,6 +291,23 @@ local function allowed_after_blocking(all_raw, blocked)
 	return allowed
 end
 
+-- The UI may send the band filter mode as either the numeric
+-- `band_filter_mode` (0 = only, 1 = block) or the string `band_mask_mode`
+-- ("only"/"block"). Normalize both to "only"/"block" so storage and the
+-- apply path never disagree - previously a string "only" fell through the
+-- `tonumber(x) == 0` test and was persisted as "block", which could later
+-- turn a persisted block-list into an allow-list.
+local function normalize_filter_mode(value)
+	if value == nil then return nil end
+	if value == "only" or value == "ONLY" or tonumber(value) == 0 then
+		return "only"
+	end
+	if value == "block" or value == "BLOCK" or tonumber(value) == 1 then
+		return "block"
+	end
+	return nil
+end
+
 -- `bands` is a list of band numbers (as returned by UCI, so strings) -
 -- strictly validated as plain positive integers before ever reaching the
 -- AT command string, since this is spliced directly into one.
@@ -487,7 +504,9 @@ return {
 		cursor:commit("network")
 		cursor:set("gl-cellular", "state", "dial_enabled", "1")
 		cursor:commit("gl-cellular")
-		os.execute("ifup wwan >/dev/null 2>&1")
+		-- Same lock + CGATT wait as every other reconnect path, so a user
+		-- Connect can never interleave with an in-flight watchdog redial.
+		os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -495,7 +514,7 @@ return {
 		local cursor = uci.cursor()
 		cursor:set("gl-cellular", "state", "dial_enabled", "0")
 		cursor:commit("gl-cellular")
-		os.execute("ifdown wwan >/dev/null 2>&1")
+		os.execute("/usr/sbin/gl-cellular-net-run /sbin/ifdown wwan >/dev/null 2>&1")
 		return {}
 	end,
 
@@ -574,8 +593,8 @@ return {
 		local lte_bands = data.lte_bands or band_list.LTE
 		local nr_bands = data.nr_bands or band_list["NR-NSA"]
 		local sa_bands = data.sa_bands or band_list["NR-SA"]
-		local filter_mode = data.band_filter_mode
-		if filter_mode == nil then filter_mode = data.band_mask_mode end
+		local filter_mode = normalize_filter_mode(data.band_filter_mode)
+			or normalize_filter_mode(data.band_mask_mode)
 
 		if data.apn then cursor:set("network", "wwan", "apn", data.apn) end
 		if ip_type then cursor:set("network", "wwan", "pdptype", tostring(ip_type):lower()) end
@@ -621,8 +640,7 @@ return {
 			cursor:set("gl-cellular", "state", "band_mask_enabled", mask_enabled and "1" or "0")
 		end
 		if filter_mode ~= nil then
-			cursor:set("gl-cellular", "state", "band_mask_mode",
-				tonumber(filter_mode) == 0 and "only" or "block")
+			cursor:set("gl-cellular", "state", "band_mask_mode", filter_mode)
 		end
 		if type(lte_bands) == "table" then
 			if #lte_bands > 0 then
@@ -677,8 +695,14 @@ return {
 				or cursor:get("gl-cellular", "state", "nr_bands")
 			sa_bands = type(sa_bands) == "table" and sa_bands
 				or cursor:get("gl-cellular", "state", "sa_bands")
-			local block_mode = tonumber(filter_mode) == 1
-				or filter_mode == "block"
+			-- Never guess "only" from a missing filter_mode: that would
+			-- apply the user's blocked list as an allow-list. Fall back to
+			-- the persisted mode, then to block (the same default
+			-- get_sim_config exposes).
+			local effective_mode = filter_mode
+				or cursor:get("gl-cellular", "state", "band_mask_mode")
+				or "block"
+			local block_mode = effective_mode ~= "only"
 			local apply_lte = block_mode
 				and allowed_after_blocking(ALL_LTE_BANDS, lte_bands) or lte_bands
 			local apply_nsa = block_mode
@@ -872,7 +896,7 @@ return {
 			-- does not clear nr5g_disable_mode on RM520N firmware.
 			at.command('AT+QNWPREFCFG="nr5g_disable_mode",0', 8)
 			at.command('AT+QNWPREFCFG="mode_pref",' .. preference, 8)
-			os.execute("(ifdown wwan >/dev/null 2>&1; sleep 1; ifup wwan >/dev/null 2>&1) &")
+			os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
 			return {}
 		end
 
@@ -923,7 +947,7 @@ return {
 		cursor:set("gl-cellular", section, "pci", tostring(pci))
 		cursor:set("gl-cellular", section, "freq", tostring(freq))
 		cursor:commit("gl-cellular")
-		os.execute("(ifdown wwan >/dev/null 2>&1; sleep 1; ifup wwan >/dev/null 2>&1) &")
+		os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -964,7 +988,7 @@ return {
 		local cursor = uci.cursor()
 		cursor:set("gl-cellular", "state", "active_slot", tostring(math.floor(tonumber(slot))))
 		cursor:commit("gl-cellular")
-		os.execute("ifup wwan >/dev/null 2>&1")
+		os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -1034,15 +1058,25 @@ return {
 		local cursor = uci.cursor()
 		local redial = cursor:get("gl-cellular", "state", "dial_enabled") ~= "0"
 		-- A COPS scan temporarily takes the modem out of packet service.
+		-- Mark it so the watchdog stands down for the duration instead of
+		-- fighting the scan with redials; scan_started_at bounds how long a
+		-- flag left behind by an aborted request can pause recovery (see
+		-- gl-cellular-boot-redial's enabled()).
+		cursor:set("gl-cellular", "state", "scan_in_progress", "1")
+		cursor:set("gl-cellular", "state", "scan_started_at", tostring(os.time()))
+		cursor:commit("gl-cellular")
 		-- Stop the MBIM interface cleanly first, then have the independent
 		-- long-command worker always redial it after the scan—even if the
 		-- browser closes the drawer/request before the scan completes.
 		if redial then
-			os.execute("/sbin/ifdown wwan >/dev/null 2>&1")
+			os.execute("/usr/sbin/gl-cellular-net-run /sbin/ifdown wwan >/dev/null 2>&1")
 		end
 		local resp = at.command("AT+COPS=?", 300, { redial_wwan = redial })
+		cursor:set("gl-cellular", "state", "scan_in_progress", "0")
+		cursor:delete("gl-cellular", "state", "scan_started_at")
+		cursor:commit("gl-cellular")
 		if not resp and redial then
-			os.execute("/sbin/ifup wwan >/dev/null 2>&1")
+			os.execute("/usr/sbin/gl-cellular-net-run /sbin/ifup wwan >/dev/null 2>&1")
 		end
 		local results = {}
 		local STAT_NAME = { [0] = "unknown", [1] = "available", [2] = "current", [3] = "forbidden" }
@@ -1115,11 +1149,24 @@ return {
 
 	get_traffic_config = function(args)
 		local cursor = uci.cursor()
-		local total = tostring(tonumber(cursor:get("gl-cellular", "state", "data_used_bytes") or "0") or 0)
+		-- gl-cellular-atd owns the live counter and only checkpoints it to
+		-- flash periodically (and not at all when save_to_flash is off).
+		-- Ask it for the current value first so this page never lags the
+		-- Internet card; fall back to the UCI checkpoint if it isn't up.
+		local total
+		local conn = ubus.connect()
+		if conn then
+			local res = conn:call("cellular", "traffic", {})
+			conn:close()
+			if res and res.total then total = tostring(res.total) end
+		end
+		total = total or tostring(tonumber(cursor:get("gl-cellular", "state", "data_used_bytes") or "0") or 0)
 		local limit_enabled = cursor:get("gl-cellular", "state", "data_limit_enabled") == "1"
 		local limit_bytes = tostring(tonumber(cursor:get("gl-cellular", "state", "data_limit_bytes") or "0") or 0)
 		return {
-			save_to_flash = cursor:get("gl-cellular", "state", "save_traffic") == "1",
+			-- Default-on, matching gl-cellular-atd's own interpretation of
+			-- an unset option; only an explicit '0' disables it.
+			save_to_flash = cursor:get("gl-cellular", "state", "save_traffic") ~= "0",
 			traffic = {
 				{ slot = 1, type = 0, traffic_total = total },
 			},

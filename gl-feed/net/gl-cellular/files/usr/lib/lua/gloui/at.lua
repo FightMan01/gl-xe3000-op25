@@ -39,8 +39,11 @@ function M.command(cmd, timeout, options)
 			local base = "/tmp/gl-at-long-" .. nonce
 			local output_path = base .. ".out"
 			local done_path = base .. ".done"
+			-- Locked: this worker outlives an aborted browser request, so
+			-- its redial must serialize against the watchdog's do_redial()
+			-- and the other RPC reconnect paths.
 			local post_command = options.redial_wwan
-				and "/sbin/ifup wwan >/dev/null 2>&1"
+				and "/usr/sbin/gl-cellular-net-run /sbin/ifup wwan >/dev/null 2>&1"
 				or ":"
 			local command = string.format(
 				"( /bin/ubus -S -t %d call cellular.at command %s > %s 2>/dev/null; status=$?; %s; echo $status > %s ) &",
@@ -89,7 +92,7 @@ function M.command(cmd, timeout, options)
 		local output = pipe:read("*a")
 		local ok = pipe:close()
 		if options.redial_wwan then
-			os.execute("/sbin/ifup wwan >/dev/null 2>&1")
+			os.execute("/usr/sbin/gl-cellular-net-run /sbin/ifup wwan >/dev/null 2>&1")
 		end
 		if not ok or output == "" then return nil, "no response" end
 		local decoded_ok, res = pcall(cjson.decode, output)

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Upgraded installs carry their old /etc/config/gl-cellular across
+# sysupgrade (it is a conffile), so watchdog tunables added in later
+# builds never reached them and the watchdog silently ran on its compiled
+# defaults. Seed them explicitly - but never overwrite an explicit user
+# choice. Values match the packaged config and the script's defaults.
+
+[ -n "$(uci -q get gl-cellular.@watchdog[0])" ] && exit 0
+
+uci -q batch <<-EOF
+	set gl-cellular.watchdog=watchdog
+	set gl-cellular.watchdog.check_period_sec='10'
+	set gl-cellular.watchdog.offline_threshold='5'
+	set gl-cellular.watchdog.restore_trigger_window_sec='300'
+	set gl-cellular.watchdog.restore_trigger_max_cnt='3'
+	set gl-cellular.watchdog.restore_block_sec='300'
+	set gl-cellular.watchdog.redial_grace_sec='180'
+	set gl-cellular.watchdog.cfun_after_cycles='2'
+	set gl-cellular.watchdog.cfun_cooldown_sec='1800'
+	set gl-cellular.watchdog.cfun_recheck_ticks='20'
+EOF
+uci -q commit gl-cellular
+
+exit 0

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Run a command while holding the shared network-reconfiguration lock.
+#
+# Every path that takes wwan down or brings it up must serialize through
+# $NET_LOCK: the watchdog's do_redial(), gl-cellular-wwan-reconnect, and
+# now the UI RPCs (Connect/Disconnect, tower lock/unlock, SIM-slot switch).
+# Before this wrapper the RPCs still ran bare ifdown/ifup and could
+# interleave with an in-flight watchdog redial, which is exactly how
+# netifd/mbim ends up reporting "up" with an address but passing no
+# traffic (recoverable only by reboot).
+#
+#   /usr/sbin/gl-cellular-net-run /sbin/ifdown wwan
+#   /usr/sbin/gl-cellular-net-run sh -c 'ifdown wwan; sleep 1; ifup wwan'
+#
+# The lock is held for the lifetime of the executed command because fd 9
+# is inherited across exec(). BusyBox flock has no -w, so poll -n.
+
+NET_LOCK=/var/run/gl-net-reconfig.lock
+WAIT_SEC="${GL_NET_LOCK_WAIT:-30}"
+
+exec 9>"$NET_LOCK"
+tries=0
+until flock -n 9; do
+	tries=$((tries + 1))
+	[ "$tries" -ge "$WAIT_SEC" ] && exit 1
+	sleep 1
+done
+
+exec "$@"
