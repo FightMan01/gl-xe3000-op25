@@ -37,3 +37,13 @@ config watchdog 'watchdog'
 	option cfun_after_cycles '2'
 	option cfun_cooldown_sec '1800'
 	option cfun_recheck_ticks '20'
+	# Recover a hung modem firmware: after this many consecutive bad ticks
+	# with a silent AT port, reset the modem through its PCIe/MHI function
+	# (gl-cellular-modem-reset). A silent AT port means no AT-based recovery
+	# can work. modem_reset_reboot=1 additionally reboots the router after
+	# modem_reset_max failed resets in modem_reset_window_sec (stock does
+	# this on a PCIe/MHI failure); off by default.
+	option at_dead_ticks '3'
+	option modem_reset_max '3'
+	option modem_reset_window_sec '3600'
+	option modem_reset_reboot '0'

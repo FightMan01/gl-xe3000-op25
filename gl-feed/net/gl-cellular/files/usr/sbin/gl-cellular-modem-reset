@@ -1,0 +1,72 @@
+#!/bin/sh
+# Recover a hung Quectel RM520N-GL by re-initialising its PCIe/MHI function.
+#
+# When the modem firmware wedges it stays "attached" with an address but
+# stops forwarding anything (not even the first-hop gateway answers), and its
+# USB AT port goes silent as well.  Neither of the watchdog's normal recovery
+# tools can reach it in that state: an AT+CFUN power-cycle needs a working AT
+# port, and an ifdown/ifup only tears down/re-establishes the host-side MBIM
+# session - the firmware itself is stuck.  The result was an outage that never
+# recovered on its own.
+#
+# Removing and rescanning the PCIe function makes mhi_pci_generic re-run the
+# modem's BHI boot protocol, which resets the modem firmware; both the AT port
+# and the MBIM session come back (verified on-device).  This is the host-side
+# equivalent of the stock firmware's last-resort modem reboot.
+#
+# Runs under the shared network-reconfiguration lock so it can't interleave
+# with a redial or a settings-driven reconnect.
+
+NET_LOCK=/var/run/gl-net-reconfig.lock
+MODEM_VENDOR=0x17cb
+# RM520N-GL / RM551E-GL MHI functions.
+MODEM_DEVICES="0x0308 0x0309"
+
+pci_dev=""
+for d in /sys/bus/pci/devices/*; do
+	[ -r "$d/vendor" ] || continue
+	[ "$(cat "$d/vendor")" = "$MODEM_VENDOR" ] || continue
+	for dev in $MODEM_DEVICES; do
+		[ "$(cat "$d/device")" = "$dev" ] && pci_dev="${d##*/}"
+	done
+	[ -n "$pci_dev" ] && break
+done
+
+[ -n "$pci_dev" ] || {
+	echo "gl-cellular-modem-reset: modem PCI function not found" >&2
+	exit 1
+}
+
+exec 9>"$NET_LOCK"
+tries=0
+until flock -n 9; do
+	tries=$((tries + 1))
+	[ "$tries" -ge 30 ] && exit 1
+	sleep 1
+done
+
+logger -p daemon.err -t gl-cellular-wwan-watchdog \
+	"modem firmware hung; resetting PCIe function $pci_dev"
+
+ifdown wwan >/dev/null 2>&1
+
+echo 1 > "/sys/bus/pci/devices/$pci_dev/remove" 2>/dev/null
+sleep 2
+echo 1 > /sys/bus/pci/rescan 2>/dev/null
+
+# Wait for the MBIM control port to reappear, then give the firmware a few
+# more seconds to finish booting before netifd opens the session.  netifd
+# retries the mbim handshake on its own if we are still early.
+tries=0
+while [ "$tries" -lt 40 ]; do
+	[ -c /dev/wwan0mbim0 ] && break
+	tries=$((tries + 1))
+	sleep 1
+done
+sleep 10
+
+if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ]; then
+	ifup wwan >/dev/null 2>&1
+fi
+
+exit 0

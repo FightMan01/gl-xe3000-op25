@@ -18,6 +18,10 @@ uci -q batch <<-EOF
 	set gl-cellular.watchdog.cfun_after_cycles='2'
 	set gl-cellular.watchdog.cfun_cooldown_sec='1800'
 	set gl-cellular.watchdog.cfun_recheck_ticks='20'
+	set gl-cellular.watchdog.at_dead_ticks='3'
+	set gl-cellular.watchdog.modem_reset_max='3'
+	set gl-cellular.watchdog.modem_reset_window_sec='3600'
+	set gl-cellular.watchdog.modem_reset_reboot='0'
 EOF
 uci -q commit gl-cellular
 

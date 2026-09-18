@@ -41,6 +41,17 @@ CFUN_RECHECK_TICKS=$(opt cfun_recheck_ticks 20)
 # after confirming AT+qnvfr's actual response format against real hardware
 # (a `logger`'d dry-run read is exactly what to check first).
 SYNC_MTU=$(opt sync_mtu 0)
+# Consecutive bad ticks on which the modem's AT port does not answer before
+# concluding the firmware itself is hung and hard-resetting it (see
+# modem_hard_reset()). A silent AT port is decisive: no AT-based recovery
+# (AT+CFUN, etc.) can work, and ifdown/ifup cannot reach the firmware.
+AT_DEAD_TICKS=$(opt at_dead_ticks 3)
+# Hard resets (PCIe/MHI re-init) allowed inside the window before giving up.
+MODEM_RESET_MAX=$(opt modem_reset_max 3)
+MODEM_RESET_WINDOW=$(opt modem_reset_window_sec 3600)
+# Last resort: reboot the whole router after the hard-reset budget is spent
+# (the stock firmware does this on a PCIe/MHI failure). Off by default.
+MODEM_RESET_REBOOT=$(opt modem_reset_reboot 0)
 
 consec_bad=0
 redial_count=0
@@ -54,6 +65,9 @@ last_device=""
 last_rx=""
 nosignal_logged=0
 nosignal_ticks=0
+at_dead=0
+reset_count=0
+reset_window_start=0
 
 # mwan3track fires ACTION=disconnecting/disconnected on wwan_4 the moment
 # its own ping tracking flips away from online - well before its own
@@ -128,6 +142,14 @@ at_query() {
 # the query itself failed, not that attach is down.
 modem_attached() {
 	at_query 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1
+}
+
+# Is the modem's AT port answering at all? A plain "AT" always returns OK on
+# a live modem, so an empty reply means the firmware (not just the data
+# session) is unresponsive. This is the signal that AT-based recovery cannot
+# work and the modem needs the PCIe/MHI hard reset.
+at_alive() {
+	[ -n "$(at_query 'AT')" ]
 }
 
 # Maps netifd's `pdptype` to the AT+CGDCONT PDP_type token the modem uses.
@@ -481,6 +503,47 @@ cfun_is_full() {
 	[ "$(at_query 'AT+CFUN?' | grep '^+CFUN:' | grep -oE '[0-9]+' | head -n1)" = "1" ]
 }
 
+# Hard-reset a hung modem through its PCIe/MHI function. This is the only
+# recovery that works once the modem firmware has stopped answering AT:
+# AT+CFUN can't be delivered and ifdown/ifup only touches the host-side MBIM
+# session. gl-cellular-modem-reset re-runs the modem's BHI boot protocol,
+# which resets the firmware; verified to bring both AT and the data session
+# back. Rate-limited, and the last resort (router reboot) is opt-in.
+modem_hard_reset() {
+	local now
+	now="$(date +%s)"
+	if [ $((now - reset_window_start)) -gt "$MODEM_RESET_WINDOW" ]; then
+		reset_window_start=$now
+		reset_count=0
+	fi
+	reset_count=$((reset_count + 1))
+	if [ "$reset_count" -gt "$MODEM_RESET_MAX" ]; then
+		logger -p daemon.err -t "$TAG" \
+			"$reset_count modem hard resets in ${MODEM_RESET_WINDOW}s did not restore service"
+		if [ "$MODEM_RESET_REBOOT" = "1" ]; then
+			logger -p daemon.err -t "$TAG" \
+				"rebooting to recover the modem (modem_reset_reboot=1)"
+			reboot
+		fi
+		return 1
+	fi
+
+	logger -p daemon.err -t "$TAG" \
+		"modem AT port unresponsive; hard-resetting via PCIe/MHI (attempt $reset_count/$MODEM_RESET_MAX)"
+	/usr/sbin/gl-cellular-modem-reset
+	at_dead=0
+	consec_bad=0
+	failed_cycles=0
+	redial_count=0
+	window_start=0
+	last_rx=""
+	# gl-cellular-modem-reset brings wwan back up itself; give it the same
+	# grace a redial gets before the loop judges the result.
+	redial_pending=1
+	grace_until=$(( $(date +%s) + GRACE_SEC ))
+	return 0
+}
+
 # Last resort: power-cycle the radio itself. This is the one lever that
 # reaches past MBIM to a wedged PCIe/MHI link or stuck baseband state
 # that a plain ifdown/ifup can't clear - but it costs 15-30s of
@@ -512,16 +575,16 @@ do_cfun_cycle() {
 	done
 
 	if ! cfun_is_full; then
-		# Distinguish this from the cooldown case above (also a nonzero
-		# return) so escalate() does NOT fall through to do_redial():
-		# dialing wwan against a radio that was never confirmed back on
-		# just burns a redial attempt for nothing and can look like "it
-		# tried and failed" when it never had a chance. Leave it for the
-		# main loop's own no-signal/CFUN_RECHECK_TICKS path, which keeps
-		# resending AT+CFUN=1 on its own cadence.
+		# The radio never came back. On a hung firmware the AT port is
+		# silent, so no amount of CFUN retries will work - escalate to the
+		# PCIe/MHI hard reset, which resets the firmware itself. Do NOT fall
+		# through to do_redial(): dialing wwan against a radio that may be
+		# off just burns a redial attempt. Return 0 so escalate() leaves the
+		# recovery to the hard reset (and the no-signal path if it declined).
 		logger -p daemon.err -t "$TAG" \
-			"AT+CFUN=1 not confirmed after $attempt attempts; leaving recovery to the no-signal watchdog"
-		return 2
+			"AT+CFUN=1 not confirmed after $attempt attempts; modem firmware may be hung"
+		modem_hard_reset
+		return 0
 	fi
 
 	sleep 10
@@ -640,6 +703,26 @@ while :; do
 	fi
 
 	if [ "$good" -eq 0 ]; then
+		# First, is the modem answering AT at all? A silent AT port means
+		# the firmware itself is hung, not merely the data session: neither
+		# AT+CFUN nor ifdown/ifup can reach it, so the only fix is the
+		# PCIe/MHI hard reset. Without this the watchdog (and a manual
+		# reconnect) would spin on a dead modem forever, which is exactly
+		# the never-recovering outage seen in the field.
+		if at_alive; then
+			at_dead=0
+		else
+			at_dead=$((at_dead + 1))
+			logger -p daemon.warning -t "$TAG" \
+				"bad tick $((consec_bad + 1))/$OFFLINE_THRESHOLD: modem AT port not answering ($at_dead/$AT_DEAD_TICKS)"
+			if [ "$at_dead" -ge "$AT_DEAD_TICKS" ]; then
+				if modem_hard_reset; then
+					do_sleep "$CHECK_PERIOD"
+					continue
+				fi
+			fi
+		fi
+
 		# Rule out "no coverage" (train tunnel, elevator, airplane mode)
 		# before treating this as a fault. A missing radio attach isn't
 		# something a redial or CFUN cycle can fix any faster than the
