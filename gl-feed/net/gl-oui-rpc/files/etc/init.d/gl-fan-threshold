@@ -1,14 +1,13 @@
 #!/bin/sh /etc/rc.common
+# Re-apply the persisted fan start threshold at boot: the kernel resets the
+# thermal trips to the DTS defaults on every boot, so the 60 C level-1 trip
+# comes back and the fan would spin up there until this runs.
 
 START=19
 
 start() {
 	local temperature
 	temperature="$(uci -q get gl-oui-rpc.fan.temperature)"
-	case "$temperature" in
-		6[9]|7[0-9]|8[0-9]|9[01])
-			echo $((temperature * 1000)) > \
-				/sys/class/thermal/thermal_zone0/trip_point_3_temp 2>/dev/null
-			;;
-	esac
+	[ -n "$temperature" ] || temperature=85
+	/usr/sbin/gl-fan-set-threshold "$temperature" 2>/dev/null
 }

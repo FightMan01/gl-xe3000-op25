@@ -1,0 +1,70 @@
+#!/bin/sh
+# Apply the user-selected CPU fan start threshold to the pwm-fan thermal
+# cooling curve.
+#
+# The upstream mt7981b cpu-thermal zone has three fan trips, one per
+# cooling level (the fan node's cooling-levels = <0 128 192 255>):
+#
+#    60 C -> level 1 (50% duty)   <- the temperature the fan STARTS at
+#    85 C -> level 2 (75% duty)
+#   115 C -> level 3 (100% duty)  (below hot=120 C and critical=125 C)
+#
+# GL exposes a single "fan start" threshold, so that value belongs on the
+# lowest (level 1) trip.  This port originally rewrote only the middle
+# trip, so the 60 C level-1 trip still started the fan regardless of the
+# setting (field report: 59 C, ~3.2k RPM, threshold set to 85 C).
+#
+# Trips are found by type and ordered by temperature rather than by a
+# hardcoded sysfs index, so an upstream DTS trip reordering can't silently
+# break this.
+
+TRIPDIR=/sys/class/thermal/thermal_zone0
+T="${1:-}"
+
+case "$T" in
+	''|*[!0-9]*) echo "usage: $0 <69..91>" >&2; exit 1 ;;
+esac
+if [ "$T" -lt 69 ] || [ "$T" -gt 91 ]; then
+	echo "gl-fan-set-threshold: $T out of range 69..91" >&2
+	exit 1
+fi
+
+[ -d "$TRIPDIR" ] || { echo "gl-fan-set-threshold: no $TRIPDIR" >&2; exit 1; }
+
+tmp="/tmp/gl-fan-trips.$$"
+: > "$tmp"
+i=0
+while [ -e "$TRIPDIR/trip_point_${i}_type" ]; do
+	if [ "$(cat "$TRIPDIR/trip_point_${i}_type" 2>/dev/null)" = "active" ]; then
+		t="$(cat "$TRIPDIR/trip_point_${i}_temp" 2>/dev/null)"
+		[ -n "$t" ] && echo "$t $i" >> "$tmp"
+	fi
+	i=$((i + 1))
+done
+
+set -- $(sort -n "$tmp" | awk '{print $2}')
+low_i="$1"; med_i="$2"; high_i="$3"
+rm -f "$tmp"
+
+if [ -z "$low_i" ]; then
+	echo "gl-fan-set-threshold: no active fan trips found" >&2
+	exit 1
+fi
+
+# New ascending curve: level 1 starts at the user threshold, the higher
+# levels keep a sensible gap above it (and level 3 stays at 115 C).
+new_low=$((T * 1000))
+new_med=85000
+[ $((new_low + 10000)) -gt "$new_med" ] && new_med=$((new_low + 10000))
+new_high=115000
+if [ -n "$med_i" ] && [ $((new_med + 10000)) -gt "$new_high" ]; then
+	new_high=$((new_med + 10000))
+fi
+
+# Highest-first, so the trips stay ordered at every step (the thermal core
+# rejects a trip that would cross its neighbour).
+[ -n "$high_i" ] && echo "$new_high" > "$TRIPDIR/trip_point_${high_i}_temp"
+[ -n "$med_i" ] && echo "$new_med" > "$TRIPDIR/trip_point_${med_i}_temp"
+echo "$new_low" > "$TRIPDIR/trip_point_${low_i}_temp"
+
+exit 0

@@ -3,7 +3,12 @@
 local uci = require "uci"
 
 local CPU_TEMP = "/sys/class/thermal/thermal_zone0/temp"
-local FAN_TRIP = "/sys/class/thermal/thermal_zone0/trip_point_3_temp"
+local FAN_DEFAULT = 85
+
+-- The threshold is applied by gl-fan-set-threshold, which rewrites the
+-- whole fan cooling curve.  It can't be done here by writing a single
+-- trip: the fan actually starts on the *lowest* active trip (the DTS
+-- default is 60 C), not on trip_point_3.
 
 local function find_pwmfan_hwmon()
 	local base = "/sys/class/hwmon/"
@@ -53,8 +58,7 @@ return {
 	get_config = function(args)
 		local cursor = uci.cursor()
 		local configured = cursor:get("gl-oui-rpc", "fan", "temperature")
-		local threshold = tonumber(configured)
-			or math.floor((read_number(FAN_TRIP) or 85000) / 1000)
+		local threshold = tonumber(configured) or FAN_DEFAULT
 		return {
 			temperature = threshold,
 			warn_temperature = math.floor((read_number(CPU_TEMP) or 0) / 1000),
@@ -66,7 +70,9 @@ return {
 		if not threshold or threshold < 69 or threshold > 91 then
 			return { code = 1, err_code = 1, err_msg = "invalid temperature" }
 		end
-		if not write_number(FAN_TRIP, threshold * 1000) then
+		local ok = os.execute(
+			"/usr/sbin/gl-fan-set-threshold " .. tostring(math.floor(threshold)))
+		if ok == nil or ok == false or (type(ok) == "number" and ok ~= 0) then
 			return { code = 2, err_code = 2, err_msg = "fan threshold is not writable" }
 		end
 		local cursor = uci.cursor()
