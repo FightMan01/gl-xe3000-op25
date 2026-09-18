@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -23,6 +23,7 @@ define Package/gl-oui-rpc
   TITLE:=GL.iNet SDK4 GUI - backend (session/RPC), reimplemented
   URL:=https://github.com/zhaojh329/lua-eco
   DEPENDS:= \
+	+gl-portal \
 	nginx-ssl +nginx-mod-lua +nginx-mod-lua-resty-core +nginx-mod-lua-resty-lrucache \
 	+lua-eco +lua-eco-ubus +lua-eco-uci +lua-eco-sha256 +lua-eco-log \
 	+libubus-lua +libuci-lua +lua-cjson +libiwinfo-lua \

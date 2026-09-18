@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# Package postinst scripts are skipped while an image is assembled.  Enable
+# the two portal services during first boot as well, when the router's normal
+# network and nginx defaults have been applied.
+/etc/init.d/gl-portal enable
+/etc/init.d/gl-repeater-portal enable
+/etc/init.d/gl-portal start
+/etc/init.d/gl-repeater-portal start
+
+exit 0

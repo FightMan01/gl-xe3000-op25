@@ -11,7 +11,8 @@
 --
 -- Method set: connect, disconnect, enter_bare_mode, exit_bare_mode,
 -- get_channel_prompt, get_config, get_saved_ap_list, remove_saved_ap,
--- scan, set_channel_prompt, set_config.
+-- get_repeater_portal, scan, set_channel_prompt, set_config,
+-- set_repeater_portal.
 
 local uci = require "uci"
 local ubus = require "ubus"
@@ -32,16 +33,168 @@ local function read_trim(path)
 	return v
 end
 
-local RADIOS = { "radio0", "radio1" }
+local PORTAL_STATE = "/tmp/gl-repeater-portal.json"
+
+local function read_portal_state()
+	local f = io.open(PORTAL_STATE, "r")
+	if not f then
+		return {
+			detected = false, detecting = false, portal_url = "",
+			bare_mode = false, status = "idle",
+		}
+	end
+	local raw = f:read("*a")
+	f:close()
+	local ok, state = pcall(cjson.decode, raw)
+	if ok and type(state) == "table" then return state end
+	return { detected = false, detecting = false, portal_url = "", bare_mode = false }
+end
+
+local function write_portal_state(state)
+	local tmp = PORTAL_STATE .. ".rpc"
+	local f = io.open(tmp, "w")
+	if not f then return end
+	f:write(cjson.encode(state))
+	f:close()
+	os.rename(tmp, PORTAL_STATE)
+end
 
 -- gl-repeater-timeout persists a scheduled re-enable time across a manual
--- disconnect/reconfigure: without clearing it here, Abort (or picking a new
--- network) sets disabled=1 for only as long as it takes the watchdog to hit
--- its already-pending retry_at, at which point it flips disabled back to 0
--- and reconnects on its own - the abort silently "does nothing".
+-- disconnect/reconfigure.  A portal/repeater action must clear that pending
+-- retry or the watchdog can silently reconnect an aborted network later.
 local function clear_retry_state()
 	os.execute("rm -f /tmp/gl-repeater-retry-at /tmp/gl-repeater-fail-type /tmp/gl-repeater-eap-autofix-count")
 end
+
+local function set_portal_gate(enabled)
+	local f = io.open("/proc/net/wifidog-ng/config", "w")
+	if not f then return false end
+	f:write("enabled=" .. (enabled and "1" or "0") .. "\n")
+	f:close()
+	return true
+end
+
+local function as_list(value)
+	if type(value) == "table" then return value end
+	if value == nil or value == "" then return {} end
+	return { value }
+end
+
+local function shell_quote(value)
+	return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function dnsmasq_confdir(cursor)
+	local section
+	cursor:foreach("dhcp", "dnsmasq", function(candidate)
+		if not section then section = candidate[".name"] end
+	end)
+	if not section then return nil end
+	local directory = cursor:get("dhcp", section, "confdir")
+	if not directory or directory == "" then
+		directory = "/tmp/dnsmasq." .. section .. ".d"
+	end
+	return directory
+end
+
+local function repeater_dns(cursor)
+	local conn = ubus.connect()
+	local status
+	if conn then
+		status = conn:call("network.interface.repeater", "status", {})
+		conn:close()
+	end
+	if status and type(status["dns-server"]) == "table" then
+		return status["dns-server"]
+	end
+	return as_list(cursor:get("network", "repeater", "dns"))
+end
+
+-- During portal login LAN clients must use the DNS learned by the repeater
+-- uplink.  Otherwise a stale VPN/AdGuard/custom dnsmasq server can prevent
+-- the URL supplied by the upstream captive network from resolving.  Use a
+-- tmpfs dnsmasq include instead of changing /etc/config/dhcp, so leaving
+-- portal mode (or rebooting) automatically restores the normal resolver.
+local function set_portal_dns(cursor, dns)
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal.conf"
+	local servers = as_list(dns)
+	if #servers == 0 then
+		return false
+	end
+	os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
+	local temp = path .. ".new"
+	local file = io.open(temp, "w")
+	if not file then return false end
+	file:write("no-resolv\n")
+	local valid = 0
+	for _, server in ipairs(servers) do
+		server = tostring(server)
+		if server:match("^[%x%.:]+$") then
+			file:write("server=", server, "\n")
+			valid = valid + 1
+		end
+	end
+	if valid == 0 then
+		file:close()
+		os.remove(temp)
+		return false
+	end
+	file:close()
+	os.rename(temp, path)
+	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	return true
+end
+
+local function restore_portal_dns(cursor)
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal.conf"
+	os.remove(path)
+	os.remove(path .. ".new")
+	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	return true
+end
+
+local function bool_value(value)
+	return value == true or value == 1 or value == "1" or value == "true"
+end
+
+local function portal_info(cursor, section)
+	local function get(option, fallback)
+		local value = section and section[option]
+		if value == nil then
+			value = cursor:get("gl-repeater", "settings", option)
+		end
+		return value == nil and fallback or value
+	end
+
+	local raw_mode = get("portal_auth_mode", "0")
+	local mode = tonumber(raw_mode) or 0
+	return {
+		auth_mode_raw = tostring(raw_mode),
+		auth_mode = mode,
+		one_click = bool_value(get("portal_one_click", "0")),
+		username = get("portal_username", "") or "",
+		password = get("portal_password", "") or "",
+		voucher = get("portal_voucher", "") or "",
+	}
+end
+
+local function current_saved(cursor, iface)
+	local ssid = iface and cursor:get("wireless", iface, "ssid")
+	local found
+	cursor:foreach("gl-repeater", "saved_ap", function(section)
+		if (iface and section.iface == iface)
+			or (ssid and section.ssid == ssid and not found) then
+			found = section
+		end
+	end)
+	return found
+end
+
+local RADIOS = { "radio0", "radio1" }
 
 local function radio_for_band(cursor, wanted_band)
 	if wanted_band ~= "2g" and wanted_band ~= "5g" then return nil end
@@ -159,6 +312,8 @@ local function apply_config(args)
 	end
 	local radio = choose_radio(args)
 	local cursor = uci.cursor()
+	-- A new uplink invalidates any DNS snapshot taken for the previous portal.
+	restore_portal_dns(cursor)
 	local iface = repeater_iface(cursor)
 	if not iface then
 		iface = cursor:add("wireless", "wifi-iface")
@@ -178,13 +333,10 @@ local function apply_config(args)
 	local secret = args.key or args.password
 	local enterprise = args.identity ~= nil or args.eap_type ~= nil
 	if enterprise then
-		local eap_type = (args.eap_type or "peap"):lower()
 		cursor:set("wireless", iface, "encryption", "wpa2")
+		local eap_type = (args.eap_type or "peap"):lower()
 		cursor:set("wireless", iface, "eap_type", eap_type)
-		-- PEAP/FAST only tunnel actual EAP inner methods (EAP-MSCHAPV2, ...);
-		-- the plain PAP/CHAP/MSCHAP/MSCHAPV2 names are TTLS-only. Defaulting
-		-- to plain MSCHAPV2 here made every PEAP network (the common case -
-		-- carrier hotspots, most enterprise APs) fail auth.
+		-- PEAP/FAST use a tunneled EAP method; plain MSCHAPV2 is TTLS-only.
 		cursor:set("wireless", iface, "auth",
 			args.auth or (eap_type == "ttls" and "MSCHAPV2" or "EAP-MSCHAPV2"))
 		cursor:set("wireless", iface, "identity", args.identity or "")
@@ -213,7 +365,9 @@ local function apply_config(args)
 		cursor:set("network", "repeater", "proto",
 			args.protocol == "static" and "static" or "dhcp")
 		if args.protocol == "static" then
-			if args.ipaddr then cursor:set("network", "repeater", "ipaddr", args.ipaddr) end
+			if args.ipaddr or args.ip then
+				cursor:set("network", "repeater", "ipaddr", args.ipaddr or args.ip)
+			end
 			if args.netmask then cursor:set("network", "repeater", "netmask", args.netmask) end
 			if args.gateway then cursor:set("network", "repeater", "gateway", args.gateway) end
 			if args.dns then cursor:set("network", "repeater", "dns", args.dns) end
@@ -221,16 +375,51 @@ local function apply_config(args)
 		cursor:commit("network")
 	end
 
-	local already_saved = false
-	cursor:foreach("gl-repeater", "saved_ap", function(s)
-		if s.ssid == args.ssid then already_saved = true end
-	end)
-	if not already_saved then
-		local saved = cursor:add("gl-repeater", "saved_ap")
-		cursor:set("gl-repeater", saved, "ssid", args.ssid)
-		cursor:set("gl-repeater", saved, "radio", radio)
-		cursor:commit("gl-repeater")
+	local auto_portal = args.auto_portal
+	if auto_portal == nil then
+		auto_portal = cursor:get("gl-repeater", "settings", "auto_portal") == "1"
+	else
+		auto_portal = bool_value(auto_portal)
 	end
+	cursor:set("gl-repeater", "settings", "settings")
+	cursor:set("gl-repeater", "settings", "auto_portal", auto_portal and "1" or "0")
+
+	local saved_section
+	cursor:foreach("gl-repeater", "saved_ap", function(s)
+		if s.ssid == args.ssid or s.iface == iface then saved_section = s end
+	end)
+	if not saved_section then
+		saved_section = cursor:add("gl-repeater", "saved_ap")
+	end
+	cursor:set("gl-repeater", saved_section, "ssid", args.ssid)
+	cursor:set("gl-repeater", saved_section, "radio", radio)
+	cursor:set("gl-repeater", saved_section, "iface", iface)
+	cursor:set("gl-repeater", saved_section, "auto_portal", auto_portal and "1" or "0")
+	cursor:set("gl-repeater", saved_section, "protocol", args.protocol or
+		(cursor:get("network", "repeater", "proto") or "dhcp"))
+
+	-- Saved portal credentials are optional.  Keep existing credentials when a
+	-- normal WiFi join does not carry portal fields, but accept both spellings
+	-- seen in the GL frontend/backend boundary.
+	local supplied_portal = args.portal_info or args.portalInfo
+	if type(supplied_portal) == "table" then
+		local fields = {
+			{ "auth_mode", "portal_auth_mode" },
+			{ "one_click", "portal_one_click" },
+			{ "username", "portal_username" },
+			{ "password", "portal_password" },
+			{ "voucher", "portal_voucher" },
+		}
+		for _, field in ipairs(fields) do
+			local value = supplied_portal[field[1]]
+			if value ~= nil then
+				cursor:set("gl-repeater", saved_section, field[2],
+					(field[1] == "one_click" and bool_value(value) and "1" or
+					 field[1] == "one_click" and "0" or tostring(value)))
+			end
+		end
+	end
+	cursor:commit("gl-repeater")
 
 	os.execute("wifi reload >/dev/null 2>&1")
 	return {}
@@ -284,6 +473,9 @@ return {
 			encryption = cursor:get("wireless", iface, "encryption"),
 			eap_type = cursor:get("wireless", iface, "eap_type"),
 			identity = cursor:get("wireless", iface, "identity"),
+			key = cursor:get("wireless", iface, "key")
+				or cursor:get("wireless", iface, "password"),
+			auto_portal = cursor:get("gl-repeater", "settings", "auto_portal") == "1",
 			disabled = cursor:get("wireless", iface, "disabled") == "1",
 		}
 	end,
@@ -327,6 +519,7 @@ return {
 	disconnect = function(args)
 		clear_retry_state()
 		local cursor = uci.cursor()
+		restore_portal_dns(cursor)
 		local iface = repeater_iface(cursor)
 		if iface then
 			cursor:set("wireless", iface, "disabled", "1")
@@ -352,47 +545,125 @@ return {
 		return {}
 	end,
 
+	-- Captive-portal credentials are a separate part of the original GL
+	-- repeater API.  Keep them in the gl-repeater settings section for the
+	-- currently selected uplink; saved_ap sections get a copy below.
+	get_repeater_portal = function(args)
+		local cursor = uci.cursor()
+		local iface = repeater_iface(cursor)
+		local info = portal_info(cursor, current_saved(cursor, iface))
+		return { res = info, portal_info = info }
+	end,
+
+	set_repeater_portal = function(args)
+		args = args or {}
+		local auth_mode = tonumber(args.auth_mode or 0)
+		if not auth_mode or auth_mode < 0 or auth_mode > 4
+			or auth_mode ~= math.floor(auth_mode) then
+			return { code = 1, message = "invalid auth_mode" }
+		end
+		if args.one_click ~= nil and type(args.one_click) ~= "boolean"
+			and type(args.one_click) ~= "number" and type(args.one_click) ~= "string" then
+			return { code = 1, message = "invalid one_click" }
+		end
+		for _, name in ipairs({ "username", "password", "voucher" }) do
+			if args[name] ~= nil and type(args[name]) ~= "string" then
+				return { code = 1, message = "invalid " .. name }
+			end
+		end
+
+		local cursor = uci.cursor()
+		local iface = repeater_iface(cursor)
+		local saved = current_saved(cursor, iface)
+		local old_info = portal_info(cursor, saved)
+		local values = {
+			portal_auth_mode = tostring(auth_mode),
+			portal_one_click = args.one_click == nil and (old_info.one_click and "1" or "0")
+				or (bool_value(args.one_click) and "1" or "0"),
+			portal_username = args.username == nil and old_info.username or args.username,
+			portal_password = args.password == nil and old_info.password or args.password,
+			portal_voucher = args.voucher == nil and old_info.voucher or args.voucher,
+		}
+		for name, value in pairs(values) do
+			cursor:set("gl-repeater", "settings", name, value)
+			if saved then cursor:set("gl-repeater", saved, name, value) end
+		end
+		if args.save_config ~= false then
+			cursor:commit("gl-repeater")
+		end
+		return {}
+	end,
+
 	-- Saved upstream-AP history (distinct from the live single "current"
-	-- config in get_config/set_config) - a simple UCI list, appended to
-	-- on every successful set_config. manual/auto_portal/disguise are
-	-- always false and protocol always "dhcp" - this port doesn't track
-	-- a manually-added-vs-auto-detected flag, a captive-portal auto-login
-	-- flag, or per-network protocol overrides.
+	-- config in get_config/set_config).  The stock UI consumes portal_info
+	-- from this list when the user opens a saved network for editing.
 	get_saved_ap_list = function(args)
 		local cursor = uci.cursor()
 		local saved = {}
 		cursor:foreach("gl-repeater", "saved_ap", function(s)
+			local key, identity, password
+			if s.iface then
+				key = cursor:get("wireless", s.iface, "key")
+				identity = cursor:get("wireless", s.iface, "identity")
+				password = cursor:get("wireless", s.iface, "password")
+			end
 			table.insert(saved, {
 				id = s[".name"], ssid = s.ssid, radio = s.radio,
-				manual = false, auto_portal = false, disguise = false,
-				protocol = "dhcp",
+				key = key or password, identity = identity, password = password,
+				manual = s.manual == "1", auto_portal = s.auto_portal == "1",
+				disguise = s.disguise == "1",
+				protocol = s.protocol or "dhcp",
 				macaddr = { mode = "default", update = "none" },
+				portal_info = portal_info(cursor, s),
 			})
 		end)
 		return { res = as_array(saved) }
 	end,
 
 	remove_saved_ap = function(args)
-		if not args.id then
-			return { code = 1, message = "missing id" }
-		end
+		args = args or {}
 		local cursor = uci.cursor()
-		cursor:delete("gl-repeater", args.id)
+		local id = args.id
+		if not id and args.ssid then
+			cursor:foreach("gl-repeater", "saved_ap", function(s)
+				if s.ssid == args.ssid then id = s[".name"] end
+			end)
+		end
+		if not id then return { code = 1, message = "missing id or ssid" } end
+		cursor:delete("gl-repeater", id)
 		cursor:commit("gl-repeater")
 		return {}
 	end,
 
-	-- "Bare mode": temporarily drop the repeater's own AP-side WiFi so a
-	-- laptop can plug in directly via ethernet during setup, avoiding a
-	-- double-hop through the very uplink being configured. NOT YET WIRED
-	-- to real AP-radio disable/restore logic - recorded as an honest
-	-- "not yet supported" no-op rather than a fake success, since getting
-	-- this wrong could strand a WiFi-only management session.
+	-- "Bare mode" is the stock portal-login mode, not an AP-radio mode in this
+	-- STA/double-NAT port.  Disable the LAN captive gate so a LAN client can
+	-- reach the upstream portal directly; leaving the management AP alive is
+	-- essential because the stock UI immediately opens the portal URL in a
+	-- browser connected to that AP.
 	enter_bare_mode = function(args)
-		return { code = 1, message = "bare mode not yet supported" }
+		local cursor = uci.cursor()
+		set_portal_dns(cursor, repeater_dns(cursor))
+		set_portal_gate(false)
+		local state = read_portal_state()
+		state.bare_mode = true
+		state.auto_bare_mode = false
+		state.updated = os.time()
+		write_portal_state(state)
+		return {}
 	end,
 
 	exit_bare_mode = function(args)
+		-- This port leaves the wifidog gate disabled after authentication.  The
+		-- original firmware repopulates a private allow-list here; enabling an
+		-- empty allow-list on mainline would cut off every LAN client.
+		local cursor = uci.cursor()
+		restore_portal_dns(cursor)
+		set_portal_gate(false)
+		local state = read_portal_state()
+		state.bare_mode = false
+		state.auto_bare_mode = false
+		state.updated = os.time()
+		write_portal_state(state)
 		return {}
 	end,
 
@@ -411,18 +682,27 @@ return {
 	end,
 
 	-- state is an int enum (0=idle, 1=connecting, 2=connected,
-	-- 3=retrying), state_s its string label. fail_type is "not-found" while
-	-- gl-repeater-timeout is backing off an upstream network it couldn't
-	-- reach, matching the fail_type the stock UI already knows how to
-	-- render. portal_info is a fixed "no captive portal pending" stub -
-	-- this port has no captive-portal-login flow. connected/ssid/ipaddr/
-	-- signal are extra fields beyond the minimal real shape.
+	-- 3=retrying), state_s its string label.  The stock Internet page consumes
+	-- portal, portal_url, bare_mode and auto_portal directly from this result
+	-- and subscribes to it as repeater.status over the websocket.
 	get_status = function(args)
 		local cursor = uci.cursor()
 		local iface = repeater_iface(cursor)
-		local portal_info = { auth_mode = 0, username = "", password = "", voucher = "" }
+		local saved = current_saved(cursor, iface)
+		local current_portal_info = portal_info(cursor, saved)
+		local portal_state = read_portal_state()
+		local auto_portal = cursor:get("gl-repeater", "settings", "auto_portal") == "1"
 		if not iface then
-			return { connected = false, state = 0, state_s = "idle", portal_info = portal_info }
+			return {
+				connected = false, state = 0, state_s = "idle",
+				portal = portal_state.detected == true,
+				portal_url = portal_state.portal_url or "",
+				portal_detecting = portal_state.detecting == true,
+				portal_status = portal_state.status or "idle",
+				bare_mode = portal_state.bare_mode == true,
+				auto_portal = auto_portal,
+				portal_info = current_portal_info,
+			}
 		end
 
 		local conn = ubus.connect()
@@ -523,8 +803,10 @@ return {
 			ssid = cursor:get("wireless", iface, "ssid"),
 			bssid = cursor:get("wireless", iface, "bssid"),
 			protocol = cursor:get("network", "repeater", "proto") or "dhcp",
+			key = cursor:get("wireless", iface, "key")
+				or cursor:get("wireless", iface, "password"),
 			identity = cursor:get("wireless", iface, "identity"),
-			auto_portal = false,
+			auto_portal = auto_portal,
 			disguise = false,
 		}
 
@@ -533,9 +815,15 @@ return {
 			state = state,
 			state_s = state == 2 and "connected"
 				or state == 1 and "connecting"
-				or state == 3 and "retrying" or "idle",
+			or state == 3 and "retrying" or "idle",
 			fail_type = fail_type,
-			portal_info = portal_info,
+			portal = portal_state.detected == true,
+			portal_url = portal_state.portal_url or "",
+			portal_detecting = portal_state.detecting == true,
+			portal_status = portal_state.status or "idle",
+			bare_mode = portal_state.bare_mode == true,
+			auto_portal = auto_portal,
+			portal_info = current_portal_info,
 			config = config,
 			ssid = ssid,
 			bssid = radio_info.bssid,

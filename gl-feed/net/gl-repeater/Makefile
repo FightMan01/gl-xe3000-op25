@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-repeater
 PKG_VERSION:=1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -20,7 +20,7 @@ define Package/gl-repeater
   SECTION:=net
   CATEGORY:=Network
   TITLE:=GL.iNet XE3000 WiFi repeater/uplink, reimplemented
-  DEPENDS:=wpad-openssl +libiwinfo-lua +libubus-lua +libuci-lua +gl-oui-rpc
+  DEPENDS:=wpad-openssl +libiwinfo-lua +libubus-lua +libuci-lua +gl-oui-rpc +gl-portal
 endef
 
 define Package/gl-repeater/description
@@ -41,6 +41,8 @@ define Package/gl-repeater/postinst
 [ -n "$$IPKG_INSTROOT" ] || {
 	/etc/init.d/gl-repeater-timeout enable
 	/etc/init.d/gl-repeater-timeout start
+	/etc/init.d/gl-repeater-portal enable
+	/etc/init.d/gl-repeater-portal start
 }
 exit 0
 endef

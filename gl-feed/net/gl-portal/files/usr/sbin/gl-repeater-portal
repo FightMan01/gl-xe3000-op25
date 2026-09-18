@@ -1,0 +1,294 @@
+#!/usr/bin/env eco
+
+-- Captive-network detector for the STA repeater uplink.
+--
+-- This follows the observable behavior of the original repeater-portal.lua:
+-- probe two vendor-neutral connectivity URLs through the repeater device,
+-- treat a redirect/login page as a portal, expose its URL in a small state
+-- file, and temporarily disable the LAN interception gate while the user is
+-- completing the portal login.
+
+local http = require "eco.http.client"
+local time = require "eco.time"
+local ubus = require "eco.ubus"
+local uci = require "eco.uci"
+local cjson = require "cjson"
+
+local STATE = "/tmp/gl-repeater-portal.json"
+local PORTAL_HTML = "/var/log/gl-repeater/portal.html"
+local PROBE_MARK = 0x8000
+local PROBE_TIMEOUT = 6
+local POLL_INTERVAL = 15
+
+local PROBES = {
+	{
+		url = "http://captive.apple.com/hotspot-detect.html",
+		body = "<body>success</body>",
+		title = "<title>success</title>",
+	},
+	{
+		url = "http://www.msftconnecttest.com/connecttest.txt",
+		body = "microsoft connect test",
+	},
+}
+
+local function load_state()
+	local file = io.open(STATE, "r")
+	if not file then
+		return {
+			detected = false, detecting = false, portal_url = "",
+			bare_mode = false, auto_bare_mode = false,
+			status = "idle", last_error = "",
+		}
+	end
+	local raw = file:read("*a")
+	file:close()
+	local ok, state = pcall(cjson.decode, raw)
+	if ok and type(state) == "table" then return state end
+	return { detected = false, detecting = false, portal_url = "", bare_mode = false }
+end
+
+local function save_state(state)
+	local temp = STATE .. ".new"
+	local file = io.open(temp, "w")
+	if not file then return end
+	file:write(cjson.encode(state))
+	file:close()
+	os.rename(temp, STATE)
+end
+
+local function update_state(fields)
+	local state = load_state()
+	for key, value in pairs(fields) do state[key] = value end
+	state.updated = os.time()
+	save_state(state)
+	return state
+end
+
+local function set_wifidog(enabled)
+	local file = io.open("/proc/net/wifidog-ng/config", "w")
+	if file then
+		file:write("enabled=" .. (enabled and "1" or "0") .. "\n")
+		file:close()
+	end
+end
+
+local function as_list(value)
+	if type(value) == "table" then return value end
+	if value == nil or value == "" then return {} end
+	return { value }
+end
+
+local function shell_quote(value)
+	return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function dnsmasq_confdir(cursor)
+	local section
+	cursor:foreach("dhcp", "dnsmasq", function(candidate)
+		if not section then section = candidate[".name"] end
+	end)
+	if not section then return nil end
+	local directory = cursor:get("dhcp", section, "confdir")
+	if not directory or directory == "" then
+		directory = "/tmp/dnsmasq." .. section .. ".d"
+	end
+	return directory
+end
+
+-- Keep the DNS path used by LAN clients aligned with the repeater STA while
+-- a captive portal is pending.  A router may otherwise continue forwarding
+-- DNS to an old VPN/AdGuard/custom server, which makes the portal URL fail to
+-- resolve even though the STA itself can reach the upstream login page.
+local function set_portal_dns(dns)
+	local cursor = uci.cursor()
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal.conf"
+	local servers = as_list(dns)
+	if #servers == 0 then
+		return false
+	end
+	os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
+	local temp = path .. ".new"
+	local file = io.open(temp, "w")
+	if not file then return false end
+	file:write("no-resolv\n")
+	local valid = 0
+	for _, server in ipairs(servers) do
+		server = tostring(server)
+		if server:match("^[%x%.:]+$") then
+			file:write("server=", server, "\n")
+			valid = valid + 1
+		end
+	end
+	if valid == 0 then
+		file:close()
+		os.remove(temp)
+		return false
+	end
+	file:close()
+	os.rename(temp, path)
+	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	return true
+end
+
+local function restore_portal_dns()
+	local cursor = uci.cursor()
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal.conf"
+	os.remove(path)
+	os.remove(path .. ".new")
+	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	return true
+end
+
+local function set_bare_mode(enabled, automatic)
+	-- The mainline port does not yet repopulate the vendor allow-list.  Never
+	-- enable wifidog-ng with an empty set: that would block every LAN client
+	-- after portal authentication.  The browser flow uses the upstream STA
+	-- directly while the gate remains fail-safe disabled.
+	set_wifidog(false)
+	return update_state({
+		bare_mode = enabled,
+		auto_bare_mode = enabled and automatic or false,
+	})
+end
+
+local function repeater_settings()
+	local cursor = uci.cursor()
+	local sta_section, ssid
+	cursor:foreach("wireless", "wifi-iface", function(section)
+		if section.mode == "sta" and section.network == "repeater" then
+			sta_section = section[".name"]
+			ssid = section.ssid
+		end
+	end)
+	if not sta_section then return nil end
+
+	local auto_portal = cursor:get("gl-repeater", "settings", "auto_portal") == "1"
+	local wireless_status = ubus.call("network.wireless", "status", {}) or {}
+	local ifname
+	for _, radio in pairs(wireless_status) do
+		for _, iface in ipairs(radio.interfaces or {}) do
+			if iface.section == sta_section or iface.config == sta_section then
+				ifname = iface.ifname
+			end
+		end
+	end
+	local network_status = ubus.call("network.interface.repeater", "status", {}) or {}
+	local device = network_status.l3_device or network_status.device or ifname
+	return {
+		section = sta_section,
+		ssid = ssid,
+		device = device,
+		up = network_status.up == true,
+		dns = network_status["dns-server"] or {},
+		auto_portal = auto_portal,
+	}
+end
+
+local function resolve_location(base, location)
+	if not location or location == "" then return nil end
+	if location:match("^https?://") then return location end
+	local authority = base:match("^(https?://[^/]+)")
+	if location:sub(1, 1) == "/" then return authority .. location end
+	return authority .. "/" .. location
+end
+
+local function extract_portal_url(base, response)
+	local location = response.headers and (response.headers.location
+		or response.headers["content-location"])
+	local url = resolve_location(base, location)
+	if url then return url end
+
+	local body = response.body or ""
+	local candidate = body:match("[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]%s*=%s*[\"']([^\"']+)")
+		or body:match("[Hh][Rr][Ee][Ff]%s*=%s*[\"'](https?://[^\"']+)")
+		or body:match("window%.location[^=]*=%s*[\"']([^\"']+)")
+	return resolve_location(base, candidate) or "http://.gl-wifi.com/"
+end
+
+local function is_probe_success(probe, response)
+	if not response then return false end
+	if response.code == 204 then return true end
+	local body = (response.body or ""):lower()
+	if response.code ~= 200 then return false end
+	if probe.title and not body:match("<title>%s*success%s*</title>") then return false end
+	if probe.title then
+		return body:match("<body>%s*success%s*</body>") ~= nil
+	end
+	return body:find(probe.body, 1, true) ~= nil
+end
+
+local function write_portal_body(body)
+	if not body then return end
+	os.execute("mkdir -p /var/log/gl-repeater")
+	local file = io.open(PORTAL_HTML, "w")
+	if file then
+		file:write(body:sub(1, 65536))
+		file:close()
+	end
+end
+
+local function detect(settings)
+	update_state({ detecting = true, status = "portal detecting...", last_error = "" })
+	local last_error = ""
+	for _, probe in ipairs(PROBES) do
+		local response, err = http.get(probe.url, {
+			timeout = PROBE_TIMEOUT,
+			device = settings.device,
+			mark = PROBE_MARK,
+			nameservers = settings.dns,
+		})
+		if response then
+			if is_probe_success(probe, response) then
+				local old = load_state()
+				-- A successful probe is the stock firmware's signal that portal
+				-- authentication completed.  Exit both automatically entered and
+				-- manually entered bare mode so the LAN gate cannot remain open.
+				restore_portal_dns()
+				if old.bare_mode then set_bare_mode(false, false) end
+				update_state({
+					detected = false, detecting = false, portal_url = "",
+					status = "portal pass", last_error = "",
+				})
+				return false
+			end
+			write_portal_body(response.body)
+			local url = extract_portal_url(probe.url, response)
+			set_portal_dns(settings.dns)
+			if settings.auto_portal then set_bare_mode(true, true) end
+			update_state({
+				detected = true, detecting = false, portal_url = url,
+				status = "portal detected", last_error = "",
+			})
+			return true
+		else
+			last_error = err or "probe failed"
+		end
+	end
+
+	update_state({
+		detected = false, detecting = false, portal_url = "",
+		status = "not found portal", last_error = last_error,
+	})
+	return false
+end
+
+while true do
+	local settings = repeater_settings()
+	if settings and settings.up and settings.device then
+		detect(settings)
+	else
+		local old = load_state()
+		restore_portal_dns()
+		if old.auto_bare_mode then set_bare_mode(false, false) end
+		update_state({
+			detected = false, detecting = false, portal_url = "",
+			status = "idle", last_error = "",
+		})
+	end
+	time.sleep(POLL_INTERVAL)
+end
