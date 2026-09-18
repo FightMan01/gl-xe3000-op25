@@ -11,6 +11,7 @@
 
 local cjson = require "cjson"
 local uci = require "uci"
+local gloui_id = require "gloui.id"
 
 local CONFIG = "gl_wgclient"
 
@@ -45,8 +46,7 @@ local function public_key(private)
 end
 
 local function new_id()
-	local seed = tostring(os.time()) .. tostring(math.random(100000, 999999))
-	return command_output("printf %s " .. shell_quote(seed) .. " | sha256sum | cut -c1-16")
+	return gloui_id.new(16)
 end
 
 local function new_section(cursor, config, section_type, name, values)
@@ -74,16 +74,32 @@ local function group_by_id(cursor, id)
 	return nil
 end
 
-local function group_result(group)
+local function group_result(cursor, group)
+	local peer_count = 0
+	cursor:foreach(CONFIG, "peer", function(section)
+		if tostring(section.group_id or "") == tostring(group.group_id or "") then
+			peer_count = peer_count + 1
+		end
+	end)
 	return {
 		group_id = group.group_id or "",
 		group_name = group.group_name or "",
-		-- group_type 3 matches GL's own "FromApp" (manually supplied,
-		-- non-vendor) group convention seen in real device UCI dumps.
-		group_type = 3,
+		-- The vendored frontend's own enum is {PROVIDER=1, CUSTOM=2, APP=3}
+		-- (app.js), and its group list filter is:
+		--   PROVIDER(1) && (show || peers/clients/username) ||
+		--   APP(3)      && (peer_count || client_count)     ||
+		--   (group_type != PROVIDER && group_type != APP)
+		-- A group the user creates in this port is a CUSTOM group, so it must
+		-- be reported as 2. Reporting 3 (which an earlier comment here wrongly
+		-- assumed meant "manual") labelled every user group APP with zero
+		-- peers, so the filter dropped it and "Add group" looked like it did
+		-- nothing while the group piled up invisibly in UCI.
+		group_type = 2,
 		auth_type = 1,
 		procedure = 0,
 		show = 0,
+		peer_count = peer_count,
+		client_count = 0,
 	}
 end
 
@@ -107,12 +123,18 @@ local function peer_by_id(cursor, id)
 	return found
 end
 
+-- The frontend's config edit dialog does `allowed_ips.split(",")` to seed its
+-- per-IP form rows (doShow in the vpn-client bundle) and its submit handler
+-- sends the field back as the same comma-separated string. So the RPC layer
+-- must speak string here, not the array-of-{ip} the dashboard's
+-- get_all_config_list uses. Returning an array made the edit dialog throw on
+-- `.split`, and made add_config ignore whatever the user typed.
 local function allowed_ips_result(value)
 	local out = {}
 	for _, ip in ipairs(cjson.decode(value or "[]")) do
-		out[#out + 1] = { ip = ip }
+		if type(ip) == "string" and ip ~= "" then out[#out + 1] = ip end
 	end
-	return as_array(out)
+	return table.concat(out, ", ")
 end
 
 local function peer_result(peer)
@@ -162,10 +184,18 @@ local function write_peer(cursor, section, args)
 		address_v4 = string.format("10.250.%d.%d/32", math.floor(h / 256), h % 256)
 	end
 	local ips = {}
-	if type(args.allowed_ips) == "table" then
+	-- The GUI sends allowed_ips as a comma-separated string; accept the
+	-- array-of-{ip} form too so both shapes round-trip.
+	if type(args.allowed_ips) == "string" then
+		for ip in args.allowed_ips:gmatch("[^,%s]+") do
+			ips[#ips + 1] = ip
+		end
+	elseif type(args.allowed_ips) == "table" then
 		for _, entry in ipairs(args.allowed_ips) do
 			if type(entry) == "table" and type(entry.ip) == "string" and entry.ip ~= "" then
 				ips[#ips + 1] = entry.ip
+			elseif type(entry) == "string" and entry ~= "" then
+				ips[#ips + 1] = entry
 			end
 		end
 	end
@@ -198,7 +228,7 @@ return {
 		local cursor = uci.cursor()
 		local groups = {}
 		for _, group in ipairs(group_sections(cursor)) do
-			groups[#groups + 1] = group_result(group)
+			groups[#groups + 1] = group_result(cursor, group)
 		end
 		return { groups = as_array(groups) }
 	end,

@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -73,10 +73,10 @@ define Package/gl-oui-rpc/postinst
 	/etc/init.d/gl-internet-led enable
 	/etc/init.d/gl-oui-client-acct enable
 	/etc/init.d/gl-oui-client-acct start
+	/etc/init.d/gl-wgserver enable
 	/etc/init.d/sqm enable
 	/etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable
-	/etc/init.d/openvpn disable
 }
 exit 0
 endef

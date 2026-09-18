@@ -13,6 +13,7 @@
 
 local cjson = require "cjson"
 local uci = require "uci"
+local gloui_id = require "gloui.id"
 
 local CONFIG = "gl_parentalcontrol"
 local RULE_PREFIX = "GL-ParentalControl "
@@ -39,12 +40,7 @@ local function is_time(value)
 end
 
 local function new_id()
-	local pipe = io.popen("printf %s%s '" .. os.time() .. "' '" ..
-		math.random(100000, 999999) .. "' | sha256sum | cut -c1-16 2>/dev/null")
-	if not pipe then return tostring(os.time()) end
-	local id = (pipe:read("*a") or ""):gsub("%s+$", "")
-	pipe:close()
-	return id ~= "" and id or tostring(os.time())
+	return gloui_id.new(16)
 end
 
 local function group_sections(cursor)

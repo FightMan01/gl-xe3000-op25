@@ -1,0 +1,49 @@
+#!/bin/sh /etc/rc.common
+# Keeps the WireGuard server's netifd state in sync with the authoritative
+# gl_wgserver.main.enabled flag across reboots.
+#
+# netifd starts every interface in /etc/config/network at boot unless it is
+# marked auto=0, so a leftover network.wgserver - from an older stop() that
+# only ran `ifdown`, a config restore, or a firmware upgrade - silently
+# resurrected the server after a reboot even though the UI and
+# system.get_status both read the server as stopped.
+#
+# wg-server.stop now deletes that runtime config itself; this boot hook is the
+# safety net. Disabled: remove any leftover interface/peers/routes/zone.
+# Enabled: make sure the interface the RPC layer already generated is up.
+
+START=25
+STOP=89
+
+teardown() {
+	ifdown wgserver 2>/dev/null
+	uci -q delete network.wgserver
+	# Anonymous peer sections: network.<name>=wireguard_wgserver
+	uci -q show network 2>/dev/null \
+		| sed -n 's/^network\.\([^.=]*\)=wireguard_wgserver$/\1/p' \
+		| while read -r s; do uci -q delete "network.$s"; done
+	# Named route rules this port generates: network.gl_wg_route_<id>
+	uci -q show network 2>/dev/null \
+		| sed -n 's/^network\.\(gl_wg_route_[^=]*\)=.*/\1/p' \
+		| while read -r s; do uci -q delete "network.$s"; done
+	uci -q delete firewall.gl_wgserver
+	uci -q delete firewall.gl_wgserver_to_lan
+	uci -q delete firewall.gl_wgserver_to_wan
+	uci -q delete firewall.gl_wgserver_input
+	uci -q commit network
+	uci -q commit firewall
+	ubus call network reload >/dev/null 2>&1
+	/etc/init.d/firewall reload >/dev/null 2>&1
+}
+
+start() {
+	if [ "$(uci -q get gl_wgserver.main.enabled)" = "1" ]; then
+		ifup wgserver 2>/dev/null
+	else
+		teardown
+	fi
+}
+
+stop() {
+	teardown
+}

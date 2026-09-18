@@ -118,24 +118,42 @@ return {
 
 	-- Used by the OpenVPN-server/WireGuard-server setup pages to ask "what
 	-- address(es) can a remote client use to reach this router" - its own
-	-- WAN IP, DDNS domain if any, and public-facing IP. pub_ip mirrors
-	-- wan_ip since no external IP/STUN lookup is performed. domain is
-	-- empty when DDNS isn't configured. No wg-server/ovpn-server backend
-	-- exists yet, so nothing currently calls this in practice.
+	-- WAN IP, DDNS domain if any, and public-facing IP.
+	--
+	-- Must scan every WAN-capable interface, not just "wan": on this device
+	-- the active uplink is usually wwan_4 (cellular), repeater or tethering,
+	-- so hardcoding "wan" left the export-address dropdown empty. pub_ip
+	-- mirrors wan_ip since no external IP/STUN lookup is performed.
 	get_available_address_list = function(args)
+		local wan_ips = {}
 		local conn = ubus.connect()
-		local wan_ip = nil
 		if conn then
-			local status = conn:call("network.interface.wan", "status", {})
+			for _, name in ipairs({ "wan", "wwan_4", "wwan_6", "repeater", "tethering" }) do
+				local status = conn:call("network.interface." .. name, "status", {}) or {}
+				if status.up then
+					local ipv4 = status["ipv4-address"] and status["ipv4-address"][1]
+					if ipv4 and ipv4.address then
+						wan_ips[#wan_ips + 1] = ipv4.address
+					end
+				end
+			end
 			conn:close()
-			local ipv4 = status and status["ipv4-address"] and status["ipv4-address"][1]
-			wan_ip = ipv4 and ipv4.address
 		end
-		local wan_ips = wan_ip and { wan_ip } or {}
+
+		-- DDNS domains, if the ddns config exists (the Dynamic DNS backend
+		-- itself is a separate gap in this port).
+		local domains = {}
+		local cursor = uci.cursor()
+		cursor:foreach("ddns", "service", function(section)
+			local domain = section.domain or section.lookup_host
+			if type(domain) == "string" and domain ~= "" then
+				domains[#domains + 1] = domain
+			end
+		end)
 		return {
 			wan_ip = as_array(wan_ips),
 			pub_ip = as_array(wan_ips),
-			domain = cjson.empty_array,
+			domain = as_array(domains),
 		}
 	end,
 

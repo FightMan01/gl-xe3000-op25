@@ -12,6 +12,7 @@
 
 local cjson = require "cjson"
 local uci = require "uci"
+local gloui_id = require "gloui.id"
 
 local CONFIG = "gl_ovpnclient"
 
@@ -31,8 +32,7 @@ local function command_output(command)
 end
 
 local function new_id()
-	local seed = tostring(os.time()) .. tostring(math.random(100000, 999999))
-	return command_output("printf %s '" .. seed .. "' | sha256sum | cut -c1-16")
+	return gloui_id.new(16)
 end
 
 local function new_section(cursor, config, section_type, name, values)
@@ -68,10 +68,15 @@ return {
 			groups[#groups + 1] = {
 				group_id = group.group_id or "",
 				group_name = group.group_name or "",
-				group_type = 3,
+				-- Frontend enum {PROVIDER=1, CUSTOM=2, APP=3}; user-created
+				-- groups are CUSTOM. See wg-client.lua's group_result for the
+				-- filter this feeds - type 3 hid them from the GUI.
+				group_type = 2,
 				auth_type = 1,
 				procedure = 0,
 				show = 0,
+				peer_count = 0,
+				client_count = 0,
 			}
 		end
 		return { groups = as_array(groups) }

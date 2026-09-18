@@ -51,12 +51,34 @@ local function public_ipv4(address)
 	return true
 end
 
+local function public_ipv6(address)
+	if type(address) ~= "string" or address == "" then return false end
+	if address:match("^::1$") then return false end        -- loopback
+	if address:lower():match("^fe80:") then return false end -- link-local
+	if address:lower():match("^f[cd]") then return false end -- ULA fc00::/7
+	return true
+end
+
 local function gateway(status)
 	for _, route in ipairs(status.route or {}) do
 		if route.target == "0.0.0.0" and route.nexthop then return route.nexthop end
 		if route.target == "::" and route.nexthop then return route.nexthop end
 	end
 	return ""
+end
+
+-- Per-server port/protocol/driver, read from UCI. The real GL firmware gets
+-- these from the same two configs before handing the port to its external
+-- prober.
+local function vpn_config(interface)
+	local cursor = uci.cursor()
+	if interface == "wgserver" then
+		return tonumber(cursor:get("gl_wgserver", "main", "port")) or 51820, "udp"
+	end
+	local port = tonumber(cursor:get("gl_ovpnserver", "vpn", "port")) or 1194
+	local proto = cursor:get("gl_ovpnserver", "vpn", "proto") or "udp"
+	if proto ~= "tcp" then proto = "udp" end
+	return port, proto
 end
 
 return {
@@ -68,18 +90,20 @@ return {
 		end
 
 		local wan_name, wan, ipv4, ipv6 = first_active_wan()
-		local server = interface_status(interface == "wgserver" and "wgserver" or "ovpnserver")
-		local port, protocol = 0, interface == "wgserver" and "udp" or "udp"
-		if interface == "wgserver" then
-			local cursor = uci.cursor()
-			port = tonumber((cursor:get("gl_wgserver", "main", "port"))) or 51820
-		end
+		local server = interface_status(interface)
+		local port, protocol = vpn_config(interface)
 		local v4 = ipv4 and ipv4.address or ""
 		local v6 = ipv6 and ipv6.address or ""
 		local up = server.up == true
+
+		-- dev_info keys MUST stay exactly the set the frontend has labels
+		-- for (internal_ip/external_ip/internal_port/external_port/protocol).
+		-- It renders one row per key and looks the label up in a fixed map,
+		-- so any extra key (this used to also carry `interface`) showed up as
+		-- a row with an empty label and a bare value like "wwan_4".
 		return {
 			ipv4 = { ip = v4, verified = up and public_ipv4(v4) },
-			ipv6 = { ip = v6, verified = up and v6 ~= "" and not v6:match("^fe80:") },
+			ipv6 = { ip = v6, verified = up and public_ipv6(v6) },
 			gateway = gateway(wan),
 			dev_info = {
 				internal_ip = v4,
@@ -87,7 +111,6 @@ return {
 				internal_port = port,
 				external_port = port,
 				protocol = protocol,
-				interface = wan_name,
 			},
 		}
 	end,

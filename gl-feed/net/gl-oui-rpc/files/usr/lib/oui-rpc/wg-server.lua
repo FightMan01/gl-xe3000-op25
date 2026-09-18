@@ -6,6 +6,7 @@
 
 local cjson = require "cjson"
 local uci = require "uci"
+local gloui_id = require "gloui.id"
 
 local CONFIG = "gl_wgserver"
 local SERVER = "main"
@@ -85,9 +86,7 @@ local function peer_sections(cursor)
 end
 
 local function peer_id()
-	local seed = tostring(os.time()) .. tostring(math.random(100000, 999999))
-	return command_output("printf %s " .. shell_quote(seed) ..
-		" | sha256sum | cut -c1-16")
+	return gloui_id.new(16)
 end
 
 local function split_csv(value)
@@ -262,6 +261,41 @@ local function apply_runtime(cursor)
 	command_ok("ubus call network reload")
 	command_ok("/etc/init.d/firewall reload")
 	return true
+end
+
+-- Fully removes the runtime netifd/firewall state the server created.
+--
+-- stop() used to only flip gl_wgserver.main.enabled=0 and `ifdown wgserver`,
+-- leaving network.wgserver in /etc/config/network. netifd brings every
+-- interface in that file up at boot unless it has auto=0, so the server came
+-- straight back after a reboot even though the UI (and system.get_status,
+-- which reads `enabled`) said it was stopped. The only reliable fix is to
+-- delete the interface, its peers, its routes and its firewall zone/rule when
+-- stopping, and let wg-server.start/apply_runtime recreate them.
+local function teardown_runtime(cursor)
+	command_ok("ifdown " .. IFACE)
+	cursor:delete("network", IFACE)
+	delete_type(cursor, "network", "wireguard_" .. IFACE)
+	local stale_routes = {}
+	for _, route_type in ipairs({ "route", "route6" }) do
+		cursor:foreach("network", route_type, function(section)
+			if tostring(section[".name"] or ""):match("^gl_wg_route_") then
+				stale_routes[#stale_routes + 1] = section[".name"]
+			end
+		end)
+	end
+	for _, name in ipairs(stale_routes) do cursor:delete("network", name) end
+	cursor:commit("network")
+
+	for _, name in ipairs({
+		"gl_wgserver", "gl_wgserver_to_lan", "gl_wgserver_to_wan",
+		"gl_wgserver_input",
+	}) do
+		cursor:delete("firewall", name)
+	end
+	cursor:commit("firewall")
+	command_ok("ubus call network reload")
+	command_ok("/etc/init.d/firewall reload")
 end
 
 local function interface_status()
@@ -540,7 +574,7 @@ return {
 		local cursor = uci.cursor()
 		cursor:set(CONFIG, SERVER, "enabled", "0")
 		cursor:commit(CONFIG)
-		command_ok("ifdown " .. IFACE)
+		teardown_runtime(cursor)
 		return {}
 	end,
 

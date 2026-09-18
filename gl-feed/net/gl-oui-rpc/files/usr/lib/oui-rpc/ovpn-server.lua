@@ -16,6 +16,7 @@
 
 local cjson = require "cjson"
 local uci = require "uci"
+local gloui_id = require "gloui.id"
 
 local CONFIG = "gl_ovpnserver"
 local IFACE = "ovpnserver"
@@ -77,8 +78,7 @@ local function sha256(value)
 end
 
 local function new_id()
-	return command_output("printf %s%s " .. shell_quote(os.time()) .. " " ..
-		shell_quote(math.random(100000, 999999)) .. " | sha256sum | cut -c1-12")
+	return gloui_id.new(12)
 end
 
 local function user_sections(cursor)
