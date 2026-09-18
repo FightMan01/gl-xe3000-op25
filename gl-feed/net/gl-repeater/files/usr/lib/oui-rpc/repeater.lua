@@ -115,6 +115,9 @@ end
 -- the URL supplied by the upstream captive network from resolving.  Use a
 -- tmpfs dnsmasq include instead of changing /etc/config/dhcp, so leaving
 -- portal mode (or rebooting) automatically restores the normal resolver.
+-- Idempotent: only reload dnsmasq when the include actually changes, so a
+-- disconnect (or any other path that calls restore with nothing pending)
+-- doesn't bounce the resolver for nothing.
 local function set_portal_dns(cursor, dns)
 	local directory = dnsmasq_confdir(cursor)
 	if not directory then return false end
@@ -123,24 +126,31 @@ local function set_portal_dns(cursor, dns)
 	if #servers == 0 then
 		return false
 	end
-	os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
-	local temp = path .. ".new"
-	local file = io.open(temp, "w")
-	if not file then return false end
-	file:write("no-resolv\n")
+
+	local lines = { "no-resolv" }
 	local valid = 0
 	for _, server in ipairs(servers) do
 		server = tostring(server)
 		if server:match("^[%x%.:]+$") then
-			file:write("server=", server, "\n")
+			lines[#lines + 1] = "server=" .. server
 			valid = valid + 1
 		end
 	end
-	if valid == 0 then
-		file:close()
-		os.remove(temp)
-		return false
+	if valid == 0 then return false end
+	local content = table.concat(lines, "\n") .. "\n"
+
+	local existing = io.open(path, "r")
+	if existing then
+		local current = existing:read("*a")
+		existing:close()
+		if current == content then return true end
 	end
+
+	os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
+	local temp = path .. ".new"
+	local file = io.open(temp, "w")
+	if not file then return false end
+	file:write(content)
 	file:close()
 	os.rename(temp, path)
 	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
@@ -151,8 +161,11 @@ local function restore_portal_dns(cursor)
 	local directory = dnsmasq_confdir(cursor)
 	if not directory then return false end
 	local path = directory .. "/gl-repeater-portal.conf"
-	os.remove(path)
 	os.remove(path .. ".new")
+	local existing = io.open(path, "r")
+	if not existing then return false end
+	existing:close()
+	os.remove(path)
 	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
 	return true
 end

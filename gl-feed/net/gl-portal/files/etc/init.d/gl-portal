@@ -22,8 +22,16 @@ write_config() {
 }
 
 start() {
+	# wifidog-ng is an optional KernelPackage (intentionally not a hard
+	# dependency).  Without it the gate simply stays disabled and the
+	# repeater portal flow still works through the STA uplink, so a missing
+	# module is a valid configuration, not a service failure - don't make
+	# rcS log an error (and don't create the sets the module would own).
+	if ! modprobe wifidog-ng 2>/dev/null; then
+		logger -t gl-portal "wifidog-ng not available; captive gate stays disabled"
+		return 0
+	fi
 	create_ipsets
-	modprobe wifidog-ng 2>/dev/null || return 1
 	# Keep the module loaded but fail-safe disabled.  Enabling an empty
 	# wifidog allow-list would block ordinary LAN traffic; the repeater portal
 	# flow does not need interception because the UI calls enter_bare_mode

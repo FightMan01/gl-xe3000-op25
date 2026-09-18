@@ -1,0 +1,31 @@
+#!/bin/sh
+# Enable WED (Wireless Ethernet Dispatch) on the MT7981.
+#
+# The mainline mt7915e driver only attaches to the SoC's WED/PPE offload
+# engine when it is loaded with wed_enable=Y, which upstream leaves off by
+# default.  Without it every WiFi frame is handled in software on this
+# 2-core Cortex-A53, which caps throughput and raises CPU load/latency -
+# the stock firmware does not have this limit because its mt_wifi driver
+# offloads via mtk_warp/mtkhnat.
+#
+# The WED engine is present in this build (CONFIG_NET_MEDIATEK_SOC_WED=y,
+# /sys/kernel/debug/wed0) and the required WO firmware is installed by
+# mt7981-wo-firmware (a dependency of gl-oui-rpc).  Attach failure is not
+# fatal: mt7915_mmio_wed_init() returns 0 and the driver transparently
+# falls back to the software path, so this can never leave WiFi without an
+# uplink.
+#
+# The option has to be present before mt7915e loads, so it takes effect on
+# the next reboot.  To opt out (e.g. to restore WiFi AQL/QoS, which WED
+# disables for offloaded flows):
+#   rm -f /etc/uci-defaults/93-gl-mt7915e-wed
+#   printf 'mt7915e\n' > /etc/modules.d/mt7915e && reboot
+
+MODS=/etc/modules.d/mt7915e
+
+[ -f "$MODS" ] || exit 0
+grep -q 'wed_enable' "$MODS" 2>/dev/null && exit 0
+
+printf 'mt7915e wed_enable=Y\n' > "$MODS"
+
+exit 0
