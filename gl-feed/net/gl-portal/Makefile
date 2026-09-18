@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-portal
 PKG_VERSION:=1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=src/wifidog-ng.c
@@ -23,12 +23,14 @@ define Package/gl-portal
   CATEGORY:=Network
   SUBMENU:=Captive Portals
   TITLE:=GL captive portal and repeater portal detection
-  DEPENDS:=+kmod-gl-wifidog-ng +ipset +lua-eco +lua-eco-http +lua-eco-ubus +lua-eco-uci +lua-cjson-lua5.4
+  DEPENDS:=+ipset +lua-eco +lua-eco-http +lua-eco-ubus +lua-eco-uci +lua-cjson-lua5.4
 endef
 
 define Package/gl-portal/description
   Captive-portal redirect support for the GL management UI and captive
-  network detection for the WiFi repeater STA uplink.
+  network detection for the WiFi repeater STA uplink.  The optional
+  wifidog-ng kernel package is built separately for matching full images;
+  the repeater flow remains safe without it because the gate is disabled.
 endef
 
 define KernelPackage/gl-wifidog-ng
