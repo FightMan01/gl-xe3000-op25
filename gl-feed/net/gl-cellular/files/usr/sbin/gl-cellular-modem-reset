@@ -65,6 +65,10 @@ while [ "$tries" -lt 40 ]; do
 done
 sleep 10
 
+# The rescan re-probes the driver, which re-enables runtime PM; re-apply the
+# D3 override so the modem doesn't immediately start autosuspending again.
+/usr/sbin/gl-cellular-pcie-pm
+
 if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ]; then
 	ifup wwan >/dev/null 2>&1
 fi
