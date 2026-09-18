@@ -4,16 +4,42 @@
 -- (etc/uci-defaults/94-gl-oui-kmwan seeds it) instead of GL's closed
 -- kmwan kernel module.
 --
--- get_config's response shape: `{ interfaces: [{interface, metric,
--- weight, ...}], mode }`.
+-- The GL frontend's contract (read from the shipped multiwan bundle) is:
 --
--- set_sensitivity accepts a single 0-2 preset (relaxed/normal/aggressive)
--- mapped onto mwan3's ping interval/down/up thresholds, applied uniformly
--- to every tracked interface.
+--   get_config -> { mode, interfaces: [{interface, enabled, metric, weight,
+--                    enable_check, track_method, track_mode, track_proto,
+--                    enable_ssl, track_ipv4[], track_ipv6[]}] }
+--   set_interface { interface, enable_check, track_proto, track_method,
+--                    track_mode, enable_ssl, track_ipv4[], track_ipv6[] }
+--   set_config   { mode, interfaces: [{interface, metric} | {interface, weight}] }
+--   get_sensitivity -> { sensitivity: { level, val } }
+--   set_sensitivity { sensitivity: { level, val } }
+--
+-- track_mode: 0 = low data, 1 = normal, 2 = strict (frontend's trackModes).
+-- level:      "low" | "medium" | "high" | "custom"; val is the custom track
+--             interval in seconds (frontend slider range 0.5 - 90).
+--
+-- This port keeps the GL-level tracking fields on the mwan3 interface
+-- section under a `kmwan_` prefix (mwan3 ignores unknown options) and
+-- translates them onto mwan3's own knobs:
+--
+--   enable_check=false  -> drop track_ip, so mwan3 marks the interface
+--                          online whenever the underlying network interface
+--                          is up (the UI's "physical state monitor"). The
+--                          wanted IP list is still stored under
+--                          kmwan_track_ipv4/6 so re-enabling restores it.
+--   track_mode          -> scales the sensitivity interval and picks the
+--                          up/down thresholds (low data checks rarely and is
+--                          forgiving, strict checks often and is quick to
+--                          flip). mwan3 has no event-driven mode, so low
+--                          data is approximated by a long interval.
 
 local uci = require "uci"
 local cjson = require "cjson"
 local ubus = require "ubus"
+
+local RPC_CONFIG = "gl-oui-rpc"
+local RPC_SECTION = "kmwan"
 
 local function as_array(t)
 	if next(t) == nil then return cjson.empty_array end
@@ -39,9 +65,17 @@ local MEMBERS = {
 }
 
 local SENSITIVITY_PRESETS = {
-	[0] = { interval = 15, down = 5, up = 5 }, -- relaxed
-	[1] = { interval = 10, down = 3, up = 3 }, -- normal (matches uci-defaults seed)
-	[2] = { interval = 5, down = 2, up = 2 }, -- aggressive
+	low = 30,
+	medium = 10,
+	high = 3,
+}
+
+-- multiplier applied to the sensitivity interval, minimum interval, and the
+-- up/down consecutive-check thresholds.
+local TRACK_MODES = {
+	[0] = { multiplier = 6, min_interval = 60, down = 5, up = 5 }, -- low data
+	[1] = { multiplier = 1, min_interval = 1, down = 3, up = 3 }, -- normal
+	[2] = { multiplier = 0.5, min_interval = 1, down = 2, up = 2 }, -- strict
 }
 
 local function find_member(frontend_name)
@@ -55,47 +89,178 @@ local function find_member(frontend_name)
 	return nil
 end
 
-local function run(cmd)
-	local f = io.popen(cmd .. " 2>&1")
-	if not f then return "" end
-	local out = f:read("*a") or ""
-	f:close()
+-- os.execute (not io.popen) so the backgrounded reload doesn't leave the
+-- shell's stdout pipe open and spew "Broken pipe" into the log.
+local function restart_mwan3()
+	os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
+end
+
+local function as_list(value)
+	if type(value) == "table" then
+		local out = {}
+		for _, v in ipairs(value) do
+			v = tostring(v)
+			if v ~= "" then out[#out + 1] = v end
+		end
+		return out
+	elseif type(value) == "string" and value ~= "" then
+		return { value }
+	end
+	return {}
+end
+
+local function set_list(cursor, config, section, option, list)
+	if #list == 0 then
+		cursor:delete(config, section, option)
+	else
+		cursor:set(config, section, option, list)
+	end
+end
+
+local function filter_ips(value, want_ipv6)
+	local out = {}
+	if type(value) ~= "table" then return out end
+	for _, ip in ipairs(value) do
+		if type(ip) == "string" and ip ~= "" then
+			local is_v6 = ip:find(":") ~= nil
+			if is_v6 == want_ipv6 then out[#out + 1] = ip end
+		end
+	end
 	return out
 end
 
+local function ensure_rpc_section(cursor)
+	if not cursor:get(RPC_CONFIG, RPC_SECTION) then
+		cursor:set(RPC_CONFIG, RPC_SECTION, RPC_SECTION)
+	end
+end
+
+-- Effective base interval (seconds) from the global sensitivity setting.
+local function sensitivity_base(cursor)
+	local level = cursor:get(RPC_CONFIG, RPC_SECTION, "level") or "medium"
+	if level == "custom" then
+		return tonumber((cursor:get(RPC_CONFIG, RPC_SECTION, "sensitivity"))) or 10
+	end
+	return SENSITIVITY_PRESETS[level] or SENSITIVITY_PRESETS.medium
+end
+
+-- The GL-level tracking view of one member, with defaults for configs that
+-- predate these options (fresh installs, or a config written by an older
+-- build): default to Normal tracking with the mwan3 track_ip list.
+local function member_tracking(cursor, m)
+	local enable = cursor:get("mwan3", m.real, "kmwan_enable_check")
+	local track_ipv4 = as_list(cursor:get("mwan3", m.real, "kmwan_track_ipv4"))
+	local track_ipv6 = as_list(cursor:get("mwan3", m.real, "kmwan_track_ipv6"))
+	if #track_ipv4 == 0 then
+		local existing = as_list(cursor:get("mwan3", m.real, "track_ip"))
+		track_ipv4 = #existing > 0 and existing or { "1.1.1.1", "8.8.8.8" }
+	end
+	return {
+		enable_check = (enable == nil or enable == "") and true or (enable == "1"),
+		track_mode = tonumber((cursor:get("mwan3", m.real, "kmwan_track_mode"))) or 1,
+		track_proto = tonumber((cursor:get("mwan3", m.real, "kmwan_track_proto"))) or 0,
+		track_method = tonumber((cursor:get("mwan3", m.real, "kmwan_track_method"))) or 0,
+		enable_ssl = cursor:get("mwan3", m.real, "kmwan_enable_ssl") == "1",
+		track_ipv4 = track_ipv4,
+		track_ipv6 = track_ipv6,
+	}
+end
+
+-- Push one member's GL-level tracking view onto mwan3.
+local function apply_member_tracking(cursor, m)
+	local t = member_tracking(cursor, m)
+
+	local active = {}
+	if t.enable_check then
+		if t.track_proto == 0 or t.track_proto == 2 then
+			for _, ip in ipairs(t.track_ipv4) do active[#active + 1] = ip end
+		end
+		if t.track_proto == 1 or t.track_proto == 2 then
+			for _, ip in ipairs(t.track_ipv6) do active[#active + 1] = ip end
+		end
+	end
+
+	cursor:set("mwan3", m.real, "family", (t.track_proto == 1) and "ipv6" or "ipv4")
+	set_list(cursor, "mwan3", m.real, "track_ip", active)
+	if not t.enable_check then
+		return
+	end
+
+	cursor:set("mwan3", m.real, "track_method", "ping")
+	local base = sensitivity_base(cursor)
+	local mode = TRACK_MODES[t.track_mode] or TRACK_MODES[1]
+	local interval = math.max(mode.min_interval,
+		math.floor(base * mode.multiplier + 0.5))
+	cursor:set("mwan3", m.real, "interval", tostring(interval))
+	cursor:set("mwan3", m.real, "down", tostring(mode.down))
+	cursor:set("mwan3", m.real, "up", tostring(mode.up))
+	if not cursor:get("mwan3", m.real, "count") then
+		cursor:set("mwan3", m.real, "count", "1")
+	end
+	if not cursor:get("mwan3", m.real, "timeout") then
+		cursor:set("mwan3", m.real, "timeout", "2")
+	end
+	if not cursor:get("mwan3", m.real, "reliability") then
+		cursor:set("mwan3", m.real, "reliability", "1")
+	end
+end
+
+local function persist_member(cursor, m, args)
+	local iface = m.real
+	if args.enable_check ~= nil then
+		cursor:set("mwan3", iface, "kmwan_enable_check", args.enable_check and "1" or "0")
+	end
+	if args.track_mode ~= nil then
+		local mode = tonumber(args.track_mode)
+		if mode and TRACK_MODES[mode] then
+			cursor:set("mwan3", iface, "kmwan_track_mode", tostring(mode))
+		end
+	end
+	if args.track_proto ~= nil then
+		local proto = tonumber(args.track_proto)
+		if proto == 0 or proto == 1 or proto == 2 then
+			cursor:set("mwan3", iface, "kmwan_track_proto", tostring(proto))
+		end
+	end
+	if args.track_method ~= nil then
+		local method = tonumber(args.track_method)
+		if method then cursor:set("mwan3", iface, "kmwan_track_method", tostring(method)) end
+	end
+	if args.enable_ssl ~= nil then
+		cursor:set("mwan3", iface, "kmwan_enable_ssl", args.enable_ssl and "1" or "0")
+	end
+	if type(args.track_ipv4) == "table" then
+		set_list(cursor, "mwan3", iface, "kmwan_track_ipv4", filter_ips(args.track_ipv4, false))
+	end
+	if type(args.track_ipv6) == "table" then
+		set_list(cursor, "mwan3", iface, "kmwan_track_ipv6", filter_ips(args.track_ipv6, true))
+	end
+end
+
 return {
-	-- metric/weight default to sane values instead of vanishing from the
-	-- response when unset in UCI (cjson drops a table key entirely when
-	-- its value is nil).
 	get_config = function(args)
 		local cursor = uci.cursor()
 		local interfaces = {}
-		local metrics = {}
 		for _, m in ipairs(MEMBERS) do
-			local metric = tonumber((cursor:get("mwan3", m.member, "metric"))) or 10
-			local weight = tonumber((cursor:get("mwan3", m.member, "weight"))) or 1
-			metrics[metric] = (metrics[metric] or 0) + 1
-			local track_ipv4 = cursor:get("mwan3", m.real, "track_ip")
-			if type(track_ipv4) ~= "table" then track_ipv4 = { "1.1.1.1", "8.8.8.8" } end
+			local t = member_tracking(cursor, m)
 			table.insert(interfaces, {
 				interface = m.frontend,
-				enabled = cursor:get("mwan3", m.real, "enabled") == "1",
-				metric = metric,
-				weight = weight,
-				enable_check = true,
-				enable_ssl = false,
-				track_method = 0,
-				track_mode = 0,
-				track_proto = 0,
-				track_ipv4 = as_array(track_ipv4),
-				track_ipv6 = as_array({}),
+				enabled = cursor:get("mwan3", m.real, "enabled") ~= "0",
+				metric = tonumber((cursor:get("mwan3", m.member, "metric"))) or 10,
+				weight = tonumber((cursor:get("mwan3", m.member, "weight"))) or 1,
+				enable_check = t.enable_check,
+				enable_ssl = t.enable_ssl,
+				track_method = t.track_method,
+				track_mode = t.track_mode,
+				track_proto = t.track_proto,
+				track_ipv4 = as_array(t.track_ipv4),
+				track_ipv6 = as_array(t.track_ipv6),
 			})
 		end
-		local distinct = 0
-		for _ in pairs(metrics) do distinct = distinct + 1 end
+		local mode = tonumber((cursor:get(RPC_CONFIG, RPC_SECTION, "mode"))) or 0
 		return {
 			interfaces = as_array(interfaces),
-			mode = (distinct <= 1) and 1 or 0, -- best-evidence: 0=failover, 1=balance
+			mode = mode,
 		}
 	end,
 
@@ -103,29 +268,37 @@ return {
 		if type(args.interfaces) ~= "table" then
 			return { code = 1, message = "missing interfaces" }
 		end
+		local mode = tonumber(args.mode) or 0
 		local cursor = uci.cursor()
+		ensure_rpc_section(cursor)
+		cursor:set(RPC_CONFIG, RPC_SECTION, "mode", tostring(mode))
 		for _, entry in ipairs(args.interfaces) do
 			local m = find_member(entry.interface)
 			if m then
-				-- An unparseable metric/weight must never silently become 1
-				-- (top priority) - that's the one value most likely to
-				-- collide with whatever interface is already prioritized,
-				-- scrambling failover tiering for every member sharing this
-				-- mwan3 policy, not just this one. Leave the existing UCI
-				-- value alone instead of guessing.
-				if entry.metric and tonumber(entry.metric) then
-					cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(entry.metric))))
-				end
-				if entry.weight and tonumber(entry.weight) then
-					cursor:set("mwan3", m.member, "weight", tostring(math.floor(tonumber(entry.weight))))
+				if mode == 1 then
+					-- Load balance: one shared metric tier, weights split
+					-- traffic between the members.
+					cursor:set("mwan3", m.member, "metric", "1")
+					if entry.weight and tonumber(entry.weight) then
+						cursor:set("mwan3", m.member, "weight",
+							tostring(math.floor(tonumber(entry.weight))))
+					end
+				else
+					-- Failover: metric is the priority tier.
+					if entry.metric and tonumber(entry.metric) then
+						cursor:set("mwan3", m.member, "metric",
+							tostring(math.floor(tonumber(entry.metric))))
+					end
+					cursor:set("mwan3", m.member, "weight", "1")
 				end
 				if entry.enabled ~= nil then
 					cursor:set("mwan3", m.real, "enabled", entry.enabled and "1" or "0")
 				end
 			end
 		end
+		cursor:commit(RPC_CONFIG)
 		cursor:commit("mwan3")
-		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
+		restart_mwan3()
 		return {}
 	end,
 
@@ -135,6 +308,8 @@ return {
 			return { code = 1, message = "unknown interface" }
 		end
 		local cursor = uci.cursor()
+		persist_member(cursor, m, args)
+		apply_member_tracking(cursor, m)
 		if args.metric and tonumber(args.metric) then
 			cursor:set("mwan3", m.member, "metric", tostring(math.floor(tonumber(args.metric))))
 		end
@@ -145,68 +320,82 @@ return {
 			cursor:set("mwan3", m.real, "enabled", args.enabled and "1" or "0")
 		end
 		cursor:commit("mwan3")
-		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
+		restart_mwan3()
 		return {}
 	end,
 
-	-- {sensitivity:{val,level}} - val is 0/1/2 (relaxed/normal/aggressive),
-	-- level is the matching low/medium/high label.
+	-- {sensitivity:{val,level}} - val is the custom track interval in seconds
+	-- (slider range 0.5-90), level is low/medium/high/custom.
 	get_sensitivity = function(args)
 		local cursor = uci.cursor()
-		local val = tonumber((cursor:get("gl-oui-rpc", "kmwan", "sensitivity"))) or 1
-		local LEVEL_NAMES = { [0] = "low", [1] = "medium", [2] = "high" }
-		return {
-			sensitivity = { val = val, level = LEVEL_NAMES[val] or "medium" },
-		}
+		local level = cursor:get(RPC_CONFIG, RPC_SECTION, "level") or "medium"
+		local val
+		if level == "custom" then
+			val = tonumber((cursor:get(RPC_CONFIG, RPC_SECTION, "sensitivity"))) or 10
+		else
+			val = SENSITIVITY_PRESETS[level] or SENSITIVITY_PRESETS.medium
+		end
+		return { sensitivity = { val = val, level = level } }
 	end,
 
 	set_sensitivity = function(args)
-		local sens_arg = args.sensitivity
-		if type(sens_arg) == "table" then sens_arg = sens_arg.val end
-		local level = tonumber(sens_arg)
-		local preset = level and SENSITIVITY_PRESETS[math.floor(level)]
-		if not preset then
-			return { code = 1, message = "sensitivity must be 0, 1, or 2" }
+		local sens = args and args.sensitivity
+		if type(sens) ~= "table" then
+			return { code = 1, message = "missing sensitivity" }
+		end
+		local level = sens.level
+		if level ~= "low" and level ~= "medium" and level ~= "high" and level ~= "custom" then
+			return { code = 1, message = "invalid sensitivity level" }
 		end
 		local cursor = uci.cursor()
-		if not cursor:get("gl-oui-rpc", "kmwan") then
-			cursor:set("gl-oui-rpc", "kmwan", "kmwan")
+		ensure_rpc_section(cursor)
+		cursor:set(RPC_CONFIG, RPC_SECTION, "level", level)
+		if level == "custom" then
+			local val = tonumber(sens.val)
+			if not val or val < 0.5 or val > 90 then
+				return { code = 1, message = "interval must be between 0.5 and 90 seconds" }
+			end
+			cursor:set(RPC_CONFIG, RPC_SECTION, "sensitivity", tostring(val))
 		end
-		cursor:set("gl-oui-rpc", "kmwan", "sensitivity", tostring(math.floor(level)))
-		cursor:commit("gl-oui-rpc")
-
-		for _, m in ipairs(MEMBERS) do
-			cursor:set("mwan3", m.real, "interval", tostring(preset.interval))
-			cursor:set("mwan3", m.real, "down", tostring(preset.down))
-			cursor:set("mwan3", m.real, "up", tostring(preset.up))
-		end
+		cursor:commit(RPC_CONFIG)
+		for _, m in ipairs(MEMBERS) do apply_member_tracking(cursor, m) end
 		cursor:commit("mwan3")
-		os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
+		restart_mwan3()
 		return {}
 	end,
 
 	-- interfaces is an array of {interface,status_v4,status_v6}.
-	-- status_v4/status_v6 mirror the same overall per-interface state -
-	-- mwan3 isn't tracked separately per address family here.
+	-- Frontend enum is 0=online, 1=offline, 2=error.
 	get_status = function(args)
 		local conn = ubus.connect()
 		local mwan_status = conn and conn:call("mwan3", "status", {}) or {}
-		if conn then conn:close() end
+		local cursor = uci.cursor()
 		local interfaces = {}
 		for _, m in ipairs(MEMBERS) do
-			local info = mwan_status.interfaces and mwan_status.interfaces[m.real] or {}
-			local state = info.status
-			-- Frontend enum is 0=online, 1=offline, 2=error (confirmed
-			-- from interfaceItemStatus in the shipped Multi-WAN bundle).
-			local value = state == "online" and 0
-				or (state == "offline" or state == "disabled"
-					or state == "disconnecting") and 1 or 2
+			local value
+			local t = member_tracking(cursor, m)
+			if t.enable_check then
+				local info = mwan_status.interfaces and mwan_status.interfaces[m.real] or {}
+				local state = info.status
+				value = state == "online" and 0
+					or (state == "offline" or state == "disabled"
+						or state == "disconnecting") and 1 or 2
+			else
+				-- Not tracked: online whenever the network interface is up.
+				local up = false
+				if conn then
+					local status = conn:call("network.interface." .. m.real, "status", {})
+					up = type(status) == "table" and status.up == true
+				end
+				value = up and 0 or 1
+			end
 			table.insert(interfaces, {
 				interface = m.frontend,
 				status_v4 = value,
 				status_v6 = value,
 			})
 		end
+		if conn then conn:close() end
 		return { interfaces = as_array(interfaces) }
 	end,
 }
