@@ -228,6 +228,24 @@ while true do
 			if msg.cmd == "subscribe" then
 				subscribed[msg.name] = true
 				push_topic(msg.name)
+				-- The vendored frontend's menu.d/internet.json only lists
+				-- cellular.modems_info/modems_status/networks_info in its
+				-- global_sockets, but its modem/SIM card also merges
+				-- cellular.sims_status, cellular.sims_info and
+				-- cellular.networks_status (modemInfoList in the internet
+				-- bundle). Those frames carry the strength bars, the SIM
+				-- label/ICCID and the data-usage counter. GL's own backend
+				-- pushes all of them; without this the card renders with an
+				-- empty Signal/Data Usage and "Unknown" label. Subscribe the
+				-- whole cellular group alongside any one of its topics.
+				if msg.name:sub(1, 9) == "cellular." then
+					for name in pairs(TOPICS) do
+						if name:sub(1, 9) == "cellular." and not subscribed[name] then
+							subscribed[name] = true
+							push_topic(name)
+						end
+					end
+				end
 			elseif msg.cmd == "unsubscribe" then
 				subscribed[msg.name] = nil
 			end
