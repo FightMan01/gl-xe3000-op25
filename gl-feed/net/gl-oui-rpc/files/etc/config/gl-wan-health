@@ -1,0 +1,23 @@
+# gl-wan-health: independent reachability watchdog for mwan3.
+#
+# mwan3track can get stuck reporting an interface "online" while it carries
+# no traffic (after an ifdown/ifup or an address change); mwan3 then never
+# fails over and the router looks connected but isn't. This service verifies
+# real reachability through the active egress and resets mwan3 when an uplink
+# that is up at netifd level has no internet.
+
+config health 'health'
+	option enabled '1'
+	# Seconds between reachability checks.
+	option check_period_sec '15'
+	# Consecutive failed checks before treating the internet as down and
+	# attempting recovery (~4 x 15s = 60s).
+	option fail_threshold '4'
+	# Recovery is rate-limited: at most reset_max mwan3 resets inside any
+	# reset_window_sec, then it backs off.
+	option reset_max '5'
+	option reset_window_sec '1800'
+	# After a reset, ignore failures for this long while mwan3 rebuilds.
+	option reset_grace_sec '90'
+	# No recovery attempts for this long after boot (slow cellular registration).
+	option startup_grace_sec '120'

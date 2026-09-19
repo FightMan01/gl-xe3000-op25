@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=8
+PKG_RELEASE:=9
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -35,6 +35,7 @@ endef
 
 define Package/gl-oui-rpc/conffiles
 /etc/config/gl-oui-rpc
+/etc/config/gl-wan-health
 /etc/config/gl-oui-acl
 /etc/config/gl_wgserver
 /etc/config/gl_wgclient
@@ -74,6 +75,8 @@ define Package/gl-oui-rpc/postinst
 	/etc/init.d/gl-oui-client-acct enable
 	/etc/init.d/gl-oui-client-acct start
 	/etc/init.d/gl-wgserver enable
+	/etc/init.d/gl-wan-health enable
+	/etc/init.d/gl-wan-health start
 	/etc/init.d/sqm enable
 	/etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable

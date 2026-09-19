@@ -36,6 +36,8 @@ uci -q batch <<-EOF
 	set mwan3.wan.interval='5'
 	set mwan3.wan.down='3'
 	set mwan3.wan.up='3'
+	set mwan3.wan.flush_conntrack='ifup'
+	add_list mwan3.wan.flush_conntrack='ifdown'
 
 	set mwan3.wwan_4=interface
 	set mwan3.wwan_4.enabled='1'
@@ -51,6 +53,8 @@ uci -q batch <<-EOF
 	set mwan3.wwan_4.interval='10'
 	set mwan3.wwan_4.down='3'
 	set mwan3.wwan_4.up='3'
+	set mwan3.wwan_4.flush_conntrack='ifup'
+	add_list mwan3.wwan_4.flush_conntrack='ifdown'
 
 	set mwan3.repeater=interface
 	set mwan3.repeater.enabled='1'
@@ -66,6 +70,8 @@ uci -q batch <<-EOF
 	set mwan3.repeater.interval='10'
 	set mwan3.repeater.down='3'
 	set mwan3.repeater.up='3'
+	set mwan3.repeater.flush_conntrack='ifup'
+	add_list mwan3.repeater.flush_conntrack='ifdown'
 
 	set mwan3.tethering=interface
 	set mwan3.tethering.enabled='1'
@@ -81,6 +87,8 @@ uci -q batch <<-EOF
 	set mwan3.tethering.interval='10'
 	set mwan3.tethering.down='3'
 	set mwan3.tethering.up='3'
+	set mwan3.tethering.flush_conntrack='ifup'
+	add_list mwan3.tethering.flush_conntrack='ifdown'
 
 	set mwan3.wan_m1_w1=member
 	set mwan3.wan_m1_w1.interface='wan'

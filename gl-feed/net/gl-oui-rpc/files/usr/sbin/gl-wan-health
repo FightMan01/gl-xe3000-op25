@@ -1,0 +1,241 @@
+#!/bin/sh
+#
+# gl-wan-health: independent reachability watchdog for the mwan3-managed WAN.
+#
+# Why this exists
+# ---------------
+# mwan3's own ping tracker (mwan3track) has long-standing state-machine bugs
+# where, after the interface is taken down and back up (or the address
+# changes, which is exactly what a cellular cell change does), it can wedge
+# reporting the interface as "online"/"connecting" while the link actually
+# carries no traffic. mwan3 then keeps the dead interface in the active
+# policy, so nothing fails over and the router looks connected (Internet LED
+# on) while passing nothing. It only recovers on `mwan3 restart`, and no
+# amount of pinging the tracker's targets brings it back. Upstream references
+# this reproduces against (mwan3 2.10-2.12):
+#   - openwrt/packages#18087  tracker stuck in "connecting"/"online" after ifdown/ifup
+#   - openwrt/packages#18841  interface locked in "online" while actually down
+#   - openwrt/packages#20924  down->up leaves mwan3 not detecting missing internet
+#   - openwrt/packages#26690  interface does not come back after an address change
+#
+# This port triggers those races constantly: the cellular watchdog redials
+# wwan (ifdown/ifup), the repeater re-associates, and the modem re-registers
+# on cell changes. So instead of trusting mwan3track's opinion, this service
+# independently verifies real reachability through the *active* egress and,
+# when an uplink is genuinely up but the internet is not, forces mwan3 to
+# rebuild its state.
+#
+# It deliberately does NOT restart mwan3 when every uplink is down at the
+# netifd level (that is a real outage the per-uplink watchdogs own); it only
+# acts when there is an uplink that should be working.
+#
+# It also publishes real connectivity to /var/run/gl-wan-online, which
+# gl-internet-led uses so the LED stops lying when mwan3 is stuck.
+
+. /lib/functions.sh
+
+TAG=gl-wan-health
+NET_LOCK=/var/run/gl-net-reconfig.lock
+STATE_FILE=/var/run/gl-wan-online
+CONFIG=gl-wan-health
+
+opt() {
+	local val
+	val="$(uci -q get $CONFIG.health.$1)"
+	echo "${val:-$2}"
+}
+
+CHECK_PERIOD=$(opt check_period_sec 15)
+FAIL_THRESHOLD=$(opt fail_threshold 4)
+RESET_MAX=$(opt reset_max 5)
+RESET_WINDOW=$(opt reset_window_sec 1800)
+RESET_GRACE=$(opt reset_grace_sec 90)
+# Don't fight mwan3 during initial bring-up (a cold cellular registration can
+# take a minute or two); no recovery is attempted for this long after start.
+STARTUP_GRACE=$(opt startup_grace_sec 120)
+
+fail_count=0
+reset_count=0
+reset_window_start=0
+grace_until=$(( $(date +%s) + STARTUP_GRACE ))
+
+log() {
+	logger -p "$1" -t "$TAG" "$2"
+}
+
+# The egress device the kernel would actually use for an arbitrary public
+# destination - i.e. the interface mwan3 currently has active.
+active_device() {
+	local dev
+	dev="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+	[ -n "$dev" ] || dev="$(ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+	echo "$dev"
+}
+
+# Real reachability through a specific egress. ICMP first, then HTTP(S): a
+# carrier can deprioritize/drop bare ICMP while HTTP keeps working, and the
+# reverse (something answers ICMP - e.g. a gateway sending destination-
+# unreachable - while no real internet exists) is also possible, so require
+# a positive ping *or* a real HTTP fetch.
+conn_ok() {
+	local dev="$1"
+	[ -n "$dev" ] || return 1
+	ping -I "$dev" -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && return 0
+	ping -I "$dev" -c 1 -W 2 9.9.9.9 >/dev/null 2>&1 && return 0
+	command -v curl >/dev/null 2>&1 || return 1
+	curl --interface "$dev" --connect-timeout 3 -m 5 -k -sS -o /dev/null \
+		http://www.msftconnecttest.com/connecttest.txt >/dev/null 2>&1 && return 0
+	curl --interface "$dev" --connect-timeout 3 -m 5 -k -sS -o /dev/null \
+		https://cp.cloudflare.com/generate_204 >/dev/null 2>&1 && return 0
+	return 1
+}
+
+mwan3_ifaces() {
+	uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^.]*\)=interface$/\1/p'
+}
+
+iface_up() {
+	[ "$(ubus call network.interface."$1" status 2>/dev/null |
+		jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
+}
+
+iface_dev() {
+	ubus call network.interface."$1" status 2>/dev/null |
+		jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+# mwan3 interface name whose netifd device is the one currently carrying the
+# default route.
+active_iface() {
+	local dev="$1" ifc
+	[ -n "$dev" ] || return 0
+	for ifc in $(mwan3_ifaces); do
+		[ "$(iface_dev "$ifc")" = "$dev" ] && { echo "$ifc"; return 0; }
+	done
+}
+
+# The cellular uplink is recovered by gl-cellular-boot-redial (its own
+# traffic/AT watchdog); taking it down from here would race that. Every
+# other uplink (Ethernet, repeater, tethering) is fair game.
+is_modem_iface() {
+	case "$1" in
+	wwan|wwan_4|modem*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Is there any mwan3 member whose underlying interface is actually up? If
+# not, this is a genuine multi-uplink outage and mwan3 is right to be down.
+any_uplink_up() {
+	local ifc
+	for ifc in $(mwan3_ifaces); do
+		[ -z "$(uci -q get mwan3."$ifc".track_ip)" ] && continue
+		iface_up "$ifc" && return 0
+	done
+	return 1
+}
+
+# mwan3 has an uplink it should be routing over but the active path is dead:
+# rebuild mwan3's state (the documented fix for the wedged tracker). If that
+# alone doesn't help across restarts, force a fresh DHCP/association on the
+# active non-modem uplink. Serialized on the shared reconfig lock so it can
+# never interleave with the cellular/repeater reconfig paths.
+recover() {
+	local now ifc
+	now="$(date +%s)"
+	if [ $((now - reset_window_start)) -gt "$RESET_WINDOW" ]; then
+		reset_window_start=$now
+		reset_count=0
+	fi
+	reset_count=$((reset_count + 1))
+	if [ "$reset_count" -gt "$RESET_MAX" ]; then
+		log daemon.err "$reset_count recoveries in ${RESET_WINDOW}s without restoring connectivity; backing off"
+		return 1
+	fi
+
+	ifc="$(active_iface "$active_dev")"
+
+	if [ "$reset_count" -ge 3 ] && [ -n "$ifc" ] && ! is_modem_iface "$ifc"; then
+		log daemon.warning \
+			"internet still down after mwan3 resets; refreshing uplink $ifc (ifdown/ifup) (attempt $reset_count/$RESET_MAX)"
+		(
+			tries=0
+			until flock -n 9; do
+				tries=$((tries + 1)); [ "$tries" -ge 30 ] && exit 1; sleep 1
+			done
+			ifdown "$ifc" >/dev/null 2>&1
+			sleep 2
+			ifup "$ifc" >/dev/null 2>&1
+			sleep 2
+			/etc/init.d/mwan3 restart >/dev/null 2>&1
+		) 9>"$NET_LOCK"
+	else
+		log daemon.warning \
+			"no internet via active egress despite an uplink being up; resetting mwan3 (attempt $reset_count/$RESET_MAX)"
+		(
+			tries=0
+			until flock -n 9; do
+				tries=$((tries + 1)); [ "$tries" -ge 30 ] && exit 1; sleep 1
+			done
+			/etc/init.d/mwan3 restart >/dev/null 2>&1
+		) 9>"$NET_LOCK"
+	fi
+	grace_until=$(( $(date +%s) + RESET_GRACE ))
+	return 0
+}
+
+mwan3_stale() {
+	local ifc
+	for ifc in $(mwan3_ifaces); do
+		local mwan state up
+		mwan="$(ubus call mwan3 status 2>/dev/null |
+			jsonfilter -e "@.interfaces[\"$ifc\"].status" 2>/dev/null)"
+		up=$(iface_up "$ifc" && echo 1 || echo 0)
+		# mwan3 claims online but the interface is down at netifd level.
+		[ "$mwan" = "online" ] && [ "$up" = "0" ] && return 0
+	done
+	return 1
+}
+
+echo 0 > "$STATE_FILE"
+fail_count=0
+
+while :; do
+	active_dev="$(active_device)"
+	if conn_ok "$active_dev"; then
+		fail_count=0
+		echo 1 > "$STATE_FILE"
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	# No connectivity via the active egress.
+	echo 0 > "$STATE_FILE"
+
+	now="$(date +%s)"
+	if [ "$now" -lt "$grace_until" ]; then
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+
+	fail_count=$((fail_count + 1))
+	if [ "$fail_count" -lt "$FAIL_THRESHOLD" ]; then
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+	fail_count=0
+
+	# Decide whether mwan3 is at fault. Two independent signals:
+	#  - an uplink is up at netifd level (so something should work), or
+	#  - mwan3 advertises an interface "online" that is actually down.
+	if any_uplink_up || mwan3_stale; then
+		log daemon.warning \
+			"internet down (egress=${active_dev:-none}, uplink up); recovering"
+		recover
+	else
+		log daemon.notice \
+			"internet down (egress=${active_dev:-none}) and no uplink is up; leaving recovery to the uplink watchdogs"
+	fi
+
+	sleep "$CHECK_PERIOD"
+done

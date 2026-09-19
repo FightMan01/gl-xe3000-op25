@@ -10,6 +10,14 @@ trap 'echo 0 > "$LED/brightness"; exit 0' INT TERM EXIT
 while true; do
 	if [ "$(uci -q get system.gl_led.led_enable)" = "0" ]; then
 		online=0
+	elif [ -r /var/run/gl-wan-online ]; then
+		# Prefer gl-wan-health's directly-measured reachability over
+		# mwan3's own opinion: mwan3track can wedge reporting an interface
+		# "online" while it passes no traffic (see gl-wan-health), and the
+		# whole point of this LED is to tell the user whether they actually
+		# have internet.
+		online="$(cat /var/run/gl-wan-online 2>/dev/null)"
+		[ "$online" = "1" ] || online=0
 	else
 		statuses="$(ubus call mwan3 status 2>/dev/null |
 			jsonfilter -e '@.interfaces.*.status' 2>/dev/null)"

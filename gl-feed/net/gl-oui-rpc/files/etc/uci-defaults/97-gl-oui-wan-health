@@ -1,0 +1,27 @@
+#!/bin/sh
+# Seed the gl-wan-health reachability watchdog. /etc/config/gl-wan-health is
+# a conffile, so an upgraded device keeps its old copy and may be missing
+# options added later - fill in only what is absent, never clobber a value
+# the user changed.
+
+[ -e /etc/config/gl-wan-health ] || {
+	echo "config health 'health'" > /etc/config/gl-wan-health
+}
+
+seed() {
+	[ -n "$(uci -q get gl-wan-health.health.$1)" ] && return 0
+	uci -q set gl-wan-health.health.$1="$2"
+}
+
+seed enabled '1'
+seed check_period_sec '15'
+seed fail_threshold '4'
+seed reset_max '5'
+seed reset_window_sec '1800'
+seed reset_grace_sec '90'
+seed startup_grace_sec '120'
+uci -q commit gl-wan-health
+
+/etc/init.d/gl-wan-health enable
+
+exit 0
