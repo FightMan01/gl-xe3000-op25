@@ -2,8 +2,18 @@
 
 CONNECT_TIMEOUT=20
 RETRY_INTERVAL=30
+# Backoff grows with each failed attempt up to this cap.
+RETRY_BACKOFF_MAX=300
+# After this many consecutive failed association attempts, stop retrying and
+# leave the STA disabled. A STA iface shares the radio with the AP on that
+# band, so a network that never associates otherwise holds/degrades that band
+# forever; the user can start again from the UI (Retry/Modify/Connect), which
+# clears the counter.
+MAX_RETRIES=$(uci -q get gl-repeater.settings.max_retries)
+[ -n "$MAX_RETRIES" ] || MAX_RETRIES=6
 FAIL_FLAG=/tmp/gl-repeater-fail-type
 RETRY_FLAG=/tmp/gl-repeater-retry-at
+RETRY_COUNT_FLAG=/tmp/gl-repeater-retry-count
 AUTOFIX_COUNT_FLAG=/tmp/gl-repeater-eap-autofix-count
 AUTOFIX_MAX=3
 NET_LOCK=/var/run/gl-net-reconfig.lock
@@ -106,7 +116,7 @@ while true; do
 	if [ "$up" = "true" ]; then
 		connecting_since=""
 		last_nak_line=""
-		rm -f "$FAIL_FLAG" "$AUTOFIX_COUNT_FLAG"
+		rm -f "$FAIL_FLAG" "$AUTOFIX_COUNT_FLAG" "$RETRY_COUNT_FLAG"
 		sleep 5
 		continue
 	fi
@@ -118,13 +128,30 @@ while true; do
 	elif try_eap_autofix; then
 		connecting_since=$now
 	elif [ $((now - connecting_since)) -ge "$CONNECT_TIMEOUT" ]; then
+		retries=$(cat "$RETRY_COUNT_FLAG" 2>/dev/null || echo 0)
+		retries=$((retries + 1))
+		echo "$retries" > "$RETRY_COUNT_FLAG"
 		echo "not-found" > "$FAIL_FLAG"
-		echo $((now + RETRY_INTERVAL)) > "$RETRY_FLAG"
 		uci set wireless."$sta_section".disabled=1
 		uci commit wireless
 		( flock -w 10 9; wifi reload >/dev/null 2>&1 ) 9>"$NET_LOCK"
 		connecting_since=""
 		last_nak_line=""
+		if [ "$retries" -ge "$MAX_RETRIES" ]; then
+			# Stop trying: a STA iface shares its radio with the AP on that
+			# band, so endlessly re-enabling a network that cannot associate
+			# keeps that band occupied/degraded. Leaving it disabled frees
+			# the band; the UI's Retry/Modify/Connect clears the counter.
+			rm -f "$RETRY_FLAG"
+			logger -p daemon.warning -t gl-repeater \
+				"could not associate after $retries attempts; giving up and releasing the radio (retry from the UI to start again)"
+		else
+			backoff=$((RETRY_INTERVAL * retries))
+			[ "$backoff" -gt "$RETRY_BACKOFF_MAX" ] && backoff=$RETRY_BACKOFF_MAX
+			echo $((now + backoff)) > "$RETRY_FLAG"
+			logger -p daemon.notice -t gl-repeater \
+				"association retry $retries/$MAX_RETRIES in ${backoff}s"
+		fi
 	fi
 
 	sleep 2

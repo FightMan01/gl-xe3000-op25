@@ -63,7 +63,7 @@ end
 -- disconnect/reconfigure.  A portal/repeater action must clear that pending
 -- retry or the watchdog can silently reconnect an aborted network later.
 local function clear_retry_state()
-	os.execute("rm -f /tmp/gl-repeater-retry-at /tmp/gl-repeater-fail-type /tmp/gl-repeater-eap-autofix-count")
+	os.execute("rm -f /tmp/gl-repeater-retry-at /tmp/gl-repeater-fail-type /tmp/gl-repeater-eap-autofix-count /tmp/gl-repeater-retry-count")
 end
 
 local function set_portal_gate(enabled)
@@ -334,6 +334,60 @@ local function apply_config(args)
 		cursor:set("wireless", iface, "mode", "sta")
 	end
 
+	-- Does this payload actually carry credentials? The saved-network list
+	-- only sends the SSID (plus remember), so without this check a plain
+	-- reconnect would fall through to the "no secret" branch and rewrite the
+	-- uplink as an OPEN network, dropping the EAP/personal config - which is
+	-- why a saved WPA2-Enterprise network had to be deleted and re-added.
+	local provided = args.identity ~= nil or args.eap_type ~= nil
+		or args.auth ~= nil or args.key ~= nil or args.password ~= nil
+		or args.encryption ~= nil
+
+	-- The saved record for this SSID (the section name, not the section
+	-- table - cursor:set() needs a name and used to be handed the table,
+	-- which made every save of an already-known network throw an "internal
+	-- error" *after* the open-config commit above had already gone through).
+	local saved_section
+	cursor:foreach("gl-repeater", "saved_ap", function(s)
+		if not saved_section and (s.ssid == args.ssid or s.iface == iface) then
+			saved_section = s[".name"]
+		end
+	end)
+
+	-- Recover the previously-used security so a bare reconnect keeps it.
+	local function prior_security()
+		local cfg, sec = nil, nil
+		if saved_section then cfg, sec = "gl-repeater", saved_section end
+		if cursor:get("wireless", iface, "ssid") == args.ssid then
+			-- Prefer the live uplink when it is already this SSID: on the
+			-- first save after this change the saved_ap has no stored
+			-- security yet, but the iface does.
+			cfg, sec = "wireless", iface
+		end
+		if not cfg then return {} end
+		return {
+			encryption = cursor:get(cfg, sec, "encryption"),
+			eap_type = cursor:get(cfg, sec, "eap_type"),
+			auth = cursor:get(cfg, sec, "auth"),
+			identity = cursor:get(cfg, sec, "identity"),
+			anonymous_identity = cursor:get(cfg, sec, "anonymous_identity"),
+			ca_cert = cursor:get(cfg, sec, "ca_cert"),
+			key = cursor:get(cfg, sec, "key"),
+			password = cursor:get(cfg, sec, "password"),
+		}
+	end
+	if not provided then
+		local prior = prior_security()
+		for _, field in ipairs({ "encryption", "eap_type", "auth", "identity",
+			"anonymous_identity", "ca_cert", "key", "password" }) do
+			if prior[field] ~= nil and prior[field] ~= "" then
+				args[field] = prior[field]
+			end
+		end
+		-- Still nothing: it genuinely is an open network.
+		if args.encryption == nil then args.encryption = "none" end
+	end
+
 	cursor:set("wireless", iface, "device", radio)
 	cursor:set("wireless", iface, "ssid", args.ssid)
 	cursor:set("wireless", iface, "disabled", "0")
@@ -345,13 +399,20 @@ local function apply_config(args)
 
 	local secret = args.key or args.password
 	local enterprise = args.identity ~= nil or args.eap_type ~= nil
+		or (args.auth ~= nil and args.auth ~= "")
 	if enterprise then
 		cursor:set("wireless", iface, "encryption", "wpa2")
 		local eap_type = (args.eap_type or "peap"):lower()
+		-- hostapd/wpa_supplicant want the inner ("phase2") method here, e.g.
+		-- MSCHAPV2. "EAP-MSCHAPV2" is not a valid auth value and silently
+		-- fails the handshake - both PEAP and TTLS tunnel MSCHAPV2 by
+		-- default, so accept any explicit value except that one.
+		local auth = args.auth
+		if not auth or auth == "" or auth == "EAP-MSCHAPV2" then
+			auth = "MSCHAPV2"
+		end
 		cursor:set("wireless", iface, "eap_type", eap_type)
-		-- PEAP/FAST use a tunneled EAP method; plain MSCHAPV2 is TTLS-only.
-		cursor:set("wireless", iface, "auth",
-			args.auth or (eap_type == "ttls" and "MSCHAPV2" or "EAP-MSCHAPV2"))
+		cursor:set("wireless", iface, "auth", auth)
 		cursor:set("wireless", iface, "identity", args.identity or "")
 		cursor:set("wireless", iface, "password", secret or "")
 		if args.anonymous_identity then
@@ -371,6 +432,8 @@ local function apply_config(args)
 		cursor:set("wireless", iface, "encryption", "none")
 		cursor:delete("wireless", iface, "key")
 		cursor:delete("wireless", iface, "eap_type")
+		cursor:delete("wireless", iface, "identity")
+		cursor:delete("wireless", iface, "password")
 	end
 	cursor:commit("wireless")
 
@@ -397,10 +460,6 @@ local function apply_config(args)
 	cursor:set("gl-repeater", "settings", "settings")
 	cursor:set("gl-repeater", "settings", "auto_portal", auto_portal and "1" or "0")
 
-	local saved_section
-	cursor:foreach("gl-repeater", "saved_ap", function(s)
-		if s.ssid == args.ssid or s.iface == iface then saved_section = s end
-	end)
 	if not saved_section then
 		saved_section = cursor:add("gl-repeater", "saved_ap")
 	end
@@ -410,6 +469,19 @@ local function apply_config(args)
 	cursor:set("gl-repeater", saved_section, "auto_portal", auto_portal and "1" or "0")
 	cursor:set("gl-repeater", saved_section, "protocol", args.protocol or
 		(cursor:get("network", "repeater", "proto") or "dhcp"))
+
+	-- Persist the security per saved network (the uplink iface is a single
+	-- shared section that the next network overwrites, so the saved record
+	-- cannot just point at it).
+	for _, field in ipairs({ "encryption", "eap_type", "auth", "identity",
+		"anonymous_identity", "ca_cert", "password", "key" }) do
+		local value = cursor:get("wireless", iface, field)
+		if value and value ~= "" then
+			cursor:set("gl-repeater", saved_section, field, value)
+		else
+			cursor:delete("gl-repeater", saved_section, field)
+		end
+	end
 
 	-- Saved portal credentials are optional.  Keep existing credentials when a
 	-- normal WiFi join does not carry portal fields, but accept both spellings
@@ -485,6 +557,9 @@ return {
 			ssid = cursor:get("wireless", iface, "ssid"),
 			encryption = cursor:get("wireless", iface, "encryption"),
 			eap_type = cursor:get("wireless", iface, "eap_type"),
+			auth = cursor:get("wireless", iface, "auth"),
+			anonymous_identity = cursor:get("wireless", iface, "anonymous_identity"),
+			ca_cert = cursor:get("wireless", iface, "ca_cert"),
 			identity = cursor:get("wireless", iface, "identity"),
 			key = cursor:get("wireless", iface, "key")
 				or cursor:get("wireless", iface, "password"),
@@ -614,15 +689,24 @@ return {
 		local cursor = uci.cursor()
 		local saved = {}
 		cursor:foreach("gl-repeater", "saved_ap", function(s)
-			local key, identity, password
-			if s.iface then
-				key = cursor:get("wireless", s.iface, "key")
-				identity = cursor:get("wireless", s.iface, "identity")
-				password = cursor:get("wireless", s.iface, "password")
+			-- Per-network security written by apply_config. Fall back to the
+			-- shared uplink iface for records created before that existed.
+			local function field(name)
+				local value = cursor:get("gl-repeater", s[".name"], name)
+				if (value == nil or value == "") and s.iface then
+					value = cursor:get("wireless", s.iface, name)
+				end
+				return value
 			end
+			local password = field("password")
 			table.insert(saved, {
 				id = s[".name"], ssid = s.ssid, radio = s.radio,
-				key = key or password, identity = identity, password = password,
+				key = field("key") or password,
+				identity = field("identity"), password = password,
+				encryption = field("encryption"),
+				eap_type = field("eap_type"), auth = field("auth"),
+				anonymous_identity = field("anonymous_identity"),
+				ca_cert = field("ca_cert"),
 				manual = s.manual == "1", auto_portal = s.auto_portal == "1",
 				disguise = s.disguise == "1",
 				protocol = s.protocol or "dhcp",
