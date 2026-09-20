@@ -82,11 +82,54 @@ proto_qcm_setup() {
 		   proto_block_restart "$interface"; return 1 ;;
 		3) proto_notify_error "$interface" NO_SIM
 		   proto_block_restart "$interface"; return 1 ;;
-		*) proto_notify_error "$interface" AT_UNAVAILABLE
-		   sleep 10; return 1 ;;
-	esac
+	*) proto_notify_error "$interface" AT_UNAVAILABLE
+	   sleep 10; return 1 ;;
+esac
 
-	local pdp="-4 -6"
+# Stock deactivates a modem-side default PDP context before starting its
+# QMI call. The modem can auto-activate CID 1 during boot even though QMI
+# reports no call; leaving that context up makes StartNetwork fail with
+# QMUX error 0x0e. Keep IMS (CID 2) untouched.
+local cgact
+cgact=$(ubus -t 5 call cellular.at command \
+	'{"cmd":"AT+CGACT?","timeout":5}' 2>/dev/null |
+	jsonfilter -e '@.response' 2>/dev/null)
+case "$cgact" in
+	*'+CGACT: 1,1'*)
+		logger -t gl-cellular "deactivating modem default PDP context CID 1 before QMI dial"
+		local cgact_off
+		cgact_off=$(ubus -t 12 call cellular.at command \
+			'{"cmd":"AT+CGACT=0,1","timeout":10}' 2>/dev/null |
+			jsonfilter -e '@.response' 2>/dev/null)
+		case "$cgact_off" in
+			*OK*) sleep 1 ;;
+			*) logger -p daemon.err -t gl-cellular "could not deactivate modem PDP context CID 1"; proto_notify_error "$interface" MODEM_PDP; proto_block_restart "$interface"; return 1 ;;
+		esac
+		;;
+esac
+
+# QMI over PCIe requires the modem's PCIe personality, not its MBIM
+# personality. QCFG is non-volatile; repair a stale setting left by an older
+# configuration before the connection manager negotiates WDA/QMAP.
+local pcie_mbim
+pcie_mbim=$(ubus -t 5 call cellular.at command \
+	'{"cmd":"AT+QCFG=\\"pcie_mbim\\"","timeout":5}' 2>/dev/null |
+	jsonfilter -e '@.response' 2>/dev/null)
+case "$pcie_mbim" in
+	*'+QCFG: "pcie_mbim",1'*)
+		logger -t gl-cellular "correcting modem pcie_mbim=1 to QMI mode"
+		local pcie_set
+		pcie_set=$(ubus -t 5 call cellular.at command \
+			'{"cmd":"AT+QCFG=\\"pcie_mbim\\",0","timeout":5}' 2>/dev/null |
+			jsonfilter -e '@.response' 2>/dev/null)
+		case "$pcie_set" in
+			*OK*) logger -t gl-cellular "modem pcie_mbim set to 0; reboot required to apply PCIe personality" ;;
+			*) logger -p daemon.err -t gl-cellular "could not set modem pcie_mbim=0"; proto_notify_error "$interface" MODEM_CONFIG; proto_block_restart "$interface"; return 1 ;;
+		esac
+		;;
+esac
+
+local pdp="-4 -6"
 	[ ! -e /proc/sys/net/ipv6 ] && ipv6=0
 	pdptype=$(echo "$pdptype" | awk '{print tolower($0)}')
 	[ "$ipv6" = 0 ] && pdptype="ipv4"

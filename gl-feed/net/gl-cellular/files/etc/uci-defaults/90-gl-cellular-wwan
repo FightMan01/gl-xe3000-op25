@@ -31,7 +31,9 @@ uci -q batch <<-EOT
 	set network.wwan.device='/dev/mhi_QMI0'
 	set network.wwan.ifname='rmnet_mhi0'
 	set network.wwan.apn='internet'
-	set network.wwan.pdptype='ipv4v6'
+	# Telekom's internet APN provides the working IPv4 bearer used by
+	# udhcpc on the RM520N-GL. Users can still select IPv4 & IPv6 in the UI.
+	set network.wwan.pdptype='ipv4'
 	set network.wwan.auto='1'
 	set network.wwan.metric='20'
 EOT
