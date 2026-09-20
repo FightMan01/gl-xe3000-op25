@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=12
+PKG_RELEASE:=13
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -69,6 +69,14 @@ endef
 
 define Package/gl-oui-rpc/postinst
 #!/bin/sh
+[ -n "$$IPKG_INSTROOT" ] && {
+	mkdir -p "$$IPKG_INSTROOT/etc/modules.d"
+	printf 'mt7915e wed_enable=Y\n' > "$$IPKG_INSTROOT/etc/modules.d/mt7915e"
+}
+[ -z "$$IPKG_INSTROOT" ] && {
+	mkdir -p /etc/modules.d
+	printf 'mt7915e wed_enable=Y\n' > /etc/modules.d/mt7915e
+}
 [ -n "$$IPKG_INSTROOT" ] || {
 	/etc/init.d/gl-ngx-session enable
 	/etc/init.d/gl-internet-led enable
