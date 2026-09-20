@@ -577,6 +577,137 @@ return {
 		}
 	end,
 
+	-- --- RPCs the vendored frontend calls but this port never exposed ---
+	--
+	-- These showed up as live JSON-RPC errors in the browser console
+	-- ("no such method: get_cell_info" / "get_band_config") on the
+	-- Cellular > Details & Configurations page. The frontend asks for them
+	-- by their own names regardless of the fact that the same data is also
+	-- reachable through get_signals/get_sim_config, so they have to exist.
+
+	-- Cell Information panel (Details page). Same serving-cell record
+	-- get_serving_cell already produces, which is exactly the shape the
+	-- panel's cellInfoKeys render.
+	get_cell_info = function(args)
+		return get_serving_cell() or {}
+	end,
+
+	get_band_config = function(args)
+		local cursor = uci.cursor()
+		local filter_mode = normalize_filter_mode(
+			cursor:get("gl-cellular", "state", "band_mask_mode"))
+		return {
+			band_enable = cursor:get("gl-cellular", "state", "band_mask_enabled") == "1",
+			band_filter_mode = filter_mode == "only" and 0 or 1,
+			band_mask_mode = filter_mode or "block",
+			band_list = {
+				LTE = as_array(cursor:get("gl-cellular", "state", "lte_bands") or {}),
+				["NR-NSA"] = as_array(cursor:get("gl-cellular", "state", "nr_bands") or {}),
+				["NR-SA"] = as_array(cursor:get("gl-cellular", "state", "sa_bands") or {}),
+			},
+		}
+	end,
+
+	-- Shares get_sim_config/set_sim_config's storage and apply path (same
+	-- UCI keys, same AT+QNWPREFCFG calls) so the Advanced band drawer and
+	-- the SIM settings page can never disagree.
+	set_band_config = function(args)
+		local data = args.data or args
+		local cursor = uci.cursor()
+		local band_list = type(data.band_list) == "table" and data.band_list or {}
+		local lte_bands = data.lte_bands or band_list.LTE
+		local nr_bands = data.nr_bands or band_list["NR-NSA"]
+		local sa_bands = data.sa_bands or band_list["NR-SA"]
+		local filter_mode = normalize_filter_mode(data.band_filter_mode)
+			or normalize_filter_mode(data.band_mask_mode)
+		local mask_enabled = data.band_enable
+		if mask_enabled == nil then mask_enabled = data.band_mask_enabled end
+
+		if mask_enabled ~= nil then
+			cursor:set("gl-cellular", "state", "band_mask_enabled", mask_enabled and "1" or "0")
+		end
+		if filter_mode ~= nil then
+			cursor:set("gl-cellular", "state", "band_mask_mode", filter_mode)
+		end
+		for _, item in ipairs({
+			{ "lte_bands", lte_bands }, { "nr_bands", nr_bands }, { "sa_bands", sa_bands },
+		}) do
+			if type(item[2]) == "table" then
+				if #item[2] > 0 then
+					cursor:set("gl-cellular", "state", item[1], item[2])
+				else
+					cursor:delete("gl-cellular", "state", item[1])
+				end
+			end
+		end
+		cursor:commit("gl-cellular")
+
+		if mask_enabled == nil then
+			mask_enabled = cursor:get("gl-cellular", "state", "band_mask_enabled") == "1"
+		end
+		if mask_enabled then
+			lte_bands = type(lte_bands) == "table" and lte_bands
+				or cursor:get("gl-cellular", "state", "lte_bands") or {}
+			nr_bands = type(nr_bands) == "table" and nr_bands
+				or cursor:get("gl-cellular", "state", "nr_bands") or {}
+			sa_bands = type(sa_bands) == "table" and sa_bands
+				or cursor:get("gl-cellular", "state", "sa_bands") or {}
+			local effective_mode = filter_mode
+				or cursor:get("gl-cellular", "state", "band_mask_mode") or "block"
+			local block_mode = effective_mode ~= "only"
+			local apply = {
+				{ "lte_band", block_mode and allowed_after_blocking(ALL_LTE_BANDS, lte_bands) or lte_bands },
+				{ "nsa_nr5g_band", block_mode and allowed_after_blocking(ALL_NR_BANDS, nr_bands) or nr_bands },
+				{ "nr5g_band", block_mode and allowed_after_blocking(ALL_NR_BANDS, sa_bands) or sa_bands },
+			}
+			for _, item in ipairs(apply) do
+				if item[2] and #item[2] > 0 then
+					local list = build_band_list(item[2])
+					if not list or not apply_band_mask(item[1], list) then
+						return { code = 1, message = "modem rejected band list" }
+					end
+				end
+			end
+		else
+			for _, kind in ipairs({ "lte_band", "nsa_nr5g_band", "nr5g_band" }) do
+				apply_band_mask(kind, "1:2:3:4:5:7:8:12:13:14:17:18:19:20:25:26:28:29:30:32:34:38:39:40:41:42:43:46:48:66:71")
+			end
+		end
+		return {}
+	end,
+
+	set_sim_name = function(args)
+		local data = args.data or args
+		local name = data.name
+		if name == nil then name = data.sim_name end
+		if name then
+			local cursor = uci.cursor()
+			cursor:set("gl-cellular", "state", "sim_name", tostring(name))
+			cursor:commit("gl-cellular")
+		end
+		return {}
+	end,
+
+	-- The About page reads this for the "cellular module" firmware row; the
+	-- port has no separate COS image, so report the Quectel firmware the
+	-- modem itself reports.
+	get_cos_version = function(args)
+		local resp = at.command("AT+CGMR", 3)
+		local version = resp and resp:match("RM520N[A-Z0-9]+") or "unknown"
+		return { version = version }
+	end,
+
+	reboot_modem = function(args)
+		os.execute("/usr/sbin/gl-cellular-modem-reset >/dev/null 2>&1 &")
+		return {}
+	end,
+
+	-- No USB tethering source is configured by this port; report it off so
+	-- the Internet page's tethering card settles instead of retrying.
+	tethering = function(args)
+		return { enabled = false, status = 0, proto = "none" }
+	end,
+
 	-- args.data={apn, ip_type, network_type, roaming_enabled, auth,
 	--   username, password, ttl, ttl_ipv6, mtu, band_mask_enabled,
 	--   band_mask_mode, lte_bands, nr_bands}
