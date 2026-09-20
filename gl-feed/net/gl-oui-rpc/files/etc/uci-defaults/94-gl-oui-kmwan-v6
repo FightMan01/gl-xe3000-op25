@@ -1,0 +1,49 @@
+#!/bin/sh
+# IPv6 for the cellular uplink under mwan3. The upstream sample config sends
+# all IPv6 through policy `balanced` (members wan6/wanb6, both disabled), so
+# mwan3 marked every IPv6 packet - router-originated and forwarded LAN
+# traffic alike - as `unreachable`. Track the qcm proto's wwan_6 child and
+# make it the IPv6 default. Idempotent; runs on upgrades of configured
+# routers as well as fresh installs.
+
+[ "$(uci -q get mwan3.wwan_6)" = "interface" ] || {
+	uci -q batch <<-EOT
+		set mwan3.wwan_6=interface
+		set mwan3.wwan_6.enabled='1'
+		set mwan3.wwan_6.family='ipv6'
+		set mwan3.wwan_6.track_method='ping'
+		set mwan3.wwan_6.track_ip='2001:4860:4860::8888'
+		add_list mwan3.wwan_6.track_ip='2606:4700:4700::1111'
+		add_list mwan3.wwan_6.track_ip='2620:fe::fe'
+		set mwan3.wwan_6.reliability='1'
+		set mwan3.wwan_6.count='2'
+		set mwan3.wwan_6.timeout='4'
+		set mwan3.wwan_6.interval='10'
+		set mwan3.wwan_6.down='3'
+		set mwan3.wwan_6.up='3'
+		set mwan3.wwan_6.flush_conntrack='ifup'
+		add_list mwan3.wwan_6.flush_conntrack='ifdown'
+	EOT
+}
+
+[ "$(uci -q get mwan3.wwan6_m2_w1)" = "member" ] || {
+	uci -q batch <<-EOT
+		set mwan3.wwan6_m2_w1=member
+		set mwan3.wwan6_m2_w1.interface='wwan_6'
+		set mwan3.wwan6_m2_w1.metric='2'
+		set mwan3.wwan6_m2_w1.weight='1'
+	EOT
+}
+
+[ "$(uci -q get mwan3.gl_failover_v6)" = "policy" ] || {
+	uci -q batch <<-EOT
+		set mwan3.gl_failover_v6=policy
+		add_list mwan3.gl_failover_v6.use_member='wwan6_m2_w1'
+	EOT
+}
+
+[ "$(uci -q get mwan3.default_rule_v6)" = "rule" ] &&
+	uci -q set mwan3.default_rule_v6.use_policy='gl_failover_v6'
+
+uci -q commit mwan3
+exit 0

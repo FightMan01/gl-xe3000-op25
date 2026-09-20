@@ -47,7 +47,7 @@ local function as_array(t)
 end
 
 -- Real mwan3/network interface name -> frontend-facing identifier.
--- umbim creates `wwan_4` as the actual IPv4 interface holding the address
+-- the qcm proto creates `wwan_4` as the actual IPv4 interface holding the address
 -- and routes; the parent `wwan` protocol interface has no L3 addresses.
 -- mwan3 must therefore track wwan_4 (tracking the parent produces empty
 -- policy tables and rejects marked DNS/HTTP traffic). It is still exposed

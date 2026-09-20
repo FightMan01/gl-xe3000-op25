@@ -1,0 +1,116 @@
+#!/bin/sh
+# Make sure the SIM is unlocked before the modem is dialled.
+#
+# The stock firmware never starts its connection manager until the SIM
+# reports READY (cellular_manager waits for the CPIN READY URC and unlocks the
+# PIN itself first). Starting quectel-CM while the SIM is still PIN-locked
+# races the modem's SIM initialisation: the QMAP data-format request is
+# refused (QMUX error 0x46, INVALID_OPERATION) and every data call after it
+# fails too, until the modem is power-cycled with the SIM unlocked first.
+#
+# The saved PIN is only ever sent when
+#   - the SIM really is in "SIM PIN" state,
+#   - it was saved for this very SIM (ICCID), so a swapped card can't burn
+#     attempts on the wrong PIN,
+#   - more than one attempt is left (AT+QPINC?), and
+#   - an earlier attempt with it did not already fail.
+#
+# Exit status: 0 SIM ready
+#              1 PIN required but none saved / saved for another SIM
+#              2 saved PIN refused or too few attempts left
+#              3 SIM absent or PUK-locked
+#              4 modem AT interface unavailable
+
+TAG=gl-cellular-sim
+. /usr/share/libubox/jshn.sh
+
+at() {
+	json_init
+	json_add_string cmd "$1"
+	json_add_int timeout "${2:-5}"
+	ubus -t $(( ${2:-5} + 3 )) call cellular.at command "$(json_dump)" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null
+}
+
+cpin_state() {
+	local r
+	r=$(at 'AT+CPIN?' 4)
+	case "$r" in
+		*"+CPIN: READY"*) echo READY ;;
+		*"+CPIN: SIM PIN"*) echo PIN ;;
+		*"+CPIN: SIM PUK"*) echo PUK ;;
+		"") echo NOAT ;;
+		*) echo OTHER ;;
+	esac
+}
+
+# The AT daemon starts after network; wait for it and for the modem.
+state=NOAT
+i=0
+while [ "$i" -lt 60 ]; do
+	state=$(cpin_state)
+	[ "$state" != NOAT ] && [ "$state" != OTHER ] && break
+	i=$((i + 1))
+	sleep 2
+done
+
+case "$state" in
+	READY) exit 0 ;;
+	PUK) logger -p daemon.err -t "$TAG" "SIM is PUK-locked"; exit 3 ;;
+	NOAT) logger -p daemon.err -t "$TAG" "modem AT interface unavailable"; exit 4 ;;
+	OTHER) logger -p daemon.err -t "$TAG" "SIM absent or not ready"; exit 3 ;;
+esac
+
+# --- SIM PIN state ---
+pin=$(uci -q get network.wwan.pincode)
+saved_iccid=$(uci -q get network.wwan.pin_iccid)
+cur_iccid=$(at 'AT+QCCID' 4 | sed -n 's/.*+QCCID:[[:space:]]*\([0-9A-Za-z]*\).*/\1/p' | head -n1)
+
+if [ -z "$pin" ]; then
+	logger -t "$TAG" "SIM is PIN-locked and no PIN is saved; waiting for it to be entered in the UI"
+	exit 1
+fi
+if [ -n "$saved_iccid" ] && [ -n "$cur_iccid" ] && [ "$saved_iccid" != "$cur_iccid" ]; then
+	logger -p daemon.warn -t "$TAG" "saved PIN belongs to a different SIM; not using it"
+	exit 1
+fi
+if [ "$(uci -q get network.wwan.pin_failed)" = "1" ]; then
+	logger -p daemon.warn -t "$TAG" "saved PIN was rejected before; not retrying (enter the PIN in the UI)"
+	exit 2
+fi
+
+left=$(at 'AT+QPINC?' 4 | sed -n 's/.*+QPINC: "SC",\([0-9]*\).*/\1/p' | head -n1)
+if [ -n "$left" ] && [ "$left" -le 1 ]; then
+	logger -p daemon.err -t "$TAG" "only $left PIN attempt(s) left; refusing to auto-enter the saved PIN"
+	exit 2
+fi
+
+logger -t "$TAG" "SIM is PIN-locked; entering the saved PIN"
+resp=$(at "AT+CPIN=\"$pin\"" 10)
+case "$resp" in
+	*OK*) ;;
+	*)
+		logger -p daemon.err -t "$TAG" "saved PIN was rejected by the SIM"
+		uci -q set network.wwan.pin_failed=1
+		uci -q commit network
+		exit 2
+		;;
+esac
+
+i=0
+while [ "$i" -lt 20 ]; do
+	[ "$(cpin_state)" = READY ] && break
+	i=$((i + 1))
+	sleep 1
+done
+[ "$(cpin_state)" = READY ] || { logger -p daemon.err -t "$TAG" "SIM did not become ready after PIN entry"; exit 2; }
+
+# Let the modem finish initialising the SIM before anyone talks QMI to it.
+sleep 4
+
+if [ -z "$saved_iccid" ] && [ -n "$cur_iccid" ]; then
+	uci -q set network.wwan.pin_iccid="$cur_iccid"
+	uci -q commit network
+fi
+logger -t "$TAG" "SIM unlocked"
+exit 0

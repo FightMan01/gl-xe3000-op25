@@ -51,7 +51,7 @@ AT_DEAD_TICKS=$(opt at_dead_ticks 3)
 # back. A modem can wedge its data plane (attached, an address on the
 # session, every ping/HTTP probe at 0% while AT+CGATT still reads 1) with
 # the AT port fully alive - so the silent-AT path above never fires, and
-# neither do_redial (host-side MBIM session only) nor do_cfun_cycle (radio
+# neither do_redial (host-side QMI session only) nor do_cfun_cycle (radio
 # re-attach) reaches the stuck firmware. Verified on-device: only the
 # PCIe/MHI re-init in gl-cellular-modem-reset brings traffic back.
 CFUN_BEFORE_RESET=$(opt cfun_before_reset 1)
@@ -106,8 +106,15 @@ enabled() {
 	[ "$(uci -q get network.wwan.disabled)" != "1" ] || return 1
 	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ] || return 1
 
+	# Stand down while the SIM is PIN/PUK locked: nothing can be dialled and
+	# a radio/PCIe reset would only re-lock it. The PIN is entered by
+	# gl-cellular-sim-unlock or through the UI.
+	case "$(at_query 'AT+CPIN?')" in
+		*"SIM PIN"*|*"SIM PUK"*) return 1 ;;
+	esac
+
 	# Stand down while the operator-scan RPC owns the modem: AT+COPS=??
-	# deliberately drops the MBIM session and can run for minutes. The
+	# deliberately drops the data session and can run for minutes. The
 	# timestamp guards against a scan whose browser request was aborted
 	# before it could clear the flag - after 15 minutes it is treated as
 	# stale so a wedged flag can never permanently disable recovery.
@@ -139,7 +146,7 @@ reset_state() {
 }
 
 # Sends an AT command through gl-cellular-atd's serialized port access
-# (the AT port is a separate USB composition from the PCIe/MHI MBIM data
+# (the AT port is a separate USB composition from the PCIe/MHI QMI data
 # path, so this never touches the live session). Echoes the raw response,
 # or nothing if the daemon/port is unavailable - callers must treat an
 # empty result as "unknown", not as a failure.
@@ -254,7 +261,7 @@ traffic_advancing() {
 	[ -n "$now" ] || return 1
 	if [ "$dev" != "$last_device" ] || [ -z "$last_rx" ] || [ "$now" -lt "$last_rx" ]; then
 		# Device name changed, first sample, or the counter went backwards
-		# (an ifdown/ifup - ours or netifd/mbim's own, e.g. after a real
+		# (an ifdown/ifup - ours or netifd/qcm's own, e.g. after a real
 		# network-side reattach - resets rx_bytes to ~0 while last_rx still
 		# holds the old session's larger value). None of these mean the
 		# link is stalled; they mean there's no valid baseline yet for this
@@ -277,7 +284,7 @@ traffic_advancing() {
 # Fallback liveness probe for when rx_bytes is flat. This is the ONLY real
 # reachability check in this script - everything else (rx_bytes, the
 # CGPADDR-vs-interface-IP comparison) is a proxy that can be wrong. Uses
-# the bearer's own DNS server (from the MBIM config response, already
+# the bearer's own DNS server (learned over DHCP from the modem, already
 # installed on wwan_4) ahead of a public fallback, so this isn't just
 # re-pinging the exact two IPs mwan3 already probes on the same interface
 # every 10s.
@@ -347,7 +354,7 @@ log_diag() {
 # profile in place, which the new SIM may not need or support.
 #
 # GL's own daemon gates its single dial-initiation choke point on this
-# check. This script has no equivalent choke point - netifd's mbim proto
+# check. This script has no equivalent choke point - netifd's qcm proto
 # dials independently at boot, outside this script's control - so this
 # runs at script startup (catches a swap made while powered off, correcting
 # it within this script's own ~25s startup delay) and again right before
@@ -364,7 +371,7 @@ check_sim_swap() {
 		logger -p daemon.notice -t "$TAG" \
 			"SIM ICCID changed ($last_iccid -> $iccid); re-deriving PDP IP type before dial"
 		# IPv4v6 is the safe default for an unknown/new SIM - netifd's
-		# mbim proto happily drops whichever family the network doesn't
+		# qcm proto happily drops whichever family the network doesn't
 		# grant, so this never blocks a connection; it only stops a
 		# previous SIM's possibly narrower type (e.g. an IPv4-only MVNO)
 		# from silently carrying over onto a new SIM that supports dual-stack.
@@ -384,7 +391,7 @@ check_sim_swap() {
 # database to drive this from, so the faithful adaptation of GL's own
 # default is: converge the NV item to 1500 if it's ever found to be
 # anything else - e.g. a leftover value from a prior stock-firmware flash
-# on the same hardware, which nothing in a netifd/mbim-only stack (which
+# on the same hardware, which nothing in a netifd/qcm-only stack (which
 # only ever sets the *interface* MTU, never the baseband's own NV value)
 # would notice or correct on its own.
 #
@@ -422,7 +429,7 @@ sync_mtu() {
 	at_query 'AT+QEFSSYNC=1' >/dev/null
 }
 
-# Tears down and rebuilds the MBIM session. Rate-limited: at most
+# Tears down and rebuilds the QMI data session. Rate-limited: at most
 # TRIGGER_MAX attempts inside any TRIGGER_WINDOW, then a BLOCK_SEC
 # cooldown - mirrors GL's own stock cellular manager, which guards its
 # equivalent restore path the same way rather than redialing on every
@@ -472,10 +479,9 @@ do_redial() {
 		done
 		ifdown wwan >/dev/null 2>&1
 		# A fixed sleep here raced ifup against a modem that hadn't
-		# finished tearing down - the field logs' "ERROR: mbim message
-		# timeout" / "Failed to read modem caps" right after a redial is
-		# consistent with ifup firing before the modem was ready to answer
-		# even a basic capabilities query. Poll attach state instead (same
+		# finished tearing down - quectel-CM failing its first QMI requests right after
+		# a redial is consistent with ifup firing before the modem was ready
+		# to answer even a basic query. Poll attach state instead (same
 		# bounded pattern gl-cellular-wwan-reconnect already uses for its
 		# own settings-driven reconnects), up to 20s, and proceed as soon
 		# as it responds rather than guessing a fixed delay either way.
@@ -493,7 +499,7 @@ do_redial() {
 		return 1
 	fi
 
-	# mbim.sh's own caps/pin/registration/attach/connect handshake can
+	# quectel-CM's own SIM/pin/registration/attach/data-call sequence can
 	# easily take longer than one poll tick, especially on 5G. Give it a
 	# grace window before judging the redial a failure - but redial_pending
 	# (checked at the top of the main loop) lets that judgment happen as
@@ -516,8 +522,8 @@ cfun_is_full() {
 
 # Hard-reset a hung modem through its PCIe/MHI function. This is the only
 # recovery that works once the modem firmware has stopped answering AT:
-# AT+CFUN can't be delivered and ifdown/ifup only touches the host-side MBIM
-# session. gl-cellular-modem-reset re-runs the modem's BHI boot protocol,
+# AT+CFUN can't be delivered and ifdown/ifup only touches the host-side QMI
+# session. gl-cellular-modem-reset re-probes the modem via pcie_mhi and re-runs its boot protocol,
 # which resets the firmware; verified to bring both AT and the data session
 # back. Rate-limited, and the last resort (router reboot) is opt-in.
 modem_hard_reset() {
@@ -557,7 +563,7 @@ modem_hard_reset() {
 }
 
 # Last resort: power-cycle the radio itself. This is the one lever that
-# reaches past MBIM to a wedged PCIe/MHI link or stuck baseband state
+# reaches past the host-side session to a wedged PCIe/MHI link or stuck baseband state
 # that a plain ifdown/ifup can't clear - but it costs 15-30s of
 # guaranteed downtime, so it's gated far more conservatively than a
 # redial and must never become the steady state.
@@ -698,8 +704,7 @@ while :; do
 			continue
 		else
 			# GRACE_SEC fully elapsed and the interface never came up at
-			# all - e.g. mbim.sh stuck on "Reading capabilities"/"Failed
-			# to read modem caps", a harder wedge than slow registration.
+			# all - e.g. quectel-CM stuck failing its QMI requests, a harder wedge than slow registration.
 			# This is already conclusive: waiting out a fresh
 			# OFFLINE_THRESHOLD countdown as if this were an ordinary
 			# flat-traffic tick would add minutes of total downtime before
@@ -798,7 +803,7 @@ while :; do
 			# ping and, on a mismatch, skipped the ping entirely - treating
 			# a bare address mismatch as proof of a stalled session. That
 			# used a hardcoded CID 1, which field logs showed answering a
-			# PDP context unrelated to the one MBIM's own session actually
+			# PDP context unrelated to the one the QMI session actually
 			# data-connects on: the exact same address, unchanged, for
 			# minutes on end, on a link a plain ping confirmed was fine
 			# throughout. modem_ip() now resolves the CID dynamically

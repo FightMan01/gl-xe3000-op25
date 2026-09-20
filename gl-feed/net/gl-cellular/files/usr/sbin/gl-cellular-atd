@@ -2,13 +2,13 @@
 
 -- gl-cellular-atd: AT-command daemon for the Quectel RM520N-GL's AT port.
 --
--- The QMI control interface (cdc-wdm, handled by uqmi/netifd's qmi proto)
--- only covers connection-lifecycle operations. The rich per-cell data
+-- The QMI control interface (/dev/mhi_QMI0, driven by quectel-CM via
+-- netifd's qcm proto) only covers connection-lifecycle operations. The rich per-cell data
 -- (RSRP/RSSI/RSRQ/SINR, cell ID, band, uplink/downlink bandwidth, mode)
 -- and the band-masking/network-type controls are only available via
 -- Quectel's AT command set on the modem's separate AT serial port
--- (standard Quectel USB composite device layout: QMI/MBIM control + a
--- diagnostic/AT port + NMEA).
+-- (standard Quectel USB composite device layout: a diagnostic/AT port +
+-- NMEA; the data path itself runs over PCIe).
 --
 -- Registers ubus object "cellular.at" with a single `command(cmd, timeout)`
 -- method returning raw response text, kept deliberately thin - response
@@ -193,8 +193,7 @@ end
 
 local function traffic_sample()
 	-- ubus network.interface.wwan status gives us the real netdev name
-	-- (may not be a fixed "wwan0" depending on the qmi_wwan driver's
-	-- naming) without hardcoding it.
+	-- (rmnet_mhi0.1 with pcie_mhi) without hardcoding it.
 	local con2 = ubus.connect()
 	if not con2 then return end
 	local status = con2:call('network.interface.wwan', 'status', {})
@@ -350,6 +349,7 @@ local function serving_cell_snapshot()
 			return {
 				mode = 'LTE ' .. (fields[4] or ''),
 				band = fields[10],
+				tac = fields[13],
 				cell_id = fields[7],
 				ul_bandwidth = BANDWIDTH_MHZ[tonumber(fields[11])]
 					and (BANDWIDTH_MHZ[tonumber(fields[11])] .. 'MHz'),
@@ -368,6 +368,7 @@ local function serving_cell_snapshot()
 			result = result or {}
 			result.mode = '5G NSA (LTE ' .. (fields[2] or '') .. ' anchor)'
 			result.band = fields[8]
+			result.tac = fields[11]
 			result.cell_id = fields[5]
 			result.ul_bandwidth = BANDWIDTH_MHZ[tonumber(fields[9])]
 				and (BANDWIDTH_MHZ[tonumber(fields[9])] .. 'MHz')
@@ -464,6 +465,104 @@ local function cached_serving_cell()
 	return shallow_copy(cell_cache)
 end
 
+-- Per-carrier rows for the Cellular > Details page (Band Information table
+-- and Signal History). The frontend wants numeric network_type codes
+-- (4 = 4G, 41 = 4G+/carrier aggregation, 5 = 5G SA, 51 = 5G NSA) and one
+-- row per component carrier, ordered PCC first (ca = 0), SCCs after.
+-- AT+QCAINFO lists the aggregated carriers; only the LTE ones and the
+-- primary NR carrier carry signal values, the rest are shown with "-".
+local LTE_RB_MHZ = { [6] = 1.4, [15] = 3, [25] = 5, [50] = 10, [75] = 15, [100] = 20 }
+
+local function carrier_levels(row)
+	row.rsrp_level = signal_level('rsrp', row.rsrp)
+	row.rssi_level = signal_level('rssi', row.rssi)
+	row.rsrq_level = signal_level('rsrq', row.rsrq)
+	row.sinr_level = signal_level('sinr', row.sinr)
+	return row
+end
+
+local function carrier_snapshot()
+	local cell = cached_serving_cell() or {}
+	local nr = cell.nr
+	local rows = {}
+	local resp = send_at('AT+QCAINFO', 3)
+	if resp then
+		for line in resp:gmatch('[^\r\n]+') do
+			local payload = line:match('^%+QCAINFO:%s*(.+)$')
+			local f = payload and split_csv(payload)
+			local band_str = f and f[4]
+			if band_str then
+				local lte_band = band_str:match('^LTE BAND (%d+)')
+				local nr_band = band_str:match('^NR5G BAND (%d+)')
+				local code = tonumber(f[3])
+				if lte_band then
+					table.insert(rows, {
+						network_type = 4,
+						band = tonumber(lte_band),
+						bandwidth = LTE_RB_MHZ[code],
+						earfcn = tonumber(f[2]),
+						pci = tonumber(f[6]),
+						rsrp = tofloat(tonumber(f[7])), rsrq = tofloat(tonumber(f[8])),
+						rssi = tofloat(tonumber(f[9])), sinr = tofloat(tonumber(f[10])),
+					})
+				elseif nr_band then
+					local row = {
+						network_type = 5,
+						band = tonumber(nr_band),
+						bandwidth = NR_BANDWIDTH_MHZ[code],
+						earfcn = tonumber(f[2]),
+						pci = tonumber(#f <= 5 and f[5] or f[6]),
+					}
+					if nr and nr.band == 'n' .. nr_band then
+						row.rsrp, row.rsrq, row.sinr = nr.rsrp, nr.rsrq, nr.sinr
+						row.pci = row.pci or tonumber(nr.cell_id)
+					end
+					table.insert(rows, row)
+				end
+			end
+		end
+	end
+
+	if #rows == 0 then
+		-- No QCAINFO (single carrier or query failed): fall back to the
+		-- serving-cell record alone.
+		if cell.mode and cell.mode:find('^LTE') or cell.mode and cell.mode:find('anchor') then
+			table.insert(rows, {
+				network_type = 4, band = tonumber(cell.band),
+				bandwidth = tonumber((cell.dl_bandwidth or ''):match('[%d%.]+')),
+				rsrp = cell.rsrp, rsrq = cell.rsrq, rssi = cell.rssi, sinr = cell.sinr,
+			})
+		end
+		if nr then
+			table.insert(rows, {
+				network_type = 5, band = tonumber((nr.band or ''):match('%d+')),
+				bandwidth = tonumber((nr.dl_bandwidth or ''):match('[%d%.]+')),
+				pci = tonumber(nr.cell_id), rsrp = nr.rsrp, rsrq = nr.rsrq, sinr = nr.sinr,
+			})
+		end
+	end
+
+	local lte_count = 0
+	for _, row in ipairs(rows) do
+		if row.network_type == 4 then lte_count = lte_count + 1 end
+	end
+	local network_type = 4
+	if cell.mode == '5G SA' then
+		network_type = 5
+	elseif nr then
+		network_type = 51
+	elseif lte_count > 1 then
+		network_type = 41
+	end
+	for i, row in ipairs(rows) do
+		row.ca = i - 1
+		if row.network_type == 5 then row.network_type = (network_type == 5) and 5 or 51 end
+		if row.network_type == 4 and lte_count > 1 then row.network_type = 41 end
+		carrier_levels(row)
+	end
+	return network_type, rows, cell
+end
+
 local function update_signal_leds(strength)
 	local live = uci.cursor()
 	local enabled = live:get('system', 'gl_led', 'led_enable') ~= '0'
@@ -482,31 +581,21 @@ local function signal_sample()
 	-- reading recorded into history, and it doubles as the cache refresh
 	-- other callers reuse for the next CELL_CACHE_TTL_SEC.
 	local cell = refresh_serving_cell()
-	local sample = nil
+	local strength
 	if cell and cell.nr then
-		sample = {
-			network_type = cell.mode == '5G SA' and 'NR5G-SA' or 'NR5G-NSA',
-			slot = 1,
-			rsrp = cell.nr.rsrp,
-			rsrq = cell.nr.rsrq,
-			sinr = cell.nr.sinr,
-		}
+		strength = signal_level('rsrp', cell.nr.rsrp)
 	elseif cell and cell.mode and cell.mode:find('^LTE') then
-		sample = {
-			network_type = 'LTE',
-			slot = 1,
-			rsrp = cell.rsrp,
-			rssi = cell.rssi,
-			rsrq = cell.rsrq,
-			sinr = cell.sinr,
-		}
+		strength = signal_level('rsrp', cell.rsrp)
 	end
+	update_signal_leds(strength or 0)
 
-	local strength = sample and signal_level('rsrp', sample.rsrp) or 0
-	update_signal_leds(strength)
-	if not sample then return end
-	sample.timestamp = os.time()
-	table.insert(signal_history, sample)
+	local network_type, rows = carrier_snapshot()
+	if #rows == 0 then return end
+	table.insert(signal_history, {
+		timestamp = os.time(),
+		network_type = network_type,
+		signal = rows,
+	})
 	while #signal_history > SIGNAL_HISTORY_MAX do table.remove(signal_history, 1) end
 end
 
@@ -683,10 +772,12 @@ local cellular_methods = {
 					lock_tower_support = true,
 					lock_carrier_support = true,
 					at_port = dev,
-					data_port = '/dev/wwan0mbim0',
-					devices = { '/dev/wwan0mbim0' },
-					protocols = { 'mbim' },
-					network_type_support = { 'AUTO', 'NR5G', 'LTE' },
+					data_port = '/dev/mhi_QMI0',
+					devices = { '/dev/mhi_QMI0' },
+					protocols = { 'qmi' },
+					-- Boolean feature flag; the selectable list is support_network_type.
+					network_type_support = true,
+					support_network_type = { 'AUTO', 'NR5G', 'LTE' },
 					band = {
 						LTE = { 1, 2, 3, 4, 5, 7, 8, 12, 13, 14, 17, 18,
 							19, 20, 25, 26, 28, 29, 30, 32, 34, 38, 39, 40,
@@ -942,11 +1033,25 @@ local cellular_methods = {
 			for _, sample in ipairs(signal_history) do
 				if sample.timestamp >= cutoff then table.insert(samples, sample) end
 			end
+			local last = samples[#samples]
 			con:reply(req, {
 				level = SIGNAL_LEVELS,
+				network_type = last and last.network_type,
 				signals = as_array(samples),
 			})
 		end, { time = ubus.INT32 }
+	},
+
+	cell_info = {
+		function(req, msg, con)
+			local network_type, rows, cell = carrier_snapshot()
+			con:reply(req, {
+				network_type = network_type,
+				tac = cell.tac,
+				cell_id = cell.cell_id,
+				signal = as_array(rows),
+			})
+		end, {}
 	},
 }
 

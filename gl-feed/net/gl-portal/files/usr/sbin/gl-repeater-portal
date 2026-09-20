@@ -222,7 +222,7 @@ local function extract_portal_url(base, response)
 	local candidate = body:match("[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]%s*=%s*[\"']([^\"']+)")
 		or body:match("[Hh][Rr][Ee][Ff]%s*=%s*[\"'](https?://[^\"']+)")
 		or body:match("window%.location[^=]*=%s*[\"']([^\"']+)")
-	return resolve_location(base, candidate) or "http://.gl-wifi.com/"
+	return resolve_location(base, candidate) or base
 end
 
 local function is_probe_success(probe, response)
@@ -247,7 +247,17 @@ local function write_portal_body(body)
 	end
 end
 
+-- The probe is bound to the STA device and marked PROBE_MARK. mwan3 rewrites
+-- only the 0x3f00 mask, so it would still steer the probe by its own policy
+-- (or mark it unreachable while it thinks the repeater is down behind the
+-- portal). Send marked probes straight to the main table instead.
+local function ensure_probe_rule()
+	os.execute("ip rule show | grep -q 'fwmark 0x8000/0x8000' || " ..
+		"ip rule add pref 900 fwmark 0x8000/0x8000 lookup main 2>/dev/null")
+end
+
 local function detect(settings)
+	ensure_probe_rule()
 	update_state({ detecting = true, status = "portal detecting...", last_error = "" })
 	local last_error = ""
 	for _, probe in ipairs(PROBES) do
@@ -271,9 +281,18 @@ local function detect(settings)
 				})
 				return false
 			end
+			local code = response.code
+			local portalish = code == 200 or code == 511 or (code and code >= 300 and code < 400)
+			if not portalish then
+				last_error = "probe returned HTTP " .. tostring(code)
+				goto next_probe
+			end
 			write_portal_body(response.body)
 			local url = extract_portal_url(probe.url, response)
-			set_portal_dns(settings.dns)
+			-- Only repoint LAN DNS at the STA while the portal flow is
+			-- engaged; otherwise a detected portal on an idle repeater would
+			-- take DNS away from a healthy cellular uplink.
+			if settings.auto_portal or load_state().bare_mode then set_portal_dns(settings.dns) end
 			if settings.auto_portal then set_bare_mode(true, true) end
 			update_state({
 				detected = true, detecting = false, portal_url = url,
@@ -283,6 +302,7 @@ local function detect(settings)
 		else
 			last_error = err or "probe failed"
 		end
+		::next_probe::
 	end
 
 	update_state({
@@ -292,7 +312,7 @@ local function detect(settings)
 	return false
 end
 
-while true do
+local function tick()
 	local settings = repeater_settings()
 	if settings and settings.up and settings.device then
 		detect(settings)
@@ -305,5 +325,12 @@ while true do
 			status = "idle", last_error = "",
 		})
 	end
+end
+
+-- A transient ubus/uci failure (this starts at boot, before netifd/wifi are
+-- up) must not kill the service and burn procd's respawn budget.
+while true do
+	local ok, err = pcall(tick)
+	if not ok then io.stderr:write("gl-repeater-portal: " .. tostring(err) .. "\n") end
 	time.sleep(POLL_INTERVAL)
 end

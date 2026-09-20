@@ -112,7 +112,7 @@ static int proc_config_show(struct seq_file *s, void *v)
 static ssize_t proc_config_write(struct file *file, const char __user *buf, size_t size, loff_t *ppos)
 {
     struct wifidog_net *wd = net_generic(current->nsproxy->net_ns, wd_net_id);
-    char data[128];
+    char data[129];
     char *delim, *key;
     const char *value;
     int update = 0;
@@ -120,13 +120,15 @@ static ssize_t proc_config_write(struct file *file, const char __user *buf, size
     if (size == 0)
         return -EINVAL;
 
-    if (size > sizeof(data))
-        size = sizeof(data);
+    if (size > sizeof(data) - 1)
+        size = sizeof(data) - 1;
 
     if (copy_from_user(data, buf, size))
         return -EFAULT;
 
-    data[size - 1] = 0;
+    /* NUL-terminate after the data: a write without a trailing newline
+     * (the shell may split writes) must not lose its last character. */
+    data[size] = 0;
 
     key = data;
     while (key && *key) {
@@ -150,7 +152,7 @@ static ssize_t proc_config_write(struct file *file, const char __user *buf, size
                 update = 1;
             pr_info("wifidog-ng: %s\n", wd->enabled ? "enabled" : "disabled");
         } else if (!strcmp(key, "interface")) {
-            strncpy(wd->interface, value, sizeof(wd->interface) - 1);
+            strscpy(wd->interface, value, sizeof(wd->interface));
             update = 1;
         } else if (!strcmp(key, "port")) {
             wd->port = htons(simple_strtol(value, NULL, 0));

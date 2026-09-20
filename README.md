@@ -2,7 +2,7 @@
 
 GL.iNet GL-XE3000 backend packages, rebuilt to run on stock OpenWrt 25.x instead of GL's own SDK4 firmware.
 
-The XE3000 normally ships with a customized OpenWrt build wired to GL's closed SDK4 stack: a SQLite-backed session daemon, a proprietary MediaTek wifi driver, a closed cellular management daemon, and so on. This repo replaces all of that with packages built against plain, mainline OpenWrt: hostapd/wpad-full instead of GL's wifi driver, mac80211/mt76, mwan3 for multi-WAN, netifd's `mbim` proto for the modem, and a from-scratch `/rpc` + `/ws` backend that speaks the exact same wire protocol GL's own frontend expects.
+The XE3000 normally ships with a customized OpenWrt build wired to GL's closed SDK4 stack: a SQLite-backed session daemon, a proprietary MediaTek wifi driver, a closed cellular management daemon, and so on. This repo replaces all of that with packages built against plain, mainline OpenWrt: hostapd/wpad-full instead of GL's wifi driver, mac80211/mt76, mwan3 for multi-WAN, Quectel's `pcie_mhi` driver + `quectel-CM` (the same QMI/QMAP stack GL ships) behind a `qcm` netifd proto for the modem, and a from-scratch `/rpc` + `/ws` backend that speaks the exact same wire protocol GL's own frontend expects.
 
 GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the original firmware) is **not** included here - that's GL's compiled output, not something to redistribute. Everything in this repo is what serves and drives that GUI, not the GUI itself. You have two ways to get the GUI onto a router running this port:
 
@@ -13,10 +13,10 @@ GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the origi
 
 - **gl-oui-rpc** - the `/rpc` and `/ws` handlers, the session/login daemon, and most per-page backends (wifi, LAN/guest/IoT, native VLAN subnets, firewall, multi-WAN, system status, clients, scheduled tasks, DNS, IPv6, USB, tailscale, VPN client/server, and more)
 - **gl-oui-runtime** - a small vanilla-JS file that keeps the Internet/Multi-WAN status cards live without needing a page refresh, plus a fallback restore page for getting the GL GUI back after flashing (both original code, not vendored from GL)
-- **gl-cellular** - RM520N-GL modem management over its AT port (SIM/APN config, band locking, cell tower scanning, SMS), plus the PCIe/MHI wiring for the actual data connection
+- **gl-cellular** - RM520N-GL modem management over its AT port (SIM/APN config, band locking, cell tower scanning, SMS), plus the `qcm` netifd proto and watchdog for the actual QMI/QMAP data connection
 - **gl-mcu** - the onboard battery/MCU controller daemon (UART, JSON wire protocol with GL's byte-substitution framing)
 - **gl-repeater** - WiFi repeater/bridge mode uplink, using a STA interface + double-NAT so it also works against WPA2/3-Enterprise networks (eduroam and the like), which WDS-based repeating never does
-- **openwrt-patches** - the handful of kernel/package patches this needs: the MHI PCI ID for the modem, turning off PCIe port power management (stops a reset loop on this hardware), an mbim data-interface fix, and a small lua-cjson patch so an empty list serializes as `[]` instead of `{}`
+- **openwrt-patches** - the handful of kernel/package patches this needs: turning off PCIe port power management (stops a reset loop on this hardware) and a small lua-cjson patch so an empty list serializes as `[]` instead of `{}`
 - **build-config** - misc build-time package config (ksmbd)
 - **tools/backup-gl-ui.sh** - pulls the GL GUI files off a router that's still on stock firmware, so you can restore them after flashing
 
@@ -64,11 +64,11 @@ You'll need a real OpenWrt source checkout, not just the SDK - the kernel patche
    ./scripts/feeds update -a
    ./scripts/feeds install -a
    ```
-3. Apply the kernel patches - copy both files into whichever `target/linux/mediatek/patches-*/` directory matches your tree's kernel version:
+3. Apply the kernel patches - copy the files into whichever `target/linux/mediatek/patches-*/` directory matches your tree's kernel version:
    ```
    cp openwrt-patches/mediatek-filogic/*.patch target/linux/mediatek/patches-6.18/
    ```
-4. Apply the `umbim` and `lua-cjson` patches against those packages' own `patches/` directories (wherever your feeds checked them out, typically under `feeds/packages/net/umbim/patches/` and `feeds/packages/utils/lua-cjson/patches/`).
+4. Apply the `lua-cjson` patch against that package's own `patches/` directory (typically `feeds/packages/utils/lua-cjson/patches/`).
 5. `make menuconfig` - Target System: MediaTek Ralink/Filogic, Subtarget: filogic, Target Profile: GL.iNet GL-XE3000. Under Network, select `gl-oui-rpc`, `gl-oui-runtime`, `gl-cellular`, `gl-mcu`, `gl-repeater`, plus `mwan3` and `wpad-full` if they aren't already pulled in as dependencies.
 6. `make -j$(nproc) V=s`
 
@@ -76,6 +76,12 @@ The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what y
 
 ## Status
 
-Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, and the battery/MCU controller. Best-effort, untested-on-real-hardware support for a Quectel RM551E-GL (Qualcomm SDX75) alongside the RM520N-GL this is otherwise built around - see `gl-cellular-wwan-autoproto`. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, and OLED screen scheduling (this device has no screen).
+Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, and the battery/MCU controller. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, and OLED screen scheduling (this device has no screen).
 
 Tested on a physical XE3000. Issues and pull requests welcome.
+
+## Cellular data path
+
+The RM520N-GL's data plane runs over PCIe through Quectel's out-of-tree `pcie_mhi` driver (`gl-feed/kernel/pcie_mhi`, V1.3.8) and `quectel-CM` (`gl-feed/net/quectel-cm`, QConnectManager V1.6.8), driven by the `qcm` netifd proto shipped in `gl-cellular`. This is the same stack GL's stock firmware uses. The mainline MHI/MBIM stack was removed: under sustained load it left the modem "connected" with an address while passing no packets, recoverable only by a PCIe function reset. Do not install any `kmod-mhi-*` package alongside `kmod-pcie_mhi` - mainline `mhi-pci-generic` matches the same PCI ID and would race it for the device.
+
+`network.wwan` uses `proto qcm`, control node `/dev/mhi_QMI0`, base netdev `rmnet_mhi0` (QMAP netdev `rmnet_mhi0.1`). The proto creates the dynamic `wwan_4` (dhcp) and `wwan_6` children that mwan3, the watchdog and the UI track. A router upgraded from an mbim-based build has `network.wwan` migrated in place on first boot.

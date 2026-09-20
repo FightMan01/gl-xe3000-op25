@@ -8,17 +8,17 @@ PROC=/proc/net/wifidog-ng/config
 create_ipsets() {
 	# The kernel module treats these two sets as the allow-list.  Empty sets
 	# intentionally mean "redirect/drop unknown clients".
-	ipset -! create wifidog-ng-mac hash:mac timeout 4294967 2>/dev/null
-	ipset -! create wifidog-ng-ip hash:ip 2>/dev/null
+	# 2147483 is ipset's maximum timeout; larger values are rejected.
+	ipset -! create wifidog-ng-mac hash:mac timeout 2147483 ||
+		logger -t gl-portal "failed to create ipset wifidog-ng-mac"
+	ipset -! create wifidog-ng-ip hash:ip ||
+		logger -t gl-portal "failed to create ipset wifidog-ng-ip"
 }
 
 write_config() {
 	[ -e "$PROC" ] || return 1
-	printf '%s\n' \
-		'interface=br-lan' \
-		'port=80' \
-		'ssl_port=443' \
-		'enabled=0' > "$PROC"
+	# No interface= line: the module already defaults to br-lan, as in stock.
+	printf 'port=80\nssl_port=443\nenabled=0\n' > "$PROC"
 }
 
 start() {

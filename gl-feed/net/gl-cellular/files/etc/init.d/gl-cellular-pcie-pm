@@ -5,11 +5,11 @@ STOP=89
 
 start() {
 	# PCI/MHI probing finishes shortly after rcS reaches this service, and
-	# mhi_pci_generic re-enables runtime PM when it probes.  Setting
+	# the PCI driver probe can re-enable runtime PM.  Setting
 	# power/control=on before that lands is overwritten back to "auto", after
 	# which the modem autosuspends into D3 every few seconds (dmesg
 	# "save config"/"PME#" churn) - the very thing this service exists to
-	# prevent, and a known way to wedge the MHI/MBIM firmware.  Keep
+	# prevent, and a known way to wedge the modem's MHI firmware.  Keep
 	# re-applying well past probe instead of exiting as soon as the device
 	# shows up; the PCI hotplug hook re-applies again on every later bind.
 	(

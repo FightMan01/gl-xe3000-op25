@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-portal
 PKG_VERSION:=1
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=src/wifidog-ng.c

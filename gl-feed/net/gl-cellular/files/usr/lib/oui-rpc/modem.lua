@@ -215,8 +215,8 @@ local function operator_and_network_type()
 	return operator, badge
 end
 
--- SMS: text-mode AT commands (AT+CMGF=1, +CMGL/+CMGS/+CMGD) - uqmi has no
--- message-service support, and text-mode AT SMS is the most portable/
+-- SMS: text-mode AT commands (AT+CMGF=1, +CMGL/+CMGS/+CMGD) - quectel-CM has
+-- no message-service support, and text-mode AT SMS is the most portable/
 -- well-documented path across modem vendors.
 local function ensure_text_mode()
 	at.command("AT+CMGF=1", 2)
@@ -560,7 +560,8 @@ return {
 			ip_type = ip_type,
 			network_mode = (cursor:get("network", "wwan", "modes") or "auto"):upper(),
 			roaming = cursor:get("gl-cellular", "state", "roaming_enabled") ~= "0",
-			protocol = cursor:get("network", "wwan", "proto") or "mbim",
+			-- the qcm netifd proto is Quectel QMI/QMAP; the UI knows it as "qmi"
+			protocol = "qmi",
 			auth = (cursor:get("network", "wwan", "auth") or "none"):upper(),
 			username = cursor:get("network", "wwan", "username") or "",
 			password = cursor:get("network", "wwan", "password") or "",
@@ -589,7 +590,16 @@ return {
 	-- get_serving_cell already produces, which is exactly the shape the
 	-- panel's cellInfoKeys render.
 	get_cell_info = function(args)
-		return get_serving_cell() or {}
+		-- The frontend wants {network_type (numeric), tac, cell_id, signal[]}
+		-- with one row per aggregated carrier; gl-cellular-atd builds that.
+		local conn = ubus.connect()
+		local info = conn and conn:call("cellular", "cell_info", {}) or nil
+		if conn then conn:close() end
+		if info then
+			info.signal = as_array(info.signal or {})
+			return info
+		end
+		return { signal = cjson.empty_array }
 	end,
 
 	get_band_config = function(args)
@@ -732,9 +742,6 @@ return {
 		if data.network_type then
 			cursor:set("network", "wwan", "modes", tostring(data.network_type):lower())
 		end
-		if data.protocol == "mbim" then
-			cursor:set("network", "wwan", "proto", "mbim")
-		end
 		if data.auth then
 			local auth = tostring(data.auth):lower()
 			if auth == "none" then
@@ -866,10 +873,10 @@ return {
 
 		-- "Changing the configuration will result in redialing" (matches
 		-- the warning banner in the supplied screenshot).  A bare ifup does
-		-- not disconnect an already-activated MBIM session.  The old bearer
-		-- then remains cosmetically up with an address but silently drops
-		-- every packet.  Tear it down first so the new APN/IP profile always
-		-- receives a fresh MBIM activation and gateway.
+		-- not restart an already-running quectel-CM.  The old data call
+		-- then remains cosmetically up with an address but the new APN/IP
+		-- profile never applies.  Tear it down first so the new profile
+		-- always receives a fresh QMI data call and gateway.
 		--
 		-- Delegated to gl-cellular-wwan-reconnect rather than inlined here:
 		-- it takes the same lock gl-cellular-wwan-watchdog's do_redial()
@@ -881,24 +888,53 @@ return {
 	end,
 
 	set_sim_pin_code = function(args)
-		-- SIM PINs are always numeric (3GPP TS 22.030) - validating this
-		-- strictly also closes the AT-command-injection risk a naive
-		-- quote-stripping approach would leave open.
+		-- SIM PINs are numeric (3GPP TS 22.030); validating strictly also
+		-- closes the AT-command-injection risk.
 		local pin = tostring(args.pin_code or args.pin or "")
-		if not pin:match("^%d%d%d%d+$") then
-			return { code = 1, message = "invalid pin_code" }
-		end
-		local resp = at.command('AT+CPIN="' .. pin .. '"', 5)
-		if not (resp and resp:match("OK")) then
-			return { code = 1, message = "PIN verification failed" }
+		if not pin:match("^%d+$") or #pin < 4 or #pin > 8 then
+			return { err_code = 20002022, err_msg = "invalid pin_code", status = 3 }
 		end
 
-		-- Persist so the SIM auto-unlocks on every future connection
-		-- attempt, including after reboot. netifd's `mbim` proto already
-		-- applies a `pincode` option automatically - just seed it.
+		local function remaining()
+			local r = at.command("AT+QPINC?", 3) or ""
+			return tonumber(r:match('%+QPINC:%s*"SC",(%d+)'))
+		end
+
+		-- The UI reads {err_code, err_msg, pin_counter, status} from a
+		-- result as an API error (20002022 = wrong PIN, status 4 = PUK).
+		local state = at.command("AT+CPIN?", 3) or ""
+		if state:match("SIM PUK") then
+			return { err_code = 20002022, err_msg = "SIM is PUK locked", pin_counter = 0, status = 4 }
+		end
+		if not state:match("SIM PIN") then
+			if state:match("READY") then return {} end
+			return { err_code = 20002045, err_msg = "modem not ready" }
+		end
+
+		local before = remaining() or 3
+		local resp = at.command('AT+CPIN="' .. pin .. '"', 8) or ""
+		if not resp:match("OK") then
+			local left = remaining() or math.max(before - 1, 0)
+			return { err_code = 20002022, err_msg = "incorrect pin",
+				pin_counter = left, status = left == 0 and 4 or 3 }
+		end
+
+		for _ = 1, 15 do
+			if (at.command("AT+CPIN?", 3) or ""):match("READY") then break end
+			os.execute("sleep 1")
+		end
+
+		-- Save the PIN, tied to this SIM, so it is entered automatically on
+		-- every boot/redial (see gl-cellular-sim-unlock).
+		local iccid = ((at.command("AT+QCCID", 3) or ""):match("%+QCCID:%s*(%w+)"))
 		local cursor = uci.cursor()
 		cursor:set("network", "wwan", "pincode", pin)
+		if iccid then cursor:set("network", "wwan", "pin_iccid", iccid) end
+		cursor:delete("network", "wwan", "pin_failed")
 		cursor:commit("network")
+
+		-- The wwan interface stopped itself while waiting for the PIN.
+		os.execute("/usr/sbin/gl-cellular-net-run sh -c 'ifdown wwan; sleep 1; ifup wwan' >/dev/null 2>&1 &")
 		return {}
 	end,
 
@@ -932,6 +968,7 @@ return {
 		if conn then conn:close() end
 		return {
 			level = history and history.level or {},
+			network_type = history and history.network_type,
 			signals = as_array(history and history.signals or {}),
 		}
 	end,
@@ -1196,7 +1233,7 @@ return {
 		cursor:set("gl-cellular", "state", "scan_in_progress", "1")
 		cursor:set("gl-cellular", "state", "scan_started_at", tostring(os.time()))
 		cursor:commit("gl-cellular")
-		-- Stop the MBIM interface cleanly first, then have the independent
+		-- Stop the wwan interface cleanly first, then have the independent
 		-- long-command worker always redial it after the scan—even if the
 		-- browser closes the drawer/request before the scan completes.
 		if redial then

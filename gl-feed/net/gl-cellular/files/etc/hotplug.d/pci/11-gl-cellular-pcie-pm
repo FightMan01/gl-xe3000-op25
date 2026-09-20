@@ -1,7 +1,7 @@
 #!/bin/sh
 # Re-apply the runtime-PM override whenever the modem PCI function (re)appears.
-# `bind` fires after the driver probes, and mhi_pci_generic re-enables runtime
-# PM during probe - so also re-apply a moment later to make the "on" stick,
+# `bind` fires after the driver probes, and a driver probe can re-enable
+# runtime PM - so also re-apply a moment later to make the "on" stick,
 # otherwise the modem autosuspends to D3 every few seconds again.
 
 case "$ACTION" in

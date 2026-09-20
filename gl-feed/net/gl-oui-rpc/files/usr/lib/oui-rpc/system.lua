@@ -215,7 +215,7 @@ return {
 		local mwan_interfaces = mwan.interfaces or {}
 		-- The frontend joins these names to kmwan.get_config.  They must be
 		-- the UI's identifiers (not merely friendly names): modem_<bus> for
-		-- cellular and wwan for repeater.  umbim puts the actual IPv4
+		-- cellular and wwan for repeater.  the qcm proto puts the actual IPv4
 		-- address on the dynamic wwan_4 child, not the address-less parent.
 		for _, entry in ipairs({
 			{ interface = "wan", real = "wan" },

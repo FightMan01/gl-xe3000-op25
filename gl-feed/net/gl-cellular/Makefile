@@ -2,23 +2,20 @@
 # gl-cellular: cellular/modem management for the GL-XE3000's Quectel
 # RM520N-GL, reimplemented for the OpenWrt 25.12 port.
 #
-# The data connection uses the modem's native PCIe/MHI link, not USB/QMI.
-# The modem enumerates as PCI ID 17cb:0308, which mainline Linux's own
-# drivers/bus/mhi/host/pci_generic.c already recognizes (as "qcom-sdx65m")
-# with no driver patching needed - just enabling these normally-off kmods.
-# Connection lifecycle is owned entirely by netifd's in-tree `mbim` proto
-# (package umbim) talking to /dev/wwan0mbim0 - no custom
-# connection-management daemon. gl-cellular-atd (this package) separately
-# supplies richer per-cell/signal data and SIM controls via the modem's
-# AT port, a distinct, parallel USB composition (ttyUSB0-3) unaffected by
-# which path (PCIe or USB) carries the actual data connection.
+# The data connection uses the modem's native PCIe link through Quectel's
+# out-of-tree pcie_mhi driver (kmod-pcie_mhi) and quectel-CM, the same QMI/
+# QMAP stack GL's stock firmware runs, driven by the `qcm` netifd proto
+# (lib/netifd/proto/qcm.sh). Mainline's MHI/MBIM stack was dropped: it
+# wedged the modem's data plane under sustained load. gl-cellular-atd (this
+# package) separately supplies richer per-cell/signal data and SIM controls
+# via the modem's AT port, a parallel USB composition (ttyUSB0-3).
 #
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-cellular
 PKG_VERSION:=1
-PKG_RELEASE:=11
+PKG_RELEASE:=16
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -29,7 +26,7 @@ define Package/gl-cellular
   CATEGORY:=Network
   TITLE:=GL.iNet XE3000 cellular/modem management, reimplemented
   DEPENDS:= \
-	+umbim +luci-proto-mbim +uqmi +kmod-mhi-bus +kmod-mhi-net +kmod-mhi-pci-generic +kmod-mhi-wwan-ctrl +kmod-mhi-wwan-mbim \
+	+kmod-pcie_mhi +quectel-cm \
 	+kmod-usb-serial-option +kmod-usb-acm \
 	+lua-eco +lua-eco-termios +lua-eco-ubus +lua-eco-uci +lua-eco-log \
 	+lua-cjson-lua5.4 +libubus-lua +libuci-lua +lua-cjson +gl-oui-rpc \
@@ -37,18 +34,11 @@ define Package/gl-cellular
 endef
 
 define Package/gl-cellular/description
-  Cellular/modem management for the GL-XE3000's Quectel RM520N-GL, using
-  its native PCIe/MHI data path (mainline mhi_pci_generic + mhi_wwan_mbim +
-  netifd's mbim proto) rather than USB/QMI, for full-speed throughput. This
-  package adds AT-port-based signal/cell detail and SIM/band configuration
-  (a separate, parallel USB path) to match GL's original GUI screens, plus
-  persistent data-usage accounting.
-
-  Also includes best-effort PCIe/MHI data-path support for the Quectel
-  RM551E-GL (Qualcomm SDX75), which needs netifd's qmi proto instead of
-  mbim - see usr/sbin/gl-cellular-wwan-autoproto. Untested against real
-  RM551E-GL hardware; the AT-port signal/SIM/band features above remain
-  RM520N-GL-only.
+  Cellular/modem management for the GL-XE3000's Quectel RM520N-GL over the
+  pcie_mhi + quectel-CM QMI/QMAP data path. Adds AT-port-based signal/cell
+  detail and SIM/band configuration (a separate USB path) to match GL's
+  original GUI screens, plus persistent data-usage accounting and a
+  watchdog that redials / power-cycles / PCIe-resets a hung modem.
 endef
 
 define Package/gl-cellular/conffiles
@@ -69,7 +59,6 @@ define Package/gl-cellular/postinst
 	/etc/init.d/gl-cellular-atd enable
 	/etc/init.d/gl-cellular-pcie-pm enable
 	/etc/init.d/gl-cellular-boot-redial enable
-	/etc/init.d/gl-cellular-wwan-autoproto enable
 }
 exit 0
 endef
