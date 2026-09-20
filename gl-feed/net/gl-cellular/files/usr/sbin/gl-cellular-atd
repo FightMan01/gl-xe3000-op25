@@ -850,22 +850,40 @@ local cellular_methods = {
 			-- renders even though the value was computed all along.
 			if cell then cell.id = cell.cell_id end
 			add_signal_levels(cell)
+			-- The Details page builds its Network Information panel as
+			-- {...networks_info_entry, iccid} (see its networkInfo computed):
+			-- Operator, Phone Number and APN all come from THIS entry, not
+			-- from the SIM topics. Without them every row renders "-".
+			local cops = csv_fields(send_at('AT+COPS?', 3), '+COPS')
+			local phone = csv_fields(send_at('AT+CNUM', 2), '+CNUM')
+			local phone_number = phone and phone[2] or ''
+			phone_number = phone_number:gsub('"', '')
+			-- That same panel iterates ipv6 as an ARRAY of {ip, dns} and
+			-- tests networkInfo.ipv6.length; the object this used to send
+			-- made the length undefined, so the IPv6 rows silently never
+			-- rendered even on a live IPv6 session.
+			local ipv6 = cjson.empty_array
+			local v6 = status6 and status6['ipv6-address'] and status6['ipv6-address'][1]
+			if v6 and v6.address then
+				ipv6 = { {
+					ip = v6.address,
+					dns = as_array(status6 and status6['dns-server'] or {}),
+				} }
+			end
 			con:reply(req, { networks = {
 				{
 					bus = MODEM_BUS,
 					slot = '1',
 					network_mode = (current_config('network', 'wwan', 'modes') or 'AUTO'):upper(),
+					carrier = cops and cops[3] or '',
+					phone_number = phone_number,
+					apn = configured_apn(),
 					ipv4 = {
 						ip = ipv4 and ipv4.address,
 						gateway = route and route.nexthop,
 						dns = as_array(status4 and status4['dns-server'] or {}),
 					},
-					ipv6 = {
-						ip = status6 and status6['ipv6-address']
-							and status6['ipv6-address'][1]
-							and status6['ipv6-address'][1].address,
-						dns = as_array(status6 and status6['dns-server'] or {}),
-					},
+					ipv6 = ipv6,
 					traffic_total = tostring(traffic_total()),
 					cell_info = cell or {},
 				},
