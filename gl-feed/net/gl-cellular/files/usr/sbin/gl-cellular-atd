@@ -577,6 +577,72 @@ local function numeric_result(resp, min_len)
 	return nil
 end
 
+-- One per-slot SIM entry, in the shape the GL frontend's modem card reads.
+-- The card builds modemData as {...modems_info, ...modems_status} and then
+-- derives everything from modemData.simcard[] (modem-card's simCardInfo ->
+-- currentSimInfo -> sim-item): the label, operator, technology, signal
+-- strength and the data-usage figure all come from that entry. GL's own
+-- daemon fills the array from its modems_info/modems_status replies; without
+-- it simCardInfo is empty, currentSimInfo is {}, and the card falls back to
+-- "Unknown", an empty signal icon and "0.00 B" no matter what the sims_*
+-- topics carry (that mismatch was live on-device 2026-09-20).
+local function sim_card_entry()
+	local sim_status, pin_counter = sim_pin_snapshot()
+	local iccid_fields = csv_fields(send_at('AT+QCCID', 2), '+QCCID')
+	local iccid = iccid_fields and iccid_fields[1]
+	if iccid then iccid = iccid:gsub('F$', '') end
+	local cops = csv_fields(send_at('AT+COPS?', 3), '+COPS')
+	local carrier = cops and cops[3] or ''
+	local nwinfo = csv_fields(send_at('AT+QNWINFO', 2), '+QNWINFO')
+	local network_name = nwinfo and nwinfo[1] or ''
+	local cell = cached_serving_cell() or {}
+	-- Same technology mapping sims_status uses; the frontend renders it via
+	-- its own {2,3,4,41,5,51} table ("4G", "5G SA", "5G NSA", ...).
+	local technology = 0
+	if cell.nr or (cell.mode and cell.mode:find('^5G NSA'))
+		or network_name:find('NR5G%-NSA') then
+		technology = 51
+	elseif network_name:find('NR5G') then
+		technology = 5
+	elseif network_name:find('LTE') then
+		technology = 4
+	elseif network_name:find('WCDMA') or network_name:find('UMTS') then
+		technology = 3
+	elseif network_name ~= '' and network_name ~= 'No Service' then
+		technology = 2
+	end
+	local rsrp = cell.nr and cell.nr.rsrp or cell.rsrp
+	local strength = 0
+	if rsrp then
+		if rsrp >= -80 then strength = 4
+		elseif rsrp >= -95 then strength = 3
+		elseif rsrp >= -110 then strength = 2
+		else strength = 1 end
+	end
+	local status = wwan_status()
+	return {
+		slot = '1',
+		type = 0,
+		-- A stored operator-set label wins; otherwise show the carrier so
+		-- the card's SIM row is meaningful instead of "Unknown".
+		name = current_config('gl-cellular', 'state', 'sim_name') or carrier,
+		status = sim_status,
+		pin_counter = pin_counter,
+		carrier = carrier,
+		technology = technology,
+		strength = strength,
+		signal = strength,
+		apn = configured_apn(),
+		iccid = iccid,
+		imsi = numeric_result(send_at('AT+CIMI', 2), 14),
+		phone_number = '',
+		-- 0 is what the card treats as "connected" (modemState success).
+		dial_status = (status and status.up == true) and 0 or 1,
+		traffic_total = tostring(traffic_total()),
+		slot_support_esim = false,
+	}
+end
+
 local cellular_methods = {
 	-- Live data total for the settings page, which otherwise only sees the
 	-- periodic UCI checkpoint (and would show a stale/zero figure while
@@ -602,6 +668,10 @@ local cellular_methods = {
 					-- .find() on this field; even a single IMEI is an array.
 					imei = { { slot = '1', imei = imei } },
 					sim_slot_num = 1,
+					-- modem-card merges this entry with the matching
+					-- modems_status entry and then reads .simcard[] for
+					-- every SIM row; see sim_card_entry().
+					simcard = { sim_card_entry() },
 					standby_type = 0,
 					sms_support = true,
 					signal_support = true,
@@ -643,13 +713,25 @@ local cellular_methods = {
 	modems_status = {
 		function(req, msg, con)
 			local status = wwan_status()
+			local up = status and status.up == true
+			local sim = sim_card_entry()
+			-- The card's header switch binds v-model to modemData.dial_enable;
+			-- without it the switch renders off even on a live connection.
+			local dial_enabled = current_config('gl-cellular', 'state', 'dial_enabled') ~= '0'
 			con:reply(req, { modems = {
 				{
 					bus = MODEM_BUS,
 					status = 1,
+					current_sim = '1',
 					current_sim_slot = '1',
+					sim_status = sim.status,
+					carrier = sim.carrier,
+					phone_number = sim.phone_number,
 					slot_switch_status = 0,
-					connected = status and status.up == true or false,
+					connected = up,
+					dial_enable = dial_enabled,
+					airplane_mode = false,
+					simcard = { sim },
 				},
 			} })
 		end
