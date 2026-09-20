@@ -46,6 +46,15 @@ SYNC_MTU=$(opt sync_mtu 0)
 # modem_hard_reset()). A silent AT port is decisive: no AT-based recovery
 # (AT+CFUN, etc.) can work, and ifdown/ifup cannot reach the firmware.
 AT_DEAD_TICKS=$(opt at_dead_ticks 3)
+# AT+CFUN power-cycles allowed before falling back to the PCIe/MHI hard
+# reset when the AT port is still answering but the data path never comes
+# back. A modem can wedge its data plane (attached, an address on the
+# session, every ping/HTTP probe at 0% while AT+CGATT still reads 1) with
+# the AT port fully alive - so the silent-AT path above never fires, and
+# neither do_redial (host-side MBIM session only) nor do_cfun_cycle (radio
+# re-attach) reaches the stuck firmware. Verified on-device: only the
+# PCIe/MHI re-init in gl-cellular-modem-reset brings traffic back.
+CFUN_BEFORE_RESET=$(opt cfun_before_reset 1)
 # Hard resets (PCIe/MHI re-init) allowed inside the window before giving up.
 MODEM_RESET_MAX=$(opt modem_reset_max 3)
 MODEM_RESET_WINDOW=$(opt modem_reset_window_sec 3600)
@@ -60,6 +69,7 @@ blocked_until=0
 grace_until=0
 redial_pending=0
 failed_cycles=0
+cfun_cycles=0
 last_cfun=0
 last_device=""
 last_rx=""
@@ -123,6 +133,7 @@ reset_state() {
 	grace_until=0
 	redial_pending=0
 	failed_cycles=0
+	cfun_cycles=0
 	last_rx=""
 	nosignal_ticks=0
 }
@@ -529,11 +540,12 @@ modem_hard_reset() {
 	fi
 
 	logger -p daemon.err -t "$TAG" \
-		"modem AT port unresponsive; hard-resetting via PCIe/MHI (attempt $reset_count/$MODEM_RESET_MAX)"
+		"modem firmware hung (AT unresponsive or data path wedged); hard-resetting via PCIe/MHI (attempt $reset_count/$MODEM_RESET_MAX)"
 	/usr/sbin/gl-cellular-modem-reset
 	at_dead=0
 	consec_bad=0
 	failed_cycles=0
+	cfun_cycles=0
 	redial_count=0
 	window_start=0
 	last_rx=""
@@ -619,10 +631,24 @@ do_cfun_cycle() {
 escalate() {
 	log_diag "$device" &
 	if [ "$((failed_cycles + 1))" -ge "$CFUN_AFTER_CYCLES" ]; then
+		# A CFUN power-cycle already ran since the last confirmed-good tick
+		# and traffic never came back. The AT port is answering (otherwise
+		# the silent-AT path would have hard-reset already), so
+		# do_cfun_cycle's own "AT+CFUN=1 not confirmed" escalation below
+		# will never fire either - looping redials and CFUN cycles forever
+		# on a firmware whose data plane is stuck. That was the field
+		# outage: the watchdog kept redialing (attempt 1/3) on a modem that
+		# only the PCIe/MHI re-init could recover. Spend the hard-reset
+		# budget instead.
+		if [ "$cfun_cycles" -ge "$CFUN_BEFORE_RESET" ]; then
+			modem_hard_reset
+			return 0
+		fi
 		do_cfun_cycle
 		case "$?" in
 		0)
 			# Radio confirmed back on; do_cfun_cycle already redialed.
+			cfun_cycles=$((cfun_cycles + 1))
 			;;
 		1)
 			# CFUN cooldown still active - the radio is presumed fine,
@@ -816,7 +842,7 @@ while :; do
 		# That made the radio power-cycle escalation effectively
 		# unreachable via this path - only the grace-timeout fast path in
 		# the main loop could ever trigger it.
-		[ "$traffic_state" = "2" ] || failed_cycles=0
+		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; }
 		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
