@@ -1,0 +1,271 @@
+#!/bin/sh
+#
+# gl-cellular-mhi-reset: recover and tune the RM520N-GL's PCIe/MHI data path.
+#
+# The escalation in gl-cellular-boot-redial goes, cheapest first:
+#
+#   1. ifdown/ifup wwan          host-side QMI session only
+#   2. gl-cellular-rat fallback  LTE-only, plus a redial
+#   3. gl-cellular-mhi-reset     the MHI controller / QMAP channels (this)
+#   4. AT+CFUN=0/1               modem radio
+#   5. gl-cellular-modem-reset   full PCIe function remove + rescan
+#   6. reboot                    last resort
+#
+# Step 3 exists because step 5 is a blunt instrument: it tears the PCIe
+# function out from under the modem, which re-runs the whole boot protocol and
+# costs 30s+ of hard downtime plus a fresh registration every time. But most of
+# what actually wedges is narrower than that - the QMAP receive ring runs out of
+# TREs and never refills, the transmit queue stops being woken by completions,
+# or the MHI core itself wedges - and all of that is recoverable in place:
+#
+#   /sys/kernel/debug/mhi_q/mhi_netdev/<dir>/reset
+#       mhi_netdev_debugfs_trigger_reset(): enabled=false, napi_disable(),
+#       mhi_unprepare_from_transfer(), mhi_netdev_dealloc() (frees the RX
+#       buffers), then mhi_netdev_enable_iface() which re-prepares the channels
+#       and re-queues fresh RX buffers. The receive ring comes back rebuilt.
+#
+#   /sys/kernel/debug/mhi_q/<node>/reset
+#       mhi_debugfs_trigger_reset(): waits for M0, drives MHI_RESET, destroys
+#       and recreates every child device, flushes all workers and re-runs the
+#       ready-state transition. The controller-level equivalent of re-plugging
+#       the modem, without touching PCIe and without losing registration.
+#
+# debugfs is mounted on demand rather than left mounted: several of these
+# entries are 0644/0444 and let a local user corrupt the driver's own counters
+# or force a modem reset, so there is no reason to expose them outside a
+# recovery action.
+#
+# Commands
+#   tune     apply bring-up-time MHI tuning and exit. Cheap, takes no lock and
+#            needs no debugfs. Called from the pci hotplug bind handler so the driver's transition timeout is right from the
+#            first data call rather than only after a recovery that was too
+#            late to have prevented anything.
+#   reset    the recovery action. Serialised against redials, settings-driven
+#            reconnects and the PCIe hard reset. Returns 0 if traffic came
+#            back, 1 if it did not (or the reset was not possible), so the
+#            caller can continue up the ladder.
+
+TAG=gl-cellular-mhi-reset
+NET_LOCK=/var/run/gl-net-reconfig.lock
+
+# How long to wait for the QMAP netdev to start passing traffic before calling
+# a reset a failure. The interface reappears almost immediately; the modem
+# needs a moment to refill it.
+SETTLE_SEC=${MHI_RESET_SETTLE_SEC:-20}
+
+DEBUGFS=/sys/kernel/debug
+
+mounted_debugfs=0
+
+mount_debugfs() {
+	[ -d "$DEBUGFS/mhi_q" ] && return 0
+	# OpenWrt normally has debugfs mounted already (BusyBox here has no
+	# mountpoint applet, hence /proc/mounts).
+	grep -q " $DEBUGFS debugfs " /proc/mounts && return 1
+	mkdir -p "$DEBUGFS" 2>/dev/null
+	mount -t debugfs none "$DEBUGFS" 2>/dev/null || return 1
+	mounted_debugfs=1
+	# No debugfs support at all, or the driver is not bound: unmount again
+	# rather than leave an empty debugfs mounted.
+	if [ ! -d "$DEBUGFS/mhi_q" ]; then
+		umount "$DEBUGFS" 2>/dev/null
+		mounted_debugfs=0
+		return 1
+	fi
+	return 0
+}
+
+umount_debugfs() {
+	[ "$mounted_debugfs" = "1" ] || return 0
+	umount "$DEBUGFS" 2>/dev/null
+	mounted_debugfs=0
+}
+
+reset_netdev() {
+	local d
+	# mhi_netdev's debugfs dir is created inside the controller's mhi_q one
+	for d in "$DEBUGFS"/mhi_q/mhi_netdev/*; do
+		[ -e "$d/reset" ] || continue
+		logger -p daemon.notice -t "$TAG" "resetting QMAP channels via ${d##*/}"
+		echo 1 > "$d/reset" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+reset_controller() {
+	local d
+	for d in "$DEBUGFS"/mhi_q/*; do
+		[ -e "$d/reset" ] || continue
+		logger -p daemon.notice -t "$TAG" "resetting MHI controller via ${d##*/}"
+		echo 1 > "$d/reset" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+# 3000ms is the driver's default for every wait_event_timeout() and
+# wait_for_completion_timeout() in the MHI state machine. Under sustained load
+# on a marginal cell a channel start or state transition can legitimately take
+# longer than that, and timing out is what turns a slow transition into a
+# wedged one. timeout_ms is a sysfs attribute of the controller's own device on
+# the mhi_q bus (mhi_qti.c's mhi_group), not a debugfs entry.
+raise_timeout_ms() {
+	local d v
+	v="$(uci -q get gl-cellular.watchdog.mhi_timeout_ms)"
+	[ -n "$v" ] || v=10000
+	[ "$v" -gt 0 ] 2>/dev/null || return 0
+	for d in /sys/bus/mhi_q/devices/*; do
+		[ -w "$d/timeout_ms" ] || continue
+		[ "$(cat "$d/timeout_ms" 2>/dev/null)" = "$v" ] && continue
+		if echo "$v" > "$d/timeout_ms" 2>/dev/null; then
+			logger -p daemon.notice -t "$TAG" \
+				"MHI transition timeout raised to ${v}ms (${d##*/})"
+		fi
+	done
+}
+
+# Anything answering on the QMAP path? The bearer's own DNS server goes first,
+# but carrier resolvers often drop ICMP, so public anycast addresses back it
+# up - a resolver that ignores ping must not turn a working reset into an
+# escalation. 4s per probe: handover RTTs of ~3s have been measured here.
+data_path_alive() {
+	local dev t
+	dev="$(ubus -t 3 call network.interface.wwan status 2>/dev/null |
+		jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ -n "$dev" ] || return 1
+	[ "$(cat "/sys/class/net/$dev/operstate" 2>/dev/null)" = "up" ] || return 1
+	for t in $(bearer_dns) 1.1.1.1 8.8.8.8; do
+		ping -I "$dev" -c 1 -W 4 "$t" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+bearer_dns() {
+	ubus -t 3 call network.interface.wwan_4 status 2>/dev/null |
+		jsonfilter -e '@["dns-server"][0]' 2>/dev/null
+}
+
+# wait_for_traffic <label> [seconds]
+wait_for_traffic() {
+	local label="$1" limit="${2:-$SETTLE_SEC}" waited=0
+	while [ "$waited" -lt "$limit" ]; do
+		if data_path_alive; then
+			logger -p daemon.notice -t "$TAG" \
+				"$label restored traffic after ${waited}s"
+			return 0
+		fi
+		sleep 2
+		waited=$((waited + 2))
+	done
+	return 1
+}
+
+# The controller reset destroys and re-creates /dev/mhi_QMI0 and the QMAP
+# netdevs, so wait for them before redialling.
+wait_for_device() {
+	local i=0
+	while [ "$i" -lt "$1" ]; do
+		[ -c /dev/mhi_QMI0 ] && [ -e /sys/class/net/rmnet_mhi0.1 ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# An in-place reset rebuilds the QMAP channels underneath the running QMI WDS
+# session, which the modem may then tear down on its own. So a reset can leave
+# the interface down rather than dead - check for that and redial, rather than
+# reporting failure and letting the caller escalate straight past a session that
+# only needed re-establishing.
+redial_if_down() {
+	local up tries
+	up="$(ubus -t 3 call network.interface.wwan status 2>/dev/null |
+		jsonfilter -e '@.up' 2>/dev/null)"
+	[ "$up" = "true" ] && return 1
+	[ "$(uci -q get network.wwan.auto)" = "0" ] && return 1
+	[ "$(uci -q get network.wwan.disabled)" = "1" ] && return 1
+	logger -p daemon.notice -t "$TAG" \
+		"data path reset left wwan down; redialling"
+	ifdown wwan >/dev/null 2>&1
+	# Poll attach rather than guessing a delay: an APN-only change leaves the
+	# radio already attached, a real radio change has to rescan.
+	tries=0
+	while [ "$tries" -lt 20 ]; do
+		[ "$(ubus -t 3 call cellular.at command \
+			'{"cmd":"AT+CGATT?","timeout":3}' 2>/dev/null |
+			jsonfilter -e '@.response' 2>/dev/null |
+			grep -oE '\+CGATT: 1')" ] && break
+		tries=$((tries + 1))
+		sleep 1
+	done
+	ifup wwan >/dev/null 2>&1
+	return 0
+}
+
+cmd_tune() {
+	raise_timeout_ms
+	return 0
+}
+
+cmd_reset() {
+	local tries=0
+
+	# Serialised against redials, settings-driven reconnects and the PCIe
+	# hard reset, so two recoveries can never interleave on the same
+	# interface.
+	exec 9>"$NET_LOCK" || return 1
+	until flock -n 9; do
+		tries=$((tries + 1))
+		[ "$tries" -ge 15 ] && return 1
+		sleep 1
+	done
+
+	mount_debugfs || {
+		logger -p daemon.warning -t "$TAG" \
+			"debugfs unavailable; skipping in-place MHI reset"
+		return 1
+	}
+	# debugfs is only ever mounted on demand here, so it must come back down
+	# on every exit path - including an early `return 0` from
+	# wait_for_traffic.
+	trap umount_debugfs EXIT
+	trap 'exit 1' INT TERM
+
+	raise_timeout_ms
+
+	# Channels first: cheaper, and it is the layer that actually starves -
+	# the RX ring and the TX queue live here. It leaves /dev/mhi_QMI0 and
+	# with it quectel-CM's WDS session alone. If that alone restores traffic
+	# there is no reason to reset the controller out from under a live modem.
+	if reset_netdev; then
+		sleep 3
+		wait_for_traffic "QMAP channel reset" && return 0
+		if redial_if_down; then
+			wait_for_traffic "QMAP channel reset plus redial" 60 && return 0
+		fi
+		logger -p daemon.notice -t "$TAG" \
+			"QMAP channel reset did not restore traffic; escalating to the MHI controller"
+	fi
+
+	# One action at a time: the controller reset takes the QMI device and
+	# the netdevs away, so the redial only happens once they are back.
+	if reset_controller; then
+		wait_for_device 30
+		redial_if_down || { ifup wwan >/dev/null 2>&1; }
+		wait_for_traffic "MHI controller reset" 90 && return 0
+	fi
+
+	logger -p daemon.warning -t "$TAG" \
+		"in-place MHI reset did not restore traffic"
+	return 1
+}
+
+case "${1:-reset}" in
+tune)  cmd_tune ;;
+reset) cmd_reset ;;
+*)
+	echo "usage: $(basename "$0") {tune|reset}" >&2
+	exit 1
+	;;
+esac
+
+exit $?

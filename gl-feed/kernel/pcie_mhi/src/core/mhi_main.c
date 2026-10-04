@@ -237,11 +237,11 @@ int mhi_queue_nop(struct mhi_device *mhi_dev,
 static void mhi_add_ring_element(struct mhi_controller *mhi_cntrl,
 				 struct mhi_ring *ring)
 {
-	void *wp = ring->wp;
+	void *wp = READ_ONCE(ring->wp);
 	wp += ring->el_size;
 	if (wp >= (ring->base + ring->len))
 		wp = ring->base;
-	ring->wp = wp;
+	WRITE_ONCE(ring->wp, wp);
 	/* smp update */
 	smp_wmb();
 }
@@ -249,11 +249,15 @@ static void mhi_add_ring_element(struct mhi_controller *mhi_cntrl,
 static void mhi_del_ring_element(struct mhi_controller *mhi_cntrl,
 				 struct mhi_ring *ring)
 {
-	void *rp = ring->rp;
+	void *rp = READ_ONCE(ring->rp);
 	rp += ring->el_size;
 	if (rp >= (ring->base + ring->len))
 		rp = ring->base;
-	ring->rp = rp;
+	/* Release: the consumer's reads of the retired element must complete
+	 * before the producer can see the slot as free and overwrite it.
+	 * Pairs with the acquire in get_nr_avail_ring_elements().
+	 */
+	smp_store_release(&ring->rp, rp);
 	/* smp update */
 	smp_wmb();
 }
@@ -261,13 +265,16 @@ static void mhi_del_ring_element(struct mhi_controller *mhi_cntrl,
 static int get_nr_avail_ring_elements(struct mhi_controller *mhi_cntrl,
 				      struct mhi_ring *ring)
 {
+	void *wp = READ_ONCE(ring->wp);
+	/* Pairs with smp_store_release() in mhi_del_ring_element(). */
+	void *rp = smp_load_acquire(&ring->rp);
 	int nr_el;
 
-	if (ring->wp < ring->rp)
-		nr_el = ((ring->rp - ring->wp) / ring->el_size) - 1;
+	if (wp < rp)
+		nr_el = ((rp - wp) / ring->el_size) - 1;
 	else {
-		nr_el = (ring->rp - ring->base) / ring->el_size;
-		nr_el += ((ring->base + ring->len - ring->wp) /
+		nr_el = (rp - ring->base) / ring->el_size;
+		nr_el += ((ring->base + ring->len - wp) /
 			  ring->el_size) - 1;
 	}
 	return nr_el;
@@ -302,14 +309,14 @@ static void mhi_recycle_ev_ring_element(struct mhi_controller *mhi_cntrl,
 	void *rp, *wp;
 
 	/* update the WP */
-	wp = ring->wp;
+	wp = READ_ONCE(ring->wp);
 	wp += ring->el_size;
 	if (wp >= (ring->base + ring->len)) {
 		wp = ring->base;
 	}
-	ring->wp = wp;
+	WRITE_ONCE(ring->wp, wp);
 
-	*ring->ctxt_wp = ring->iommu_base + (ring->wp - ring->base);
+	*ring->ctxt_wp = ring->iommu_base + (wp - ring->base);
 
 	/* update the RP */
 	rp = ring->rp;
@@ -470,7 +477,7 @@ int mhi_queue_skb(struct mhi_device *mhi_dev,
 	}
 
 	/* generate the tre */
-	buf_info = buf_ring->wp;
+	buf_info = READ_ONCE(buf_ring->wp);
 	buf_info->v_addr = skb->data;
 	buf_info->cb_buf = skb;
 	buf_info->wp = tre_ring->wp;
@@ -480,7 +487,7 @@ int mhi_queue_skb(struct mhi_device *mhi_dev,
 	if (ret)
 		goto map_error;
 
-	mhi_tre = tre_ring->wp;
+	mhi_tre = READ_ONCE(tre_ring->wp);
 
 	mhi_tre->ptr = MHI_TRE_DATA_PTR(buf_info->p_addr);
 	mhi_tre->dword[0] = MHI_TRE_DATA_DWORD0(buf_info->len);
@@ -577,7 +584,7 @@ int mhi_queue_dma(struct mhi_device *mhi_dev,
 	}
 
 	/* generate the tre */
-	buf_info = buf_ring->wp;
+	buf_info = READ_ONCE(buf_ring->wp);
 	MHI_ASSERT(buf_info->used, "TRE Not Freed\n");
 	buf_info->p_addr = mhi_buf->dma_addr;
 	buf_info->pre_mapped = true;
@@ -586,7 +593,7 @@ int mhi_queue_dma(struct mhi_device *mhi_dev,
 	buf_info->dir = mhi_chan->dir;
 	buf_info->len = len;
 
-	mhi_tre = tre_ring->wp;
+	mhi_tre = READ_ONCE(tre_ring->wp);
 
 	if (mhi_chan->xfer_type == MHI_XFER_RSC_DMA) {
 		buf_info->used = true;
@@ -651,7 +658,7 @@ int mhi_gen_tre(struct mhi_controller *mhi_cntrl,
 	buf_ring = &mhi_chan->buf_ring;
 	tre_ring = &mhi_chan->tre_ring;
 
-	buf_info = buf_ring->wp;
+	buf_info = READ_ONCE(buf_ring->wp);
 	buf_info->v_addr = buf;
 	buf_info->cb_buf = cb;
 	buf_info->wp = tre_ring->wp;
@@ -667,7 +674,7 @@ int mhi_gen_tre(struct mhi_controller *mhi_cntrl,
 	chain = !!(flags & MHI_CHAIN);
 	bei = !!(mhi_chan->intmod);
 
-	mhi_tre = tre_ring->wp;
+	mhi_tre = READ_ONCE(tre_ring->wp);
 	mhi_tre->ptr = MHI_TRE_DATA_PTR(buf_info->p_addr);
 	mhi_tre->dword[0] = MHI_TRE_DATA_DWORD0(buf_len);
 	mhi_tre->dword[1] = MHI_TRE_DATA_DWORD1(bei, eot, eob, chain);
@@ -1114,6 +1121,12 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 	else
 		read_lock_bh(&mhi_chan->lock);
 
+	/*
+	 * Completions for a disabled channel are dropped on purpose: every
+	 * path that disables a channel (__mhi_unprepare_channel) goes on to
+	 * mhi_reset_chan(), which marks the channel's pending events stale and
+	 * drains the whole ring through the client's own xfer_cb.
+	 */
 	if (mhi_chan->ch_state != MHI_CH_STATE_ENABLED)
 		goto end_process_tx_event;
 
@@ -1141,7 +1154,7 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 		result.dir = mhi_chan->dir;
 
 		/* local rp */
-		local_rp = tre_ring->rp;
+		local_rp = READ_ONCE(tre_ring->rp);
 		while (local_rp != dev_rp) {
 			buf_info = buf_ring->rp;
 			/* Always get the get len from the event */
@@ -1173,7 +1186,7 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 #endif
 			mhi_del_ring_element(mhi_cntrl, buf_ring);
 			mhi_del_ring_element(mhi_cntrl, tre_ring);
-			local_rp = tre_ring->rp;
+			local_rp = READ_ONCE(tre_ring->rp);
 
 			/* notify client */
 			mhi_chan->xfer_cb(mhi_chan->mhi_dev, &result);
@@ -1366,7 +1379,7 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 	}
 
 	dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
-	local_rp = ev_ring->rp;
+	local_rp = READ_ONCE(ev_ring->rp);
 
 	while (dev_rp != local_rp) {
 		enum MHI_PKT_TYPE type = MHI_TRE_GET_EV_TYPE(local_rp);
@@ -1498,7 +1511,7 @@ int mhi_process_ctrl_ev_ring(struct mhi_controller *mhi_cntrl,
 #endif
 
 		mhi_recycle_ev_ring_element(mhi_cntrl, ev_ring);
-		local_rp = ev_ring->rp;
+		local_rp = READ_ONCE(ev_ring->rp);
 		dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
 		count++;
 	}
@@ -1538,7 +1551,7 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 	}
 
 	dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
-	local_rp = ev_ring->rp;
+	local_rp = READ_ONCE(ev_ring->rp);
 
 	while (dev_rp != local_rp && event_quota > 0) {
 		enum MHI_PKT_TYPE type = MHI_TRE_GET_EV_TYPE(local_rp);
@@ -1566,7 +1579,7 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 
 		chan_count += get_used_ring_elements(chan_local_rp, mhi_chan->tre_ring.rp, mhi_chan->tre_ring.elements);
 		mhi_recycle_ev_ring_element(mhi_cntrl, ev_ring);
-		local_rp = ev_ring->rp;
+		local_rp = READ_ONCE(ev_ring->rp);
 		if (local_rp == dev_rp || event_quota == 0) {
 			if (chan_count > mhi_chan->used_elements)
 				mhi_chan->used_elements = chan_count;
@@ -1611,7 +1624,7 @@ int mhi_process_tsync_event_ring(struct mhi_controller *mhi_cntrl,
 	}
 
 	dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
-	local_rp = ev_ring->rp;
+	local_rp = READ_ONCE(ev_ring->rp);
 
 	while (dev_rp != local_rp) {
 		enum MHI_PKT_TYPE type = MHI_TRE_GET_EV_TYPE(local_rp);
@@ -1653,7 +1666,7 @@ int mhi_process_tsync_event_ring(struct mhi_controller *mhi_cntrl,
 		} while (true);
 
 		mhi_recycle_ev_ring_element(mhi_cntrl, ev_ring);
-		local_rp = ev_ring->rp;
+		local_rp = READ_ONCE(ev_ring->rp);
 		dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
 		count++;
 	}
@@ -2059,7 +2072,7 @@ static void mhi_mark_stale_events(struct mhi_controller *mhi_cntrl,
 	spin_lock_irqsave(&mhi_event->lock, flags);
 	dev_rp = mhi_to_virtual(ev_ring, er_ctxt->rp);
 
-	local_rp = ev_ring->rp;
+	local_rp = READ_ONCE(ev_ring->rp);
 	while (dev_rp != local_rp) {
 		if (MHI_TRE_GET_EV_TYPE(local_rp) ==
 		    MHI_PKT_TYPE_TX_EVENT &&
@@ -2087,7 +2100,7 @@ static void mhi_reset_data_chan(struct mhi_controller *mhi_cntrl,
 	tre_ring = &mhi_chan->tre_ring;
 	result.transaction_status = -ENOTCONN;
 	result.bytes_xferd = 0;
-	while (tre_ring->rp != tre_ring->wp) {
+	while (READ_ONCE(tre_ring->rp) != READ_ONCE(tre_ring->wp)) {
 		struct mhi_buf_info *buf_info = buf_ring->rp;
 
 		if (mhi_chan->dir == DMA_TO_DEVICE) {
@@ -2398,6 +2411,8 @@ int mhi_prepare_for_transfer(struct mhi_device *mhi_dev)
 		}
 	}
 
+	atomic_inc(&mhi_cntrl->xfer_paths);
+
 	return 0;
 
 error_open_chan:
@@ -2432,6 +2447,8 @@ void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
 			break;
 		}
 	}
+
+	atomic_dec_if_positive(&mhi_cntrl->xfer_paths);
 }
 EXPORT_SYMBOL(mhi_unprepare_from_transfer);
 

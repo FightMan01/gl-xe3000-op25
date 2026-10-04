@@ -333,6 +333,35 @@ local function all_qeng_lines(resp)
 	return out
 end
 
+-- <tx_power> and <srxlev> off the tail of a "+QENG:" serving-cell line.
+--
+-- Quectel RM5x0N AT manual, serving-cell field order:
+--   LTE-only:  "servingcell",<state>,"LTE",<duplex>,<mcc>,<mnc>,<cellid>,<pcid>,
+--              <earfcn>,<band>,<ul_bw>,<dl_bw>,<tac>,<rsrp>,<rsrq>,<rssi>,
+--              <sinr>,<cqi>,<tx_power>,<srxlev>      -> indices 19 and 20
+--   NSA:       "LTE","FDD",... same fields with no "servingcell"/state prefix
+--                                              -> indices 17 and 18
+-- Units: tx_power is 1/10 dBm (235 -> 23.5 dBm) and reads "-" while idle,
+-- srxlev is dB. The NR5G-NSA/SA lines carry neither.
+--
+-- Worth surfacing rather than discarding. There is no writable TX power on this
+-- module - the RM5x0N AT manual has no AT+QCFG="tx_power" and no antenna
+-- switcher, and the hardware envelope is 23 dBm +/-2 (Class 3), 26 dBm
+-- +2/-3 on the HPUE bands n38/40/41/77/78/79 - so the only question worth
+-- asking is what the modem's closed loop is actually doing, and it is not
+-- "max": at idle the radio deliberately sits near minimum output and only
+-- rises to the network's requested power while transmitting. A reading of a
+-- couple of dBm while the link is idle is therefore correct, not a fault, and
+-- the number to watch is the one sampled under load.
+local function qeng_tx_power(v)
+	local n = tonumber(v)
+	return n and n / 10 or nil
+end
+
+local function qeng_srxlev(v)
+	return tonumber(v)
+end
+
 -- See modem.lua's get_serving_cell() for the full field-mapping rationale
 -- - ported here since gl-cellular-atd can't require "gloui.at"/modem.lua
 -- directly (different Lua runtime). LTE-only mode is one combined
@@ -357,6 +386,8 @@ local function serving_cell_snapshot()
 					and (BANDWIDTH_MHZ[tonumber(fields[12])] .. 'MHz'),
 				rsrp = tofloat(tonumber(fields[14])), rsrq = tofloat(tonumber(fields[15])),
 				rssi = tofloat(tonumber(fields[16])), sinr = tofloat(tonumber(fields[17])),
+				tx_power = qeng_tx_power(fields[19]),
+				srxlev = qeng_srxlev(fields[20]),
 			}
 		end
 		return { mode = rat }
@@ -376,6 +407,8 @@ local function serving_cell_snapshot()
 				and (BANDWIDTH_MHZ[tonumber(fields[10])] .. 'MHz')
 			result.rsrp = tofloat(tonumber(fields[12])); result.rsrq = tofloat(tonumber(fields[13]))
 			result.rssi = tofloat(tonumber(fields[14])); result.sinr = tofloat(tonumber(fields[15]))
+			result.tx_power = qeng_tx_power(fields[17])
+			result.srxlev = qeng_srxlev(fields[18])
 		elseif fields[1] == 'NR5G-NSA' or fields[1] == 'NR5G-SA' then
 			result = result or {}
 			if fields[1] == 'NR5G-SA' then result.mode = '5G SA' end

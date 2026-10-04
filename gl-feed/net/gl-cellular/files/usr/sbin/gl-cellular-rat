@@ -1,0 +1,182 @@
+#!/bin/sh
+#
+# gl-cellular-rat: choose which radio technologies the modem is allowed to
+# camp on, and hold that choice across the dial that follows.
+#
+# Why this exists
+# ---------------
+# Under NSA the modem registers LTE first and adds a 5G secondary node on top
+# (Quectel's own "5G Network Searching Scheme" doc: "In NSA network
+# registration, LTE is registered first, and then 5G cell is added"). A handset
+# and an RM520N-GL sitting on the same eNB can therefore end up with materially
+# different radio behaviour, and in a congested cell - a train full of people -
+# the NR leg is the fragile one. When the secondary node drops, the whole
+# bearer goes with it. Forcing LTE-only trades peak throughput for a bearer
+# that does not get torn down underneath you, which is the right trade for a
+# backup uplink and the wrong one for a primary.
+#
+# So this does not pick for you: it makes the choice explicit, sticky and
+# reversible, and it can fall back to LTE on its own when the data path keeps
+# failing (see the watchdog's mhi/nr backoff), then put itself back.
+#
+# Commands
+#   apply            reconcile the modem with the configured preference. Called
+#                    from the qcm proto before every dial, so a policy change
+#                    takes effect on the next dial rather than the next reboot.
+#   show             print the effective preference and the modem's answer.
+#   restore          drop any fallback and go back to the configured
+#                    preference. Used by the watchdog once the link has been
+#                    stable again.
+#
+# Configuration (gl-cellular.rat)
+#   mode_pref  AUTO | LTE | LTE:NR5G | NR5G | WCDMA
+#       The standing preference. AUTO means "let the modem decide", which is
+#       what it does out of the box. Default: AUTO.
+#       Maps straight onto AT+QNWPREFCFG="mode_pref", and this is the exact
+#       command sequence GL's own stock cellular manager uses in
+#       lib/functions/modem.sh's set_5G_mode()/set_5G_mode_mask()/
+#       set_network_mode() - so there is no guesswork about which token is
+#       accepted or in what order.
+#   fallback_pref
+#       What the watchdog falls back to. Default: LTE.
+#   The fallback itself is switched and timed by gl-cellular.watchdog's
+#   lte_fallback, lte_fallback_after and lte_fallback_hold_sec.
+#
+# The fallback lives only in tmpfs. After a power loss mid-fallback the first
+# dial's `apply` finds no state file and writes the configured preference
+# back, so the modem's NVM never stays LTE-only across a reboot.
+#
+# Note on AT+QNWPREFCFG="rat_acq_order",LTE:NR5G:WCDMA
+#   That is the more surgical knob - it keeps 5G available but stops the modem
+#   camping on NR first when LTE would serve - and it is what a phone does.
+#   It is deliberately NOT used here: the manual says it only takes effect
+#   after the module reboots and that it is written to NVM, so every change
+#   would cost a full modem re-registration. mode_pref is a live preference.
+#   If you want the acq-order behaviour and can live with the re-registration,
+#   set it once by hand:
+#       AT+QNWPREFCFG="rat_acq_order",LTE:NR5G:WCDMA
+#       AT+CFUN=0 / AT+CFUN=1
+
+TAG=gl-cellular-rat
+STATE=/var/run/gl-cellular-rat.state
+
+opt() {
+	local val
+	val="$(uci -q get gl-cellular.rat.$1)"
+	echo "${val:-$2}"
+}
+
+at() {
+	ubus -t 8 call cellular.at command \
+		"{\"cmd\":\"$1\",\"timeout\":6}" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null
+}
+
+# Validate before sending: mode_pref rejects an unknown token, and writing NVM
+# with a typo is not something to discover from a modem that will not camp.
+valid_pref() {
+	case "$1" in
+	AUTO|LTE|LTE:NR5G|NR5G|WCDMA) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+set_pref() {
+	local want="$1" have
+
+	valid_pref "$want" || {
+		logger -p daemon.err -t "$TAG" \
+			"refusing unknown mode_pref '$want' (want AUTO, LTE, LTE:NR5G, NR5G or WCDMA)"
+		return 1
+	}
+
+	have="$(current_pref)"
+	[ "$have" = "$want" ] && return 0
+
+	case "$(at "AT+QNWPREFCFG=\"mode_pref\",$want")" in
+	*OK*)
+		# nr5g_disable_mode is a separate NVM setting GL keeps in step
+		# with mode_pref. Leaving it behind a mode_pref change is how you
+		# end up asking for NR5G while the modem still has NR disabled,
+		# which presents as "modem claims NR5G but only ever camps on
+		# LTE". Pair them the same way stock's set_5G_mode() does: 0 when
+		# NR is permitted, 1 when only NSA is, 2 when only SA is.
+		case "$want" in
+		AUTO|NR5G) at 'AT+QNWPREFCFG="nr5g_disable_mode",0' >/dev/null ;;
+		LTE:NR5G)  at 'AT+QNWPREFCFG="nr5g_disable_mode",1' >/dev/null ;;
+		esac
+		logger -p daemon.notice -t "$TAG" \
+			"mode_pref ${have:-unknown} -> $want"
+		return 0
+		;;
+	*)
+		logger -p daemon.err -t "$TAG" \
+			"modem rejected mode_pref $want (it reports '${have:-unknown}')"
+		return 1
+		;;
+	esac
+}
+
+configured_pref() {
+	opt mode_pref AUTO
+}
+
+current_pref() {
+	at 'AT+QNWPREFCFG="mode_pref"' | tr -d '\r' |
+		sed -n 's/.*"mode_pref",\([^)]*\).*/\1/p' | head -n1
+}
+
+# Read the fallback the watchdog may have left behind. Kept in a file rather
+# than in UCI so it never becomes the user's standing configuration by
+# accident, and so the restore path is a single rm.
+fallback_pref() {
+	[ -f "$STATE" ] && cat "$STATE" 2>/dev/null
+}
+
+cmd_apply() {
+	local fb
+	fb="$(fallback_pref)"
+	if [ -n "$fb" ]; then
+		set_pref "$fb" && return 0
+	fi
+	set_pref "$(configured_pref)"
+}
+
+cmd_restore() {
+	[ -f "$STATE" ] || return 0
+	rm -f "$STATE"
+	set_pref "$(configured_pref)"
+}
+
+# Enter the LTE fallback. Called by the watchdog when the data path has failed
+# repeatedly on a mode that includes 5G.
+cmd_fallback() {
+	local want
+	want="$(opt fallback_pref LTE)"
+	valid_pref "$want" || want=LTE
+	[ "$(current_pref)" = "$want" ] && return 0
+	echo "$want" > "$STATE" 2>/dev/null
+	logger -p daemon.notice -t "$TAG" \
+		"falling back to mode_pref $want for $(uci -q get gl-cellular.watchdog.lte_fallback_hold_sec || echo 900)s after repeated data-path failures"
+	set_pref "$want"
+}
+
+cmd_show() {
+	echo "configured=$(configured_pref)"
+	echo "effective=$(current_pref)"
+	fb="$(fallback_pref)"
+	[ -n "$fb" ] && echo "fallback=$fb"
+	at 'AT+QNWPREFCFG="nr5g_disable_mode"' | tr -d '\r'
+	at 'AT+QENG="servingcell"' | tr -d '\r'
+}
+
+case "${1:-apply}" in
+apply)   cmd_apply ;;
+restore) cmd_restore ;;
+fallback) cmd_fallback ;;
+show)    cmd_show ;;
+*)
+	echo "usage: $(basename "$0") {apply|restore|fallback|show}" >&2
+	exit 1
+	;;
+esac

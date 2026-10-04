@@ -92,7 +92,8 @@ end
 -- os.execute (not io.popen) so the backgrounded reload doesn't leave the
 -- shell's stdout pipe open and spew "Broken pipe" into the log.
 local function restart_mwan3()
-	os.execute("(flock -w 10 9; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
+	-- BusyBox flock has no -w; poll -n for ~10s like the shell scripts do.
+	os.execute("(t=0; until flock -n 9; do t=$((t+1)); [ $t -ge 10 ] && exit 1; sleep 1; done; /etc/init.d/mwan3 restart) 9>/var/run/gl-net-reconfig.lock >/dev/null 2>&1 &")
 end
 
 local function as_list(value)

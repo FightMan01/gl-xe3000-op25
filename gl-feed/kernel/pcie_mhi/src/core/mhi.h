@@ -414,6 +414,14 @@ struct mhi_controller {
 	atomic_t dev_wake;
 	atomic_t alloc_size;
 	atomic_t pending_pkts;
+	/* Number of channels currently started for data transfer. A live
+	 * transfer channel must never see the controller driven into M3, and
+	 * the existing busy checks cannot detect it: dev_wake is left at 0 by
+	 * the WIN-driver-derived mhi_assert_dev_wake(), which is compiled to a
+	 * no-op, and pending_pkts only counts in-flight UL TREs, so it drops
+	 * back to zero on an established but momentarily idle bearer.
+	 */
+	atomic_t xfer_paths;
 	struct list_head transition_list;
 	spinlock_t transition_lock;
 	spinlock_t wlock;

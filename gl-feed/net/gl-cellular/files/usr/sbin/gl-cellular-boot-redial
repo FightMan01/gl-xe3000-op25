@@ -55,6 +55,39 @@ AT_DEAD_TICKS=$(opt at_dead_ticks 3)
 # re-attach) reaches the stuck firmware. Verified on-device: only the
 # PCIe/MHI re-init in gl-cellular-modem-reset brings traffic back.
 CFUN_BEFORE_RESET=$(opt cfun_before_reset 1)
+# In-place MHI data-path reset (gl-cellular-mhi-reset) is the rung between a
+# plain redial and a radio power-cycle. It rebuilds the QMAP channels and, if
+# that is not enough, resets the MHI controller - both through the driver's own
+# debugfs entries, so the modem's registration, SIM state and PCIe link all
+# survive. That is what makes it worth trying before anything that costs a
+# re-attach: the PCIe hard reset below drops the bearer and forces a fresh
+# registration every time, and AT+CFUN=0/1 costs the same.
+#
+# Rate-limited the same way as the other rungs, so a persistently dead data path
+# still progresses to the PCIe reset instead of looping here forever.
+#
+# Off by default (0). Tested on hardware 2026-10-04: the QMAP channel reset
+# completes cleanly, but the RM520N then completes no UL transfers and delivers
+# no DL data until the call is re-established - a working link was left dead.
+# Re-enable only once reset-plus-redial has been shown to bring traffic back.
+MHI_RESET_MAX=$(opt mhi_reset_max 0)
+MHI_RESET_WINDOW=$(opt mhi_reset_window_sec 1800)
+# MHI transition timeout, in ms, applied opportunistically when the recovery
+# script can reach the driver's debugfs node. The driver's default is 3000ms
+# for every wait in the MHI state machine, which is tight enough that a slow
+# channel start under load turns into a timed-out one. 0 disables.
+MHI_TIMEOUT_MS=$(opt mhi_timeout_ms 10000)
+# Drop to LTE-only after this many data-path failures that needed more than a
+# plain redial, and stay there for LTE_FALLBACK_HOLD seconds. On by default:
+# under NSA the modem camps LTE and adds a 5G secondary node, and in a
+# congested cell the secondary leg is the fragile one - when it drops, the whole
+# bearer goes with it, which is the failure this watchdog keeps rediscovering.
+# LTE-only is slower at the top end and much harder to lose. Restored
+# automatically once the link has been good for the hold window, so a genuinely
+# 5G-capable location is not stuck on LTE. Set lte_fallback=0 to pin it off.
+LTE_FALLBACK=$(opt lte_fallback 1)
+LTE_FALLBACK_AFTER=$(opt lte_fallback_after 2)
+LTE_FALLBACK_HOLD=$(opt lte_fallback_hold_sec 900)
 # Hard resets (PCIe/MHI re-init) allowed inside the window before giving up.
 MODEM_RESET_MAX=$(opt modem_reset_max 3)
 MODEM_RESET_WINDOW=$(opt modem_reset_window_sec 3600)
@@ -78,6 +111,10 @@ nosignal_ticks=0
 at_dead=0
 reset_count=0
 reset_window_start=0
+mhi_reset_count=0
+mhi_reset_window_start=0
+lte_fallback_count=0
+lte_fallback_since=0
 
 # mwan3track fires ACTION=disconnecting/disconnected on wwan_4 the moment
 # its own ping tracking flips away from online - well before its own
@@ -341,9 +378,17 @@ https_confirms() {
 }
 
 log_diag() {
-	local dev="$1"
+	local dev="$1" qeng
+	# The RF picture matters as much as the IP picture here. A stall while
+	# RSRP/SINR are healthy is a host/driver problem; a stall while SINR is
+	# negative or the serving band changed is the radio, and the two need
+	# completely different fixes. Without this line a field log records
+	# "stalled, cgatt=1, cgpaddr=..." and nothing about the conditions that
+	# actually produced it.
+	qeng="$(at_query 'AT+QENG="servingcell"' | tr -d '\r' | grep '^ *+QENG' | \
+		sed 's/^+QENG: *//; s/"//g' | tr '\n' '|')"
 	logger -p daemon.warning -t "$TAG" \
-		"stalled, device=$dev cgatt=[$(modem_attached)] cgpaddr=[$(modem_ip)]"
+		"stalled, device=$dev cgatt=[$(modem_attached)] cgpaddr=[$(modem_ip)] mode_pref=[$(at_query 'AT+QNWPREFCFG="mode_pref"' | tr -d '\r\n')] rf=[$qeng]"
 }
 
 # Mirrors GL's own stock cellular_manager (fix_ip_type_before_dial,
@@ -511,6 +556,87 @@ do_redial() {
 	return 0
 }
 
+# Stop using 5G for a while. See LTE_FALLBACK's own comment for why; the
+# policy itself lives in gl-cellular-rat so the same mode_pref command
+# sequence GL's stock cellular manager uses is the only thing that ever writes
+# to the modem. Returns 0 only if it switched the modem on this call, so the
+# caller can spend the tick on it; 1 if it did nothing.
+lte_fallback_enter() {
+	[ "$LTE_FALLBACK" = "1" ] || return 1
+	lte_fallback_count=$((lte_fallback_count + 1))
+	[ "$lte_fallback_count" -ge "$LTE_FALLBACK_AFTER" ] || return 1
+	[ -f /var/run/gl-cellular-rat.state ] && return 1
+	/usr/sbin/gl-cellular-rat fallback
+	# fallback writes no state when the modem is already on that mode
+	[ -f /var/run/gl-cellular-rat.state ] || return 1
+	lte_fallback_since="$(date +%s)"
+	return 0
+}
+
+# Put the modem back on its configured preference once the link has actually
+# been good for the hold window. Checked on the good path rather than from a
+# timer, so it costs nothing while things are broken and cannot be starved by
+# the recovery loop.
+lte_fallback_release() {
+	local now
+	[ "$LTE_FALLBACK" = "1" ] || return 0
+	[ "$lte_fallback_since" -gt 0 ] || return 0
+	[ -f /var/run/gl-cellular-rat.state ] || { lte_fallback_since=0; return 0; }
+	now="$(date +%s)"
+	[ $((now - lte_fallback_since)) -ge "$LTE_FALLBACK_HOLD" ] || return 0
+	logger -p daemon.notice -t "$TAG" \
+		"data path stable for $((now - lte_fallback_since))s; restoring the configured RAT preference"
+	/usr/sbin/gl-cellular-rat restore
+	lte_fallback_since=0
+	lte_fallback_count=0
+}
+
+# Rebuild the modem's PCIe/MHI data path in place. Cheaper than anything else
+# past a redial and, unlike it, it does not cost the registration: the QMAP
+# channels are rebuilt (and, failing that, the MHI controller is reset) through
+# the driver's own debugfs entries, with the modem still attached. Returns 0 if
+# the data path came back, 1 if the reset ran but did not help, 2 if it did not
+# run at all (budget spent). Only 2 lets the caller move up the ladder on the
+# same tick: a reset that ran may have just redialled.
+#
+# Rate-limited inside MHI_RESET_WINDOW, so a data path that is genuinely gone
+# still reaches the PCIe hard reset instead of being reset here indefinitely.
+mhi_path_reset() {
+	local now
+	now="$(date +%s)"
+	if [ $((now - mhi_reset_window_start)) -gt "$MHI_RESET_WINDOW" ]; then
+		mhi_reset_window_start=$now
+		mhi_reset_count=0
+	fi
+	if [ "$mhi_reset_count" -ge "$MHI_RESET_MAX" ]; then
+		return 2
+	fi
+	mhi_reset_count=$((mhi_reset_count + 1))
+
+	logger -p daemon.err -t "$TAG" \
+		"data path wedged with the modem still attached; rebuilding the QMAP/MHI path in place (attempt $mhi_reset_count/$MHI_RESET_MAX)"
+	if /usr/sbin/gl-cellular-mhi-reset; then
+		mhi_reset_count=0
+		mhi_reset_window_start=0
+		consec_bad=0
+		failed_cycles=0
+		cfun_cycles=0
+		last_rx=""
+		# Same courtesy a redial gets: the reset (and any redial it
+		# triggered) needs a moment before the loop judges the result.
+		redial_pending=1
+		grace_until=$(( $(date +%s) + GRACE_SEC ))
+		return 0
+	fi
+
+	logger -p daemon.warn -t "$TAG" \
+		"in-place MHI reset did not restore traffic"
+	last_rx=""
+	redial_pending=1
+	grace_until=$(( $(date +%s) + GRACE_SEC ))
+	return 1
+}
+
 # Ground truth for "is the radio actually on", via AT+CFUN? - never trust
 # the SET command's own "OK" echo for this. An "OK" just means the modem
 # accepted the command, not that the radio finished coming back up, and an
@@ -552,6 +678,8 @@ modem_hard_reset() {
 	consec_bad=0
 	failed_cycles=0
 	cfun_cycles=0
+	mhi_reset_count=0
+	mhi_reset_window_start=0
 	redial_count=0
 	window_start=0
 	last_rx=""
@@ -624,11 +752,18 @@ do_cfun_cycle() {
 # against the redial that follows; that's an acceptable trade for a
 # diagnostic line.
 #
-# Never calls do_redial and do_cfun_cycle for the same bad tick: that used
-# to happen whenever this tick's redial pushed failed_cycles up to
-# CFUN_AFTER_CYCLES, which meant do_cfun_cycle's AT+CFUN=0 could land
-# seconds after ifup, killing the radio mid-handshake on the very redial
-# meant to fix things. Decide up front which one this tick gets.
+# Picks exactly one rung per bad tick, cheapest first:
+#   1. redial (host-side QMI session only)
+#   2. in-place QMAP/MHI data-path rebuild, once redials have proven
+#      insufficient - keeps the modem attached
+#   3. AT+CFUN radio power-cycle
+#   4. PCIe/MHI function re-init (last resort before a reboot)
+#
+# Never runs two rungs for the same bad tick: that used to happen whenever
+# this tick's redial pushed failed_cycles up to CFUN_AFTER_CYCLES, which meant
+# do_cfun_cycle's own AT+CFUN=0 could land seconds after ifup, killing the
+# radio mid-handshake on the very redial meant to fix things. Decide up front
+# which one this tick gets.
 # do_cfun_cycle does its own redial internally once AT+CFUN=1 is
 # confirmed and resets failed_cycles itself; if it declines to run
 # (CFUN_COOLDOWN still active, or a previous cycle never confirmed the
@@ -637,6 +772,28 @@ do_cfun_cycle() {
 escalate() {
 	log_diag "$device" &
 	if [ "$((failed_cycles + 1))" -ge "$CFUN_AFTER_CYCLES" ]; then
+		# Before anything destructive, try the one thing that costs no
+		# re-registration at all: stop using 5G. mode_pref is a live
+		# preference, and the redial that goes with it re-runs qcm.sh,
+		# whose attach gate waits for the modem to settle on LTE. That
+		# redial is this tick's rung.
+		if lte_fallback_enter; then
+			do_redial && failed_cycles=$((failed_cycles + 1))
+			return 0
+		fi
+
+		# Redials have not been enough. Try the in-place data-path
+		# rebuild before touching the radio: it is the only rung that
+		# leaves the modem attached, and the failure this ladder exists
+		# for - attached, addressed, DHCP complete, zero packets, AT
+		# fully responsive - is a QMAP/MHI-layer fault, not a radio
+		# fault. Not yet verified on hardware that this reaches the
+		# fault the PCIe/MHI re-init is known to fix. If it ran at all,
+		# that is this tick's rung, even when it failed: it may have
+		# redialled, and an AT+CFUN=0 now would land on that redial.
+		mhi_path_reset
+		[ "$?" -eq 2 ] || return 0
+
 		# A CFUN power-cycle already ran since the last confirmed-good tick
 		# and traffic never came back. The AT port is answering (otherwise
 		# the silent-AT path would have hard-reset already), so
@@ -711,6 +868,15 @@ while :; do
 			# a second redial, let alone a radio power-cycle, even gets a
 			# chance to run.
 			redial_pending=0
+			# Still down because there is no coverage is not a fault:
+			# qcm.sh's attach gate keeps the interface down in a dead
+			# zone on purpose. Hand over to the no-signal wait below.
+			if [ "$(modem_attached)" = "0" ]; then
+				logger -t "$TAG" \
+					"interface still down ${GRACE_SEC}s after a redial, but there is no attach; waiting for signal"
+				do_sleep "$CHECK_PERIOD"
+				continue
+			fi
 			logger -p daemon.warning -t "$TAG" \
 				"interface still down ${GRACE_SEC}s after a redial; escalating immediately"
 			device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
@@ -847,7 +1013,12 @@ while :; do
 		# That made the radio power-cycle escalation effectively
 		# unreachable via this path - only the grace-timeout fast path in
 		# the main loop could ever trigger it.
-		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; }
+		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; }
+		# Deliberately outside the guard above: a confirmed-good tick is
+		# exactly what should start (and then satisfy) the fallback hold
+		# window, so lte_fallback_since survives the counter reset that
+		# traffic_state=2 causes.
+		lte_fallback_release
 		do_sleep "$CHECK_PERIOD"
 		continue
 	fi

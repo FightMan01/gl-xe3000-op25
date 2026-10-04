@@ -18,6 +18,15 @@ config state 'state'
 	# the UI's Connect/Disconnect actions persistently toggle this.
 	option dial_enabled '1'
 
+config rat 'rat'
+	# Which radio technologies the modem may camp on, as
+	# AT+QNWPREFCFG="mode_pref": AUTO (let the modem decide, its out-of-the-box
+	# setting), LTE, LTE:NR5G (NSA only), NR5G or WCDMA. Applied by the qcm
+	# proto before every dial, so a change takes effect on the next
+	# connection rather than the next reboot. The exact command sequence is
+	# GL's own stock one (lib/functions/modem.sh's set_5G_mode()).
+	option mode_pref 'AUTO'
+
 config watchdog 'watchdog'
 	# Tunables for /usr/sbin/gl-cellular-boot-redial.  All optional - the
 	# script uses these same values as defaults if unset.  Modeled on the
@@ -47,3 +56,37 @@ config watchdog 'watchdog'
 	option modem_reset_max '3'
 	option modem_reset_window_sec '3600'
 	option modem_reset_reboot '0'
+	# Rebuild the PCIe/MHI data path in place
+	# (gl-cellular-mhi-reset: the QMAP channels via the driver's
+	# mhi_netdev debugfs reset, then the MHI controller via its mhi_q
+	# reset) once plain redials have stopped being enough. This is the
+	# rung between a redial and a radio power-cycle, and the only one
+	# that leaves the modem attached - it exists because the failure it
+	# fixes (attached, addressed, DHCP complete, zero packets, AT fully
+	# responsive) is a QMAP/MHI-layer fault rather than a radio one.
+	# Rate-limited per window so a genuinely dead data path still
+	# progresses to the PCIe/MHI function re-init below.
+	# 0 = disabled. On hardware the channel reset left a working link
+	# passing nothing until the call was redialled; keep it off until
+	# reset-plus-redial is proven.
+	option mhi_reset_max '0'
+	option mhi_reset_window_sec '1800'
+	# MHI state-transition timeout in ms, applied by
+	# gl-cellular-mhi-reset whenever it can reach the driver's
+	# /sys/bus/mhi_q/devices/<node>/timeout_ms. The driver's own default
+	# is 3000ms for every wait in the MHI state machine, which is tight
+	# enough that a slow channel start under load becomes a timed-out
+	# one. 0 leaves the driver default alone.
+	option mhi_timeout_ms '10000'
+	# Drop to LTE-only after LTE_FALLBACK_AFTER data-path failures that
+	# needed more than a plain redial, and stay there for
+	# lte_fallback_hold_sec before restoring the configured preference.
+	# Under NSA the modem camps LTE and adds a 5G secondary node, and on a
+	# congested cell it is the secondary leg that fails - when it goes, the
+	# whole bearer goes with it. LTE-only is slower at the top end and much
+	# harder to lose, and for a backup uplink that is the right trade. The
+	# restore is automatic, so a location with good 5G is not stuck on LTE.
+	# Set lte_fallback to 0 to pin it off.
+	option lte_fallback '1'
+	option lte_fallback_after '2'
+	option lte_fallback_hold_sec '900'

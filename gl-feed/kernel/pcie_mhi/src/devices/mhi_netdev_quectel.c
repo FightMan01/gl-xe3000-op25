@@ -23,6 +23,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
+#include <linux/pm_runtime.h>
 #include <linux/errno.h>
 #include <linux/rtnetlink.h>
 #include <linux/time.h>
@@ -378,6 +379,10 @@ struct mhi_netdev {
 	u32 link_state;
 	u32 flow_control;
 	u32 dl_minimum_padding;
+	bool pm_ref_held;
+	u32 alloc_retry;
+	struct delayed_work fc_work;
+	u32 fc_pending;
 
 #ifdef QUECTEL_BRIDGE_MODE
 	uint bridge_mode;
@@ -792,13 +797,68 @@ static void rmnet_map_send_ack(struct mhi_netdev *pQmapDev,
 	dev_queue_xmit(skb);
 }
 
+/*
+ * QMAP flow control. This was a "//TODO return 0": the modem's FLOW_DISABLE
+ * was ACKed and then ignored. Same semantics as mainline rmnet
+ * (rmnet_map_command.c / rmnet_vnd_do_flow_control()): FLOW_ENABLE arrives
+ * here as enable=1 and lets the flow run, FLOW_DISABLE as enable=0 and stops
+ * it. mhi_netdev->flow_control holds one bit per mux that is currently
+ * *held* (stopped).
+ *
+ * Only the vnd is stopped. It is the only thing that feeds data into the
+ * parent, so stopping it is enough; stopping the parent as well would also
+ * hold back the RMNET_MAP_COMMAND_ACK that rmnet_map_send_ack() queues on it.
+ *
+ * FC_STALL_JIFFIES bounds the stop: if a FLOW_ENABLE never arrives, the queue
+ * is forced open again rather than leaving the uplink dead for good.
+ */
+#define FC_STALL_JIFFIES (5 * HZ)
+
+static void mhi_netdev_fc_timeout(struct work_struct *work)
+{
+	struct mhi_netdev *mhi_netdev = container_of(work, struct mhi_netdev,
+						      fc_work.work);
+	u32 held;
+	unsigned i;
+
+	/* pm_lock keeps mhi_netdev_remove() from unregistering the vnds while
+	 * they are being walked: remove clears `enabled` under the write lock
+	 * before it touches mpQmapNetDev[].
+	 */
+	read_lock_bh(&mhi_netdev->pm_lock);
+	held = mhi_netdev->flow_control;
+	mhi_netdev->flow_control = 0;
+	mhi_netdev->fc_pending = 0;
+	if (!mhi_netdev->enabled) {
+		read_unlock_bh(&mhi_netdev->pm_lock);
+		return;
+	}
+
+	for (i = 0; i < mhi_netdev->qmap_mode; i++) {
+		struct net_device *vnd = mhi_netdev->mpQmapNetDev[i];
+
+		if (!vnd || !(held & (1 << i)))
+			continue;
+
+		MSG_ERR("Flow control held by modem for mux %u and not "
+			"released after %ds; forcing the queue open\n",
+			i, FC_STALL_JIFFIES / HZ);
+		netif_wake_queue(vnd);
+	}
+	read_unlock_bh(&mhi_netdev->pm_lock);
+}
+
 static int rmnet_data_vnd_do_flow_control(struct net_device *dev,
 			       uint32_t map_flow_id,
 			       uint16_t v4_seq,
 			       uint16_t v6_seq,
 			       int enable)
 {
-	//TODO
+	if (enable)
+		netif_wake_queue(dev);
+	else
+		netif_stop_queue(dev);
+
 	return 0;
 }
 
@@ -833,9 +893,22 @@ static uint8_t rmnet_map_do_flow_control(struct mhi_netdev *pQmapDev,
 	qos_id = ntohl(cmd->flow_control.qos_id);
 
 	 if (enable)
-		 pQmapDev->flow_control |= (1 << mux_id);
-	 else
 		 pQmapDev->flow_control &= ~(1 << mux_id);
+	 else
+		 pQmapDev->flow_control |= (1 << mux_id);
+
+	/* Arm the bounded-stop deadline while any flow is held. */
+	if (pQmapDev->flow_control) {
+		if (!pQmapDev->fc_pending && pQmapDev->enabled) {
+			pQmapDev->fc_pending = 1;
+			schedule_delayed_work(&pQmapDev->fc_work,
+					      FC_STALL_JIFFIES);
+		}
+	} else if (pQmapDev->fc_pending) {
+		pQmapDev->fc_pending = 0;
+		cancel_delayed_work(&pQmapDev->fc_work);
+	}
+
 	/* Ignore the ip family and pass the sequence number for both v4 and v6
 	 * sequence. User space does not support creating dedicated flows for
 	 * the 2 protocols
@@ -1968,26 +2041,55 @@ static void mhi_netdev_alloc_work(struct work_struct *work)
 {
 	struct mhi_netdev *mhi_netdev = container_of(work, struct mhi_netdev,
 						   alloc_work.work);
-	/* sleep about 1 sec and retry, that should be enough time
-	 * for system to reclaim freed memory back.
-	 */
-	const int sleep_ms =  1000;
-	int retry = 60;
+	unsigned long delay_ms = 20;
 	int ret;
 
 	MSG_LOG("Entered\n");
-	do {
-		ret = mhi_netdev_alloc_skb(mhi_netdev, GFP_KERNEL);
-		/* sleep and try again */
-		if (ret == -ENOMEM) {
-			schedule_delayed_work(&mhi_netdev->alloc_work, msecs_to_jiffies(20));
-			return;
-			msleep(sleep_ms);
-			retry--;
-		}
-	} while (ret == -ENOMEM && retry);
 
-	MSG_LOG("Exit with status:%d retry:%d\n", ret, retry);
+	for (;;) {
+		ret = mhi_netdev_alloc_skb(mhi_netdev, GFP_KERNEL);
+		if (!ret)
+			break;
+
+		/*
+		 * Back off and come back. This used to reschedule only for
+		 * -ENOMEM and give up on -EIO - which mhi_netdev_alloc_skb()
+		 * returns both when the interface is momentarily disabled and
+		 * whenever mhi_queue_transfer() fails. So a single transient
+		 * -EIO left the receive ring permanently short of TREs and
+		 * nothing ever refilled it again: from that point buffers were
+		 * only topped up from inside NAPI, with GFP_ATOMIC and an
+		 * order-2 allocation of mru (15360) bytes, which fails routinely
+		 * on a low-RAM device. Once the DL channel ran out of TREs the
+		 * modem had nowhere to put data, so a bearer that had come up,
+		 * negotiated and completed a DHCP lease carried nothing at all,
+		 * with no self-healing path.
+		 *
+		 * Stop only when the interface is genuinely being torn down -
+		 * mhi_netdev_remove() clears `enabled` before flushing this
+		 * work, so a teardown cannot be kept alive by the retry.
+		 */
+		read_lock_bh(&mhi_netdev->pm_lock);
+		if (!mhi_netdev->enabled) {
+			read_unlock_bh(&mhi_netdev->pm_lock);
+			MSG_LOG("Exit, interface disabled (status:%d)\n", ret);
+			return;
+		}
+		read_unlock_bh(&mhi_netdev->pm_lock);
+
+		delay_ms = 20u << min(mhi_netdev->alloc_retry, 5u);
+		mhi_netdev->alloc_retry++;
+		/* retries are unbounded; log the first and then every 64th */
+		if ((mhi_netdev->alloc_retry & 63) == 1)
+			MSG_ERR("Receive buffer top-up failed:%d, retry %u in %lums\n",
+				ret, mhi_netdev->alloc_retry, delay_ms);
+		schedule_delayed_work(&mhi_netdev->alloc_work,
+				      msecs_to_jiffies(delay_ms));
+		return;
+	}
+
+	mhi_netdev->alloc_retry = 0;
+	MSG_LOG("Exit with status:%d\n", ret);
 }
 
 static void mhi_netdev_dealloc(struct mhi_netdev *mhi_netdev)
@@ -2311,10 +2413,17 @@ static int mhi_netdev_poll(struct napi_struct *napi, int budget)
 	/* queue new buffers */
   	if (!delayed_work_pending(&mhi_netdev->alloc_work)) {
 		ret = mhi_netdev->rx_queue(mhi_netdev, GFP_ATOMIC);
-		if (ret == -ENOMEM) {
+		if (ret) {
 			//MSG_LOG("out of tre, queuing bg worker\n"); //do not print in softirq
 			mhi_netdev->stats.alloc_failed++;
-			schedule_delayed_work(&mhi_netdev->alloc_work, msecs_to_jiffies(20));
+			/* Any failure, not just -ENOMEM. mhi_queue_transfer()
+			 * failures surface as -EIO here, and only the -ENOMEM
+			 * case used to wake the worker - so a single transient
+			 * -EIO dropped the receive ring permanently short of
+			 * TREs (see mhi_netdev_alloc_work).
+			 */
+			schedule_delayed_work(&mhi_netdev->alloc_work,
+					      msecs_to_jiffies(20));
 		}
   	}
 	
@@ -2636,6 +2745,53 @@ static void mhi_netdev_setup(struct net_device *dev)
 #endif
 }
 
+/*
+ * Hold a runtime PM reference for as long as the data interface is enabled.
+ *
+ * The controller arms pm_runtime_use_autosuspend() with a 2s delay at probe,
+ * and mhi_runtime_idle() only permits the suspend once dev_state reaches M2
+ * (see the fix in controllers/mhi_qti.c). Nothing in the data path ever held a
+ * reference across an *idle but established* data call - mhi_netdev_quectel.c
+ * never called mhi_device_get()/put() at all, and the core's own
+ * runtime_get()/runtime_put() pair only brackets outstanding UL TREs. So a
+ * session that was up but momentarily quiet had its usage count fall back to
+ * the probe baseline, and the MHI core told the SDX62 firmware to enter M3 out
+ * from under an active bearer. Both of the busy checks in mhi_pm_suspend() are
+ * dead as well, because mhi_assert_dev_wake() is compiled to a no-op that
+ * leaves mhi_cntrl->dev_wake permanently 0, so there was nothing left to stop
+ * it. The result was a data call that came up, carried nothing, and then had
+ * the bearer torn down under it.
+ *
+ * pm_runtime_get_sync() (not the driver's async runtime_get()) so the device is
+ * guaranteed to be out of runtime suspend before the caller touches MHI state.
+ */
+static void mhi_netdev_pm_hold(struct mhi_netdev *mhi_netdev)
+{
+	struct mhi_device *mhi_dev = mhi_netdev->mhi_dev;
+	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+
+	if (mhi_netdev->pm_ref_held || !mhi_cntrl || !mhi_cntrl->dev)
+		return;
+
+	pm_runtime_get_sync(mhi_cntrl->dev);
+	mhi_netdev->pm_ref_held = true;
+	MSG_LOG("runtime PM reference held\n");
+}
+
+static void mhi_netdev_pm_release(struct mhi_netdev *mhi_netdev)
+{
+	struct mhi_device *mhi_dev = mhi_netdev->mhi_dev;
+	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+
+	if (!mhi_netdev->pm_ref_held || !mhi_cntrl || !mhi_cntrl->dev)
+		return;
+
+	mhi_netdev->pm_ref_held = false;
+	pm_runtime_mark_last_busy(mhi_cntrl->dev);
+	pm_runtime_put(mhi_cntrl->dev);
+	MSG_LOG("runtime PM reference released\n");
+}
+
 /* enable mhi_netdev netdev, call only after grabbing mhi_netdev.mutex */
 static int mhi_netdev_enable_iface(struct mhi_netdev *mhi_netdev)
 {
@@ -2726,6 +2882,8 @@ static int mhi_netdev_enable_iface(struct mhi_netdev *mhi_netdev)
 	mhi_netdev->enabled =  true;
 	write_unlock_irq(&mhi_netdev->pm_lock);
 
+	mhi_netdev_pm_hold(mhi_netdev);
+
 #ifdef CONFIG_USE_RMNET_DATA_FOR_SKIP_MEMCPY
 	/* MRU must be multiplication of page size */
 	mhi_netdev->order = 1;
@@ -2804,6 +2962,9 @@ static void mhi_netdev_xfer_ul_cb(struct mhi_device *mhi_dev,
 			netif_wake_queue(ndev);
 			for (i = 0; i < mhi_netdev->qmap_mode; i++) {
 				struct net_device *qmap_net = mhi_netdev->mpQmapNetDev[i];
+				/* leave a mux the modem has flow-controlled stopped */
+				if (mhi_netdev->flow_control & (1 << i))
+					continue;
 				if (qmap_net) {
 					if (netif_queue_stopped(qmap_net))
 						netif_wake_queue(qmap_net);
@@ -3053,6 +3214,7 @@ static int mhi_netdev_debugfs_trigger_reset(void *data, u64 val)
 	struct mhi_netdev *mhi_netdev = data;
 	struct mhi_device *mhi_dev = mhi_netdev->mhi_dev;
 	int ret;
+	unsigned i;
 
 	MSG_LOG("Triggering channel reset\n");
 
@@ -3060,7 +3222,11 @@ static int mhi_netdev_debugfs_trigger_reset(void *data, u64 val)
 	write_lock_irq(&mhi_netdev->pm_lock);
 	mhi_netdev->enabled = false;
 	write_unlock_irq(&mhi_netdev->pm_lock);
+	mhi_netdev_pm_release(mhi_netdev);
 	napi_disable(&mhi_netdev->napi);
+	cancel_delayed_work_sync(&mhi_netdev->fc_work);
+	mhi_netdev->flow_control = 0;
+	mhi_netdev->fc_pending = 0;
 
 	/* disable all hardware channels */
 	mhi_unprepare_from_transfer(mhi_dev);
@@ -3073,6 +3239,16 @@ static int mhi_netdev_debugfs_trigger_reset(void *data, u64 val)
 	ret = mhi_netdev_enable_iface(mhi_netdev);
 	if (ret)
 		return ret;
+
+	/* The UL ring was drained with -ENOTCONN, which mhi_netdev_xfer_ul_cb()
+	 * never wakes the queues for, so a queue stopped before the reset would
+	 * otherwise stay stopped.
+	 */
+	netif_wake_queue(mhi_netdev->ndev);
+	for (i = 0; i < mhi_netdev->qmap_mode; i++) {
+		if (mhi_netdev->mpQmapNetDev[i])
+			netif_wake_queue(mhi_netdev->mpQmapNetDev[i]);
+	}
 
 	return 0;
 }
@@ -3182,6 +3358,9 @@ static void mhi_netdev_remove(struct mhi_device *mhi_dev)
 	write_lock_irq(&mhi_netdev->pm_lock);
 	mhi_netdev->enabled = false;
 	write_unlock_irq(&mhi_netdev->pm_lock);
+	mhi_netdev_pm_release(mhi_netdev);
+	/* fc_timeout walks mpQmapNetDev[]; it must be gone before the vnds are */
+	cancel_delayed_work_sync(&mhi_netdev->fc_work);
 
 	for (i = 0; i < mhi_netdev->qmap_mode; i++) {
 		if (mhi_netdev->mpQmapNetDev[i]
@@ -3210,6 +3389,8 @@ static void mhi_netdev_remove(struct mhi_device *mhi_dev)
 	napi_disable(&mhi_netdev->napi);
 	netif_napi_del(&mhi_netdev->napi);
 	mhi_netdev_dealloc(mhi_netdev);
+	/* again, in case the RX path re-armed it before napi_disable() */
+	cancel_delayed_work_sync(&mhi_netdev->fc_work);
 	unregister_netdev(mhi_netdev->ndev);
 #if defined(MHI_NETDEV_STATUS64)
 	free_percpu(mhi_netdev->stats64);
@@ -3309,6 +3490,7 @@ static int mhi_netdev_probe(struct mhi_device *mhi_dev,
 	spin_lock_init(&mhi_netdev->rx_lock);
 	rwlock_init(&mhi_netdev->pm_lock);
 	INIT_DELAYED_WORK(&mhi_netdev->alloc_work, mhi_netdev_alloc_work);
+	INIT_DELAYED_WORK(&mhi_netdev->fc_work, mhi_netdev_fc_timeout);
 	skb_queue_head_init(&mhi_netdev->qmap_chain);
 	skb_queue_head_init(&mhi_netdev->skb_chain);
 	skb_queue_head_init(&mhi_netdev->tx_allocated);

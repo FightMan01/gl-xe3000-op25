@@ -72,9 +72,11 @@ local NR_BANDWIDTH_MHZ = {
 
 -- LTE-only mode: ONE combined "+QENG:" line -
 --   "servingcell",<state>,"LTE",<duplex>,<mcc>,<mnc>,<cellid>,<pcid>,
---   <earfcn>,<band>,<ul_bw>,<dl_bw>,<tac>,<rsrp>,<rsrq>,<rssi>,<sinr>,<srxlev>
+--   <earfcn>,<band>,<ul_bw>,<dl_bw>,<tac>,<rsrp>,<rsrq>,<rssi>,<sinr>,
+--   <cqi>,<tx_power>,<srxlev>
 --   (fields[3]=="LTE") - rat@3, duplex@4, cellid@7, band@10, ul_bw@11,
---   dl_bw@12, rsrp@14, rsrq@15, rssi@16, sinr@17.
+--   dl_bw@12, rsrp@14, rsrq@15, rssi@16, sinr@17, cqi@18, tx_power@19,
+--   srxlev@20.
 --
 -- 5G NSA mode: the SAME command instead returns THREE SEPARATE "+QENG:"
 -- lines, e.g.:
@@ -84,10 +86,30 @@ local NR_BANDWIDTH_MHZ = {
 -- The LTE line here has no "servingcell"/state prefix of its own, so its
 -- field indices are shifted down by 2 versus the LTE-only case: rat@1,
 -- duplex@2, cellid@5, band@8, ul_bw@9, dl_bw@10, rsrp@12, rsrq@13,
--- rssi@14, sinr@15. The NR5G-NSA line's fields are Quectel's documented
+-- rssi@14, sinr@15, cqi@16, tx_power@17, srxlev@18. The NR5G-NSA line's fields are Quectel's documented
 -- order: mcc@2, mnc@3, pci@4, rsrp@5, sinr@6, rsrq@7, arfcn@8, band@9,
 -- bandwidth-code@10, scs@11 - bandwidth-code's exact MHz mapping for NR
 -- isn't confirmed, so nr.bandwidth_code is reported raw.
+-- <tx_power> is in 1/10 dBm (235 -> 23.5 dBm) and is "-" while idle;
+-- <srxlev> is plain dB.
+--
+-- Reported because there is nothing to *set*: the RM5x0N AT manual has no
+-- writable TX-power or antenna command (no AT+QCFG="tx_power", no
+-- AT+QCFG="antenna_sw", no AT+QCFG="sarcfg" on this branch - the last exists
+-- only on the older RG50xQ/RM5xxQ firmware), and the hardware envelope is
+-- 23 dBm +/-2 (Class 3) / 26 dBm +2/-3 on the HPUE bands. So the answer to
+-- "is the modem transmitting at maximum" is that there is no maximum to
+-- select - the modem runs closed-loop power control to whatever the network
+-- asks for, and at idle it deliberately sits near minimum output, rising to
+-- full only while actually transmitting. A single-digit dBm reading on an idle
+-- link is correct behaviour, not a fault; the number that matters is one
+-- sampled under load.
+local function qeng_power(v, scale)
+	if not v or v == "" then return nil end
+	local n = tonumber(v)
+	return n and (n / (scale or 10)) or nil
+end
+
 local function get_serving_cell()
 	local resp = at.command('AT+QENG="servingcell"', 3)
 	local lines = at.all_matches(resp, "+QENG")
@@ -104,6 +126,9 @@ local function get_serving_cell()
 				fields[4], fields[7], fields[10], fields[11], fields[12],
 				fields[14], fields[15], fields[16], fields[17]
 			rsrp, rsrq, rssi, sinr = tonumber(rsrp), tonumber(rsrq), tonumber(rssi), tonumber(sinr)
+			-- fields[19]/[20] are <tx_power> (1/10 dBm) and <srxlev> (dB).
+			-- See the note on qeng_power() for why both are worth reporting.
+			local tx_power, srxlev = qeng_power(fields[19]), qeng_power(fields[20], 1)
 			return {
 				mode = "LTE " .. (duplex or ""),
 				network_type = "LTE",
@@ -117,6 +142,7 @@ local function get_serving_cell()
 				rssi = rssi, rssi_quality = signal_quality("rssi", rssi),
 				rsrq = rsrq, rsrq_quality = signal_quality("rsrq", rsrq),
 				sinr = sinr, sinr_quality = signal_quality("sinr", sinr),
+				tx_power = tx_power, srxlev = srxlev,
 				cell_id = cellid,
 			}
 		end
@@ -133,6 +159,9 @@ local function get_serving_cell()
 				fields[2], fields[5], fields[8], fields[9], fields[10],
 				fields[12], fields[13], fields[14], fields[15]
 			rsrp, rsrq, rssi, sinr = tonumber(rsrp), tonumber(rsrq), tonumber(rssi), tonumber(sinr)
+			-- No "servingcell"/state prefix on this line, so the tail
+			-- fields sit two earlier than in LTE-only mode: 17 and 18.
+			local tx_power, srxlev = qeng_power(fields[17]), qeng_power(fields[18], 1)
 			result = result or {}
 			result.mode = "5G NSA (LTE " .. (duplex or "") .. " anchor)"
 			result.network_type = "LTE"
@@ -146,6 +175,7 @@ local function get_serving_cell()
 			result.rssi = rssi; result.rssi_quality = signal_quality("rssi", rssi)
 			result.rsrq = rsrq; result.rsrq_quality = signal_quality("rsrq", rsrq)
 			result.sinr = sinr; result.sinr_quality = signal_quality("sinr", sinr)
+			result.tx_power = tx_power; result.srxlev = srxlev
 			result.cell_id = cellid
 		elseif fields[1] == "NR5G-NSA" or fields[1] == "NR5G-SA" then
 			local pci, rsrp, sinr, rsrq, arfcn, band, bw_code =

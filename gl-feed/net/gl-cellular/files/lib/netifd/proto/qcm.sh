@@ -86,27 +86,135 @@ proto_qcm_setup() {
 	   sleep 10; return 1 ;;
 esac
 
-# Stock deactivates a modem-side default PDP context before starting its
-# QMI call. The modem can auto-activate CID 1 during boot even though QMI
-# reports no call; leaving that context up makes StartNetwork fail with
-# QMUX error 0x0e. Keep IMS (CID 2) untouched.
-local cgact
-cgact=$(ubus -t 5 call cellular.at command \
-	'{"cmd":"AT+CGACT?","timeout":5}' 2>/dev/null |
-	jsonfilter -e '@.response' 2>/dev/null)
-case "$cgact" in
-	*'+CGACT: 1,1'*)
-		logger -t gl-cellular "deactivating modem default PDP context CID 1 before QMI dial"
-		local cgact_off
-		cgact_off=$(ubus -t 12 call cellular.at command \
-			'{"cmd":"AT+CGACT=0,1","timeout":10}' 2>/dev/null |
-			jsonfilter -e '@.response' 2>/dev/null)
-		case "$cgact_off" in
+_qcm_at() {
+	ubus -t 8 call cellular.at command \
+		"{\"cmd\":\"$1\",\"timeout\":6}" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null
+}
+
+# Release every stale modem-side PDP context that belongs to our APN, not just
+# CID 1.
+#
+# The CID-1-only version of this existed because the modem auto-activates CID 1
+# during boot even though QMI reports no call, and leaving it up makes
+# StartNetwork fail with QMUX error 0x0e. But 0x0e is only the wrapper: the
+# detail is in the call-end-reason TLVs, and the one that actually matters here
+# is
+#
+#   call_end_reason 1 / type 6 / verbose 55
+#     = QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MULTIPLE_CONNECTION_TO_SAME_PDN_
+#       NOT_ALLOWED, i.e. 3GPP ESM cause 55 (TS 24.301): the network refused
+#       the activation because a PDN connection for the same APN already
+#       existed.
+#
+# That is what a data call which was never cleanly torn down leaves behind, and
+# it recurs because a real SIM frequently has several contexts for one APN (a
+# live IPv4v6 one plus stale or placeholder ones) - on the Telekom HU SIM in
+# this modem's tray, the configured APN sits on CIDs well above 1. Sweeping
+# only CID 1 therefore fixed the boot-time case and left the reconnect case
+# failing exactly as before.
+#
+# Deliberately avoids `tr` character classes: this BusyBox's tr was built
+# without CONFIG_FEATURE_TR_CLASSES, so `tr -d '[:space:]'` silently deletes
+# the literal letters s,p,a,c,e instead of whitespace. Parse with parameter
+# expansion instead (same note, same workaround as gl-cellular-boot-redial's
+# pdp_cids_for_apn).
+# _qcm_pdp_cids_for_apn <apn> <pdp-type>
+_qcm_pdp_cids_for_apn() {
+	local want_apn="$1" want_type="$2" resp line rest cid ptype apn exact other
+	[ -n "$want_apn" ] || return 0
+	resp="$(_qcm_at 'AT+CGDCONT?')"
+	[ -n "$resp" ] || return 0
+
+	exact=""
+	other=""
+	while IFS= read -r line; do
+		case "$line" in
+		'+CGDCONT:'*)
+			rest="${line#*:}"
+			rest="${rest# }"
+			cid="${rest%%,*}"
+			rest="${rest#*,}"
+			ptype="${rest%%,*}"
+			rest="${rest#*,}"
+			apn="${rest%%,*}"
+			ptype="${ptype#\"}"; ptype="${ptype%\"}"
+			apn="${apn#\"}"; apn="${apn%\"}"
+			[ "$apn" = "$want_apn" ] || continue
+			case " $exact $other " in
+			*" $cid "*) continue ;;
+			esac
+			if [ -z "$want_type" ] || [ "$ptype" = "$want_type" ]; then
+				exact="$exact $cid"
+			else
+				other="$other $cid"
+			fi
+			;;
+		esac
+	done <<-EOF
+		$resp
+		EOF
+
+	for cid in $exact $other; do echo "$cid"; done
+}
+
+# The PDP type token AT+CGDCONT uses, matching what we are about to dial.
+# pdptype in any case, AT token out.
+_qcm_at_ip_type() {
+	case "$(echo "$1" | tr 'A-Z' 'a-z')" in
+	ipv6) echo "IPV6" ;;
+	ipv4|ip) echo "IP" ;;
+	"") echo "" ;;
+	*) echo "IPV4V6" ;;
+	esac
+}
+
+# _qcm_deactivate_pdp <apn> <lower-cased pdptype>
+_qcm_deactivate_pdp() {
+	local want_apn="$1" want_type cids cid active
+	want_type="$(_qcm_at_ip_type "$2")"
+	active="$(_qcm_at 'AT+CGACT?')"
+	[ -n "$active" ] || return 0
+
+	cids="$(_qcm_pdp_cids_for_apn "$want_apn" "$want_type")"
+
+	for cid in $cids; do
+		case "$active" in
+		*"+CGACT: $cid,1"*)
+			logger -t gl-cellular \
+				"deactivating stale modem PDP context CID $cid (APN $want_apn) before QMI dial"
+			case "$(_qcm_at "AT+CGACT=0,$cid")" in
 			*OK*) sleep 1 ;;
-			*) logger -p daemon.err -t gl-cellular "could not deactivate modem PDP context CID 1"; proto_notify_error "$interface" MODEM_PDP; proto_block_restart "$interface"; return 1 ;;
+			*) logger -p daemon.err -t gl-cellular \
+				"could not deactivate modem PDP context CID $cid" ;;
+			esac
+			;;
+		esac
+	done
+
+	# No APN match at all (empty AT+CGDCONT?, or our APN was never
+	# programmed into a context) still leaves the boot-time auto-activation
+	# that this whole dance started for: fall back to CID 1 alone, which
+	# is what the previous version of this always did.
+	[ -n "$cids" ] && return 0
+	case "$active" in
+	*'+CGACT: 1,1'*)
+		logger -t gl-cellular \
+			"deactivating modem default PDP context CID 1 before QMI dial"
+		case "$(_qcm_at 'AT+CGACT=0,1')" in
+		*OK*) sleep 1 ;;
+		*) logger -p daemon.err -t gl-cellular \
+			"could not deactivate modem PDP context CID 1"
+		   proto_notify_error "$interface" MODEM_PDP
+		   proto_block_restart "$interface"
+		   return 1 ;;
 		esac
 		;;
-esac
+	esac
+	return 0
+}
+
+_qcm_deactivate_pdp "$apn" "$pdptype" || return 1
 
 # QMI over PCIe requires the modem's PCIe personality, not its MBIM
 # personality. QCFG is non-volatile; repair a stale setting left by an older
@@ -146,7 +254,13 @@ local pdp="-4 -6"
 	esac
 	[ -z "$username" ] && { password=""; auth=""; }
 
-	[ -n "$mtu" ] && ip link set dev "$qmapnet" mtu "$mtu" 2>/dev/null
+	# Stock sets the QMAP netdev MTU unconditionally rather than only when
+	# configured, so a value inherited from an older configuration cannot
+	# leave the vnd at a size the modem's aggregation will not honour. The
+	# driver derives its own ceiling as mru (15KB) minus the two QMAP
+	# headers, so anything up to 1500 is accepted without a modem-side
+	# renegotiation.
+	ip link set dev "$qmapnet" mtu "${mtu:-1500}" 2>/dev/null
 
 	# The modem announces its IPv6 router only via RA (no DHCPv6). Accept RA
 	# for the default route but keep the QMI-assigned address rather than a
@@ -154,12 +268,84 @@ local pdp="-4 -6"
 	echo 2 > "/proc/sys/net/ipv6/conf/$qmapnet/accept_ra" 2>/dev/null
 	echo 0 > "/proc/sys/net/ipv6/conf/$qmapnet/autoconf" 2>/dev/null
 
+	# Carrier-rejection cause reporting. AT+QNETRC=7 makes the modem emit a
+	# +QNETRC URC carrying the EMM/ESM/5GMM reject cause whenever the
+	# network refuses a registration or an activation. This is the only
+	# place the *network's* reason for a refusal is ever exposed - QMI's
+	# call-end-reason says "no service" (CM_NO_SERVICE, verbose 2001) or
+	# "already have this PDN" (ESM 54, verbose 55) but never why. Persisted
+	# in NVM, so it is set once here rather than on every dial.
+	_qcm_at 'AT+QNETRC=7' >/dev/null
+
+	# Same reason GL's own cellular manager issues AT+QCAINFO=1 at modem
+	# bring-up (its ensure_quectel_qcainfo_enabled, Quectel-only): it turns
+	# on the modem's carrier-aggregation parameter reporting, which is what
+	# the signal/RF readings in the UI are built from.
+	_qcm_at 'AT+QCAINFO=1' >/dev/null
+
+	# Don't dial into no service. A QMI data call against a modem that is
+	# not attached cannot succeed, and attempting one anyway burns an
+	# attempt in quectel-CM's 5/10/20/40/60s back-off ladder while
+	# returning the generic call_end_reason 3 / type 3 / verbose 2001
+	# (CM_NO_SERVICE) - which says nothing about the actual cause. Wait
+	# briefly for the radio, then log why it is not there and let netifd
+	# retry: the difference between "no coverage, will attach on its own"
+	# and "attached but the bearer was refused" is the single most useful
+	# thing a field log can contain here, and it is otherwise invisible.
+	#
+	# The RAT preference goes first: mode_pref is live, and a modem left on
+	# a mode with no coverage here could otherwise never attach, so would
+	# never get past this gate to have it corrected.
+	/usr/sbin/gl-cellular-rat apply
+
+	local waited=0 attach nosvc=/var/run/gl-cellular-qcm-nosvc
+	attach="$(_qcm_at 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1)"
+	while [ "$waited" -lt 15 ] && [ "$attach" != "1" ]; do
+		sleep 3
+		waited=$((waited + 3))
+		attach="$(_qcm_at 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1)"
+	done
+	if [ "$attach" != "1" ]; then
+		# netifd re-runs setup straight away, so in a long dead zone this
+		# would log every ~20s: once per no-service episode is enough.
+		[ -e "$nosvc" ] || {
+			: > "$nosvc"
+			logger -p daemon.warn -t gl-cellular \
+				"not attached after ${waited}s; not dialling. cereg=[$(_qcm_at 'AT+CEREG?' | tr -d '\r\n')] cops=[$(_qcm_at 'AT+COPS?' | tr -d '\r\n')] netrc=[$(_qcm_at 'AT+QNETRC?' | tr -d '\r\n')]"
+		}
+		proto_notify_error "$interface" NO_SERVICE
+		return 1
+	fi
+	rm -f "$nosvc"
+
 	proto_run_command "$interface" env QCM_NO_DHCP4=1 /usr/sbin/quectel-CM \
 		-i "$ifname" $pdp \
 		${apn:+-s "$apn" ${username:+"$username" "$password" $auth}}
 
 	proto_init_update "$qmapnet" 1
 	proto_send_update "$interface"
+
+	# Bring the QMAP carrier up explicitly, as stock's qcm.sh does
+	# (`(sleep 3; echo "0x1" > $(find /sys/devices/ -name link_state)) &`,
+	# cleared to 0x0 in teardown).
+	#
+	# On the pcie_mhi driver this attribute is a pure software carrier flag:
+	# link_state_store() only calls netif_carrier_on()/off() on rmnet_mhi0 and
+	# rmnet_mhi0.1, and both netdevs are registered with carrier OFF - so
+	# nothing brings the QMAP vnd up except this write. quectel-CM does it
+	# too, from the first statement of udhcpc_start(), which is reached even
+	# with QCM_NO_DHCP4 set - but that couples the carrier to a DHCP code
+	# path this configuration deliberately bypasses. Doing it here costs
+	# nothing, is idempotent, and removes the dependency.
+	#
+	# Only while a quectel-CM is running: a teardown inside the 3s must not
+	# be followed by this raising the carrier on a vnd with no session.
+	(
+		sleep 3
+		[ -w "/sys/class/net/$ifname/link_state" ] || exit 0
+		pidof quectel-CM >/dev/null || exit 0
+		echo "0x1" > "/sys/class/net/$ifname/link_state" 2>/dev/null
+	) &
 
 	local zone="$(fw3 -q network "$interface" 2>/dev/null)"
 
@@ -225,6 +411,12 @@ proto_qcm_teardown() {
 	ifname="${ifname:-rmnet_mhi0}"
 
 	proto_kill_command "$interface"
+	# Stock also drops the QMAP carrier on teardown, and it matters for the
+	# same reason it is raised on setup: rmnet_mhi0.1's carrier is derived
+	# from rmnet_mhi0's, so leaving it set across a teardown reports a live
+	# carrier on a vnd with no session behind it.
+	[ -w "/sys/class/net/$ifname/link_state" ] &&
+		echo "0x0" > "/sys/class/net/$ifname/link_state" 2>/dev/null
 	sed -i "/# IPV[46] ${ifname}\.1\$/d" /etc/resolv.conf 2>/dev/null
 	proto_init_update "*" 0
 	proto_send_update "$interface"

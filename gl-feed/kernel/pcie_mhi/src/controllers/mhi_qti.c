@@ -377,25 +377,24 @@ static int mhi_runtime_idle(struct device *dev)
 {
 	struct mhi_controller *mhi_cntrl = dev_get_drvdata(dev);
 
-	if ((mhi_cntrl->dev_state == MHI_STATE_M0 || mhi_cntrl->dev_state == MHI_STATE_M3)
-		&& mhi_cntrl->ee == MHI_EE_AMSS) {
-		return 0;
-	}
-	MHI_LOG("Entered returning -EBUSY, mhi_state:%s exec_env:%s\n",
-		   TO_MHI_STATE_STR(mhi_get_mhi_state(mhi_cntrl)), TO_MHI_EXEC_STR(mhi_get_exec_env(mhi_cntrl)));
-
 	/*
-	 * RPM framework during runtime resume always calls
-	 * rpm_idle to see if device ready to suspend.
-	 * If dev.power usage_count count is 0, rpm fw will call
-	 * rpm_idle cb to see if device is ready to suspend.
-	 * if cb return 0, or cb not defined the framework will
-	 * assume device driver is ready to suspend;
-	 * therefore, fw will schedule runtime suspend.
-	 * In MHI power management, MHI host shall go to
-	 * runtime suspend only after entering MHI State M2, even if
-	 * usage count is 0.  Return -EBUSY to disable automatic suspend.
+	 * In MHI power management, MHI host shall go to runtime suspend only
+	 * after entering MHI State M2, even if usage count is 0.
+	 *
+	 * The original code permitted the suspend in M0 and M3. M0 is the
+	 * state a live bearer sits in, so with pm_runtime_use_autosuspend()'s
+	 * 2s timer this handed the firmware an M3 request two seconds after the
+	 * last uplink packet of an established-but-idle data call. M3 is also
+	 * self-perpetuating: once there, idle keeps returning 0, so the core
+	 * re-issued no-op suspend attempts instead of refusing them.
+	 *
+	 * M2 is the only state where a suspend is meaningful, and only M0
+	 * matters for keeping an active bearer out of it: M1 is the transition
+	 * M2 leads into, and there is no data path that can be live in M1.
 	 */
+	if (mhi_cntrl->dev_state == MHI_STATE_M2 && mhi_cntrl->ee == MHI_EE_AMSS)
+		return 0;
+
 	return -EBUSY;
 }
 

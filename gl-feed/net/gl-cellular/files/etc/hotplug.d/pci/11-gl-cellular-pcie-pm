@@ -7,6 +7,12 @@
 case "$ACTION" in
 add|bind)
 	/usr/sbin/gl-cellular-pcie-pm
-	( sleep 3; /usr/sbin/gl-cellular-pcie-pm ) &
+	# Also apply the MHI transition-timeout override. The driver's default
+	# is 3000ms for every wait in the MHI state machine, which is tight
+	# enough that a slow channel start under load becomes a timed-out one -
+	# and doing it here means it is right from the first data call rather
+	# than only after a recovery that was already too late.
+	/usr/sbin/gl-cellular-mhi-reset tune
+	( sleep 3; /usr/sbin/gl-cellular-pcie-pm; /usr/sbin/gl-cellular-mhi-reset tune ) &
 	;;
 esac

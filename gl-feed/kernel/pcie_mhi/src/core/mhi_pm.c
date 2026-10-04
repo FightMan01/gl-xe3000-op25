@@ -1017,6 +1017,18 @@ int mhi_pm_suspend(struct mhi_controller *mhi_cntrl)
 		return -EBUSY;
 	}
 
+	/* A started transfer channel must never be suspended out from under an
+	 * established bearer. Neither check below can see this: dev_wake is
+	 * permanently 0 because mhi_assert_dev_wake() is a no-op, and the
+	 * pending_pkts counter this relies on elsewhere only tracks in-flight
+	 * UL TREs - it returns to zero on a data call that is up but idle,
+	 * which is exactly the case where an autosuspend must not fire.
+	 */
+	if (atomic_read(&mhi_cntrl->xfer_paths)) {
+		MHI_VERB("Transfer path active, aborting M3\n");
+		return -EBUSY;
+	}
+
 	/* exit MHI out of M2 state */
 	read_lock_bh(&mhi_cntrl->pm_lock);
 	mhi_cntrl->wake_get(mhi_cntrl, false);
