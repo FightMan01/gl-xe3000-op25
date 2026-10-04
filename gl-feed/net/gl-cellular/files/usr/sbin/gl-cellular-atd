@@ -502,8 +502,7 @@ end
 -- and Signal History). The frontend wants numeric network_type codes
 -- (4 = 4G, 41 = 4G+/carrier aggregation, 5 = 5G SA, 51 = 5G NSA) and one
 -- row per component carrier, ordered PCC first (ca = 0), SCCs after.
--- AT+QCAINFO lists the aggregated carriers; only the LTE ones and the
--- primary NR carrier carry signal values, the rest are shown with "-".
+-- AT+QCAINFO lists the aggregated carriers with their own signal values.
 local LTE_RB_MHZ = { [6] = 1.4, [15] = 3, [25] = 5, [50] = 10, [75] = 15, [100] = 20 }
 
 local function carrier_levels(row)
@@ -539,14 +538,27 @@ local function carrier_snapshot()
 						rssi = tofloat(tonumber(f[9])), sinr = tofloat(tonumber(f[10])),
 					})
 				elseif nr_band then
+					-- Two NR layouts. The primary NR carrier (SA PCC, or
+					-- the NSA secondary cell group's primary):
+					--   ...,"NR5G BAND 78",<pci>,<rsrp>,<rsrq>,<sinr>
+					-- An NR SCC adds a state and three UL fields:
+					--   ...,"NR5G BAND 1",<state>,<pci>,<ul_cfg>,<ul_bw>,
+					--   <ul_arfcn>,<rsrp>,<rsrq>,<sinr>
+					-- sinr is in 1/100 dB in both; whole dB like the LTE rows.
+					local scc = #f >= 12
+					local base = scc and 10 or 6
+					local sinr = tonumber(f[base + 2])
 					local row = {
 						network_type = 5,
 						band = tonumber(nr_band),
 						bandwidth = NR_BANDWIDTH_MHZ[code],
 						earfcn = tonumber(f[2]),
-						pci = tonumber(#f <= 5 and f[5] or f[6]),
+						pci = tonumber(scc and f[6] or f[5]),
+						rsrp = tofloat(tonumber(f[base])),
+						rsrq = tofloat(tonumber(f[base + 1])),
+						sinr = sinr and math.floor(sinr / 100 + 0.5),
 					}
-					if nr and nr.band == 'n' .. nr_band then
+					if not scc and nr and nr.band == 'n' .. nr_band then
 						row.rsrp, row.rsrq, row.sinr = nr.rsrp, nr.rsrq, nr.sinr
 						row.pci = row.pci or tonumber(nr.cell_id)
 					end
