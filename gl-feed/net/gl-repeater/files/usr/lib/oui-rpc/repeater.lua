@@ -118,6 +118,36 @@ end
 -- Idempotent: only reload dnsmasq when the include actually changes, so a
 -- disconnect (or any other path that calls restore with nothing pending)
 -- doesn't bounce the resolver for nothing.
+-- mwan3 judges the repeater by pinging public hosts, which a captive portal
+-- blocks until login, so it keeps the uplink "offline" and marks everything -
+-- the portal's own DNS and login pages included - for the cellular table.
+-- While logging in, send the portal's DNS servers and the private/test ranges
+-- captive networks host their pages on through the main table (where the
+-- repeater route lives), ahead of mwan3's fwmark rules.
+local PORTAL_RULE_PRIO = 800
+local PORTAL_RANGES = { "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "192.0.2.0/24" }
+
+local function clear_portal_routes()
+	os.execute("while ip rule del prio " .. PORTAL_RULE_PRIO .. " 2>/dev/null; do :; done")
+end
+
+local function set_portal_routes(servers)
+	clear_portal_routes()
+	local targets = {}
+	for _, server in ipairs(servers) do
+		server = tostring(server)
+		if server:match("^%d+%.%d+%.%d+%.%d+$") then
+			targets[#targets + 1] = server
+		end
+	end
+	for _, range in ipairs(PORTAL_RANGES) do
+		targets[#targets + 1] = range
+	end
+	for _, target in ipairs(targets) do
+		os.execute("ip rule add to " .. target .. " lookup main prio " .. PORTAL_RULE_PRIO .. " 2>/dev/null")
+	end
+end
+
 local function set_portal_dns(cursor, dns)
 	local directory = dnsmasq_confdir(cursor)
 	if not directory then return false end
@@ -138,6 +168,7 @@ local function set_portal_dns(cursor, dns)
 	end
 	if valid == 0 then return false end
 	local content = table.concat(lines, "\n") .. "\n"
+	set_portal_routes(servers)
 
 	local existing = io.open(path, "r")
 	if existing then
@@ -160,6 +191,7 @@ end
 local function restore_portal_dns(cursor)
 	local directory = dnsmasq_confdir(cursor)
 	if not directory then return false end
+	clear_portal_routes()
 	local path = directory .. "/gl-repeater-portal.conf"
 	os.remove(path .. ".new")
 	local existing = io.open(path, "r")
@@ -332,6 +364,34 @@ local function apply_config(args)
 		iface = cursor:add("wireless", "wifi-iface")
 		cursor:set("wireless", iface, "network", "repeater")
 		cursor:set("wireless", iface, "mode", "sta")
+	end
+
+	-- The frontend echoes back every field of the AP record it was handed,
+	-- so a saved entry that picked up EAP fields from an earlier network
+	-- keeps arriving as WPA2-Enterprise even when the AP is open (an open
+	-- captive-portal hotspot then never associates). What the AP actually
+	-- advertises wins over anything stale in the payload.
+	local advertised
+	for _, ap in ipairs(scan_results({ radio = radio })) do
+		if (args.bssid and ap.bssid and args.bssid:lower() == ap.bssid:lower())
+				or (not args.bssid and ap.ssid == args.ssid) then
+			advertised = ap.encryption
+			break
+		end
+	end
+	if type(advertised) == "table" then
+		local eap = false
+		for _, suite in ipairs(advertised.auth_suites or {}) do
+			if suite == "802.1X" then eap = true end
+		end
+		if advertised.enabled == false then
+			args.encryption = "none"
+			args.key, args.password = nil, nil
+		end
+		if not eap then
+			args.identity, args.eap_type, args.auth = nil, nil, nil
+			args.anonymous_identity, args.ca_cert = nil, nil
+		end
 	end
 
 	-- Does this payload actually carry credentials? The saved-network list
@@ -693,7 +753,8 @@ return {
 			-- shared uplink iface for records created before that existed.
 			local function field(name)
 				local value = cursor:get("gl-repeater", s[".name"], name)
-				if (value == nil or value == "") and s.iface then
+				if (value == nil or value == "") and s.iface
+						and cursor:get("wireless", s.iface, "ssid") == s.ssid then
 					value = cursor:get("wireless", s.iface, name)
 				end
 				return value

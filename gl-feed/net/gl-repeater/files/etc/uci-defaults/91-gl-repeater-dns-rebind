@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stock GL turns dnsmasq rebind protection off (network_gl uci-defaults).
+# Captive portals such as MAVSTART-WiFi resolve their login host to a private
+# address, which rebind protection silently strips, so the portal never loads.
+
+uci -q set dhcp.@dnsmasq[0].rebind_protection='0'
+uci -q commit dhcp
+exit 0
