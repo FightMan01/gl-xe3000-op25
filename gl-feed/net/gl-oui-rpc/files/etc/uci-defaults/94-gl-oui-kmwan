@@ -47,12 +47,18 @@ uci -q batch <<-EOF
 	add_list mwan3.wwan_4.track_ip='8.8.8.8'
 	add_list mwan3.wwan_4.track_ip='9.9.9.9'
 	add_list mwan3.wwan_4.track_ip='208.67.222.222'
-	set mwan3.wwan_4.reliability='1'
-	set mwan3.wwan_4.count='2'
-	set mwan3.wwan_4.timeout='4'
+	set mwan3.wwan_4.reliability='2'
+	set mwan3.wwan_4.count='3'
+	set mwan3.wwan_4.timeout='2'
 	set mwan3.wwan_4.interval='10'
+	set mwan3.wwan_4.failure_interval='5'
 	set mwan3.wwan_4.down='3'
-	set mwan3.wwan_4.up='3'
+	set mwan3.wwan_4.up='5'
+	set mwan3.wwan_4.check_quality='1'
+	set mwan3.wwan_4.failure_latency='1000'
+	set mwan3.wwan_4.failure_loss='40'
+	set mwan3.wwan_4.recovery_latency='500'
+	set mwan3.wwan_4.recovery_loss='10'
 	set mwan3.wwan_4.flush_conntrack='ifup'
 	add_list mwan3.wwan_4.flush_conntrack='ifdown'
 
@@ -111,6 +117,7 @@ uci -q batch <<-EOF
 	set mwan3.tethering_m4_w1.weight='1'
 
 	set mwan3.gl_failover=policy
+	delete mwan3.gl_failover.use_member
 	add_list mwan3.gl_failover.use_member='wan_m1_w1'
 	add_list mwan3.gl_failover.use_member='wwan4_m2_w1'
 	add_list mwan3.gl_failover.use_member='repeater_m3_w1'
@@ -121,6 +128,13 @@ uci -q batch <<-EOF
 	set mwan3.gl_default_rule.family='ipv4'
 	set mwan3.gl_default_rule.use_policy='gl_failover'
 EOF
+
+# Cellular on the move is rarely dead outright - it degrades into heavy loss
+# and multi-second latency while the odd ping still gets through. With plain
+# reachability tracking (any one reply = online) mwan3 never fails over to a
+# working repeater in that state. check_quality marks a target failed on loss
+# or latency too, two of the four targets must pass, and recovery needs five
+# clean rounds so a briefly good cell does not drag traffic straight back.
 
 # The upstream mwan3 sample configuration ships catch-all/HTTPS rules
 # pointing at its `balanced` policy. Keep the sections for UI compatibility,
