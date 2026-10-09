@@ -84,6 +84,14 @@ while true do
 		end
 		local dir = path:match("^(.*)/[^/]+$")
 		os.execute("mkdir -p " .. dir)
+		-- A re-upload replaces the previous one; drop it (and any copy
+		-- unpacked from it) first, or a large modem zip can never be
+		-- uploaded twice on a 256 MB tmpfs.
+		os.remove(path)
+		os.remove(path .. ".part")
+		if path == "/tmp/upgrade_cellular/firmware.zip" then
+			os.execute("rm -rf /tmp/upgrade_cellular/cellular_firmware")
+		end
 		local free = free_bytes(dir)
 		if size and free and size >= free then
 			-- The upload card shows its "not enough memory" message on 507.
