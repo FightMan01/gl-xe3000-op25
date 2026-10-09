@@ -790,6 +790,9 @@ local function sim_card_entry()
 	}
 end
 
+-- Only changes with a modem firmware upgrade, which reboots the router.
+local modem_revision
+
 local cellular_methods = {
 	-- Live data total for the settings page, which otherwise only sees the
 	-- periodic UCI checkpoint (and would show a stale/zero figure while
@@ -804,6 +807,10 @@ local cellular_methods = {
 		function(req, msg, con)
 			local resp = send_at('AT+CGSN', 2)
 			local imei = resp and resp:match('(%d+)')
+			if not modem_revision then
+				local rev = send_at('AT+QGMR', 2)
+				modem_revision = rev and rev:match('\n(RM[%w_%.]+)')
+			end
 			con:reply(req, { modems = {
 				{
 					bus = MODEM_BUS,
@@ -811,6 +818,8 @@ local cellular_methods = {
 					model = 'RM520N-GL',
 					name = 'RM520N-GL',
 					vendor = 'Quectel',
+					-- The Modem Information dialog's "Firmware Version" row.
+					version = modem_revision or '',
 					-- The GL UI supports multi-slot modems and always calls
 					-- .find() on this field; even a single IMEI is an array.
 					imei = { { slot = 1, imei = imei } },
