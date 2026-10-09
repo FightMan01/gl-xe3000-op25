@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=16
+PKG_RELEASE:=17
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -30,7 +30,8 @@ define Package/gl-oui-rpc
 	+kmod-mt7915e +kmod-mt7981-firmware +mt7981-wo-firmware wpad-openssl \
 	+mwan3 +px5g-mbedtls +sqm-scripts +tailscale +adguardhome +zerotier +tor \
 	+ksmbd-server +avahi-nodbus-daemon +ksmbd-avahi-service +wireguard-tools \
-	+openvpn-openssl +openvpn-easy-rsa +openssl-util +kmod-ovpn-backports
+	+openvpn-openssl +openvpn-easy-rsa +openssl-util +kmod-ovpn-backports \
+	+unzip
 endef
 
 define Package/gl-oui-rpc/conffiles
