@@ -16,6 +16,10 @@ local ALLOWED_DIRS = {
 	"/etc/openvpn/ovpn/",
 }
 
+local ALLOWED_FILES = {
+	["/tmp/logread.tar"] = true,
+}
+
 local function call_gl_session(method, params)
 	local conn = ubus.connect()
 	if not conn then return nil, "ubus connect failed" end
@@ -25,6 +29,9 @@ local function call_gl_session(method, params)
 end
 
 local function path_allowed(path)
+	if ALLOWED_FILES[path] then
+		return true
+	end
 	for _, dir in ipairs(ALLOWED_DIRS) do
 		if path:sub(1, #dir) == dir and not path:find("..", 1, true) then
 			return true

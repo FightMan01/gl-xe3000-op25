@@ -81,14 +81,23 @@ return {
 	end,
 
 	export_logs = function(args)
-		local dest = "/tmp/gl-logs-export.tar.gz"
-		os.execute("logread > /tmp/gl-export-system.txt 2>/dev/null")
-		os.execute("dmesg > /tmp/gl-export-kernel.txt 2>/dev/null")
-		os.execute(string.format(
-			"tar -czf %q -C /tmp gl-export-system.txt gl-export-kernel.txt 2>/dev/null",
-			dest))
-		os.remove("/tmp/gl-export-system.txt")
-		os.remove("/tmp/gl-export-kernel.txt")
+		-- The frontend ignores our return value and always downloads
+		-- /tmp/logread.tar as "logread.tar" (stock's contract), so the
+		-- archive has to land exactly there, as a plain tar.
+		local dest = "/tmp/logread.tar"
+		local name = "xe3000_log"
+		local dir = "/tmp/" .. name
+		os.remove(dest)
+		os.execute(string.format([[
+rm -rf %s
+mkdir -p %s/nginx
+logread > %s/system.log 2>/dev/null
+dmesg > %s/kernel.log 2>/dev/null
+cp /var/log/nginx/*.log %s/nginx/ 2>/dev/null
+cat /sys/fs/pstore/dmesg* %s/* > %s/crash.log 2>/dev/null
+tar -cf %s -C /tmp %s
+rm -rf %s
+]], dir, dir, dir, dir, dir, CRASH_LOG_DIR, dir, dest, name, dir))
 		local f = io.open(dest, "rb")
 		if not f then
 			return { code = 1, message = "export failed" }
