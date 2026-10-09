@@ -117,6 +117,16 @@ local function send_at_unlocked(cmd, timeout_s)
 			end
 		end
 	end
+	-- Unsolicited SIM/network reports arrive between commands and land in
+	-- the next reply. Log them: they are the only record of why the SIM
+	-- dropped (detect-pin glitch, SIM refresh, card error).
+	for _, line in ipairs(buf) do
+		if line:match('^%+QSIMSTAT:') or line:match('^%+QIND:')
+				or line:match('^%+CPIN: NOT')
+				or (line:match('^%+CPIN:') and not cmd:match('CPIN')) then
+			log.info('gl-cellular-atd: modem report: ' .. line)
+		end
+	end
 	return table.concat(buf, '\n')
 end
 
@@ -659,7 +669,9 @@ local methods = {
 		function(req, msg, con)
 			local resp, err = send_at(msg.cmd, msg.timeout)
 			if not resp then
-				return con:reply(req, ubus.STATUS_INVALID_ARGUMENT)
+				-- A status code is the handler's return value; passed to
+				-- reply() it raises and takes the whole daemon down.
+				return ubus.STATUS_INVALID_ARGUMENT
 			end
 			con:reply(req, { response = resp })
 		end, { cmd = ubus.STRING, timeout = ubus.INT32 }
@@ -1106,6 +1118,9 @@ if not handle then
 	os.exit(1)
 end
 f = handle
+-- Report SIM insertion/removal as +QSIMSTAT, so a SIM that drops out
+-- (and comes back PIN-locked) leaves a trace in the log.
+send_at_unlocked('AT+QSIMSTAT=1', 2)
 
 local con, err = ubus.connect(nil, true)
 if not con then

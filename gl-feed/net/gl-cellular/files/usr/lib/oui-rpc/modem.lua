@@ -963,8 +963,16 @@ return {
 		cursor:delete("network", "wwan", "pin_failed")
 		cursor:commit("network")
 
-		-- The wwan interface stopped itself while waiting for the PIN.
-		os.execute("/usr/sbin/gl-cellular-net-run sh -c 'ifdown wwan; sleep 1; ifup wwan' >/dev/null 2>&1 &")
+		-- The wwan interface stopped itself while waiting for the PIN - but
+		-- only when no PIN was saved. With a saved PIN the router's own
+		-- redial is already mid-setup, and bouncing it here left the link
+		-- "connected" with no traffic until a reboot.
+		local h = io.popen("ifstatus wwan 2>/dev/null | jsonfilter -e '@.up' -e '@.pending' 2>/dev/null")
+		local st = h and h:read("*a") or ""
+		if h then h:close() end
+		if not st:match("true") then
+			os.execute("/usr/sbin/gl-cellular-net-run sh -c 'ifdown wwan; sleep 1; ifup wwan' >/dev/null 2>&1 &")
+		end
 		return {}
 	end,
 
