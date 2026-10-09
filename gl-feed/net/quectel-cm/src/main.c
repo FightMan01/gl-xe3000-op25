@@ -26,6 +26,7 @@ static int signal_control_fd[2];
 static int qcm_status_indication_fd[2];
 #endif
 int g_donot_exit_when_modem_hangup = 0;
+int g_pdn_conflict = 0;
 extern int ql_ifconfig(int argc, char *argv[]);
 extern int ql_get_netcard_driver_info(const char*);
 extern int ql_capture_usbmon_log(PROFILE_T *profile, const char *log_path);
@@ -612,6 +613,19 @@ if(profile->usb_dev.idProduct != 0x0316)
                                         profile->auth = old_auto; //still fail, restore old auth moe
                                 }
 
+                                if (qmierr && g_pdn_conflict && profile->apn && profile->profile_index
+                                        && getenv("QCM_EXIT_ON_PDN_CONFLICT")) {
+                                    /* The modem re-attached on its own and already holds a PDN for
+                                     * this APN. An explicit APN TLV makes it ask for a second one;
+                                     * the profile alone lets it bind the existing one. */
+                                    const char *apn = profile->apn;
+
+                                    dbg_time("PDN already active, retrying on profile %d without APN override", profile->profile_index);
+                                    profile->apn = NULL;
+                                    qmierr = request_ops->requestSetupDataCall(profile, IpFamilyV4);
+                                    profile->apn = apn;
+                                }
+
                                 if (!qmierr) {
                                     qmierr = request_ops->requestGetIPAddress(profile, IpFamilyV4);
                                     if (!qmierr)
@@ -645,6 +659,23 @@ if(profile->usb_dev.idProduct != 0x0316)
                                 }
                             }
                                 
+                            if (g_pdn_conflict && getenv("QCM_EXIT_ON_PDN_CONFLICT")
+                                    && ((profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)
+                                    || (profile->enable_ipv6 && IPv6ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED))) {
+                                /* ESM cause 55: a PDN for this APN still exists on the modem.
+                                 * Retrying here can never succeed, so exit and let the caller
+                                 * release the stale context before dialling again. */
+                                dbg_time("PDN for this APN already active, exiting so it can be released");
+                                usbnet_link_change(0, profile);
+#ifdef USE_IPC_MSG_STATUS_IND
+                                main_send_status_to_fifo(QCM_PROCESS_EXIT);
+#endif
+                                if (profile->qmi_ops->deinit)
+                                    profile->qmi_ops->deinit();
+                                main_send_event_to_qmidevice(RIL_REQUEST_QUIT);
+                                goto __main_quit;
+                            }
+
                             if ((profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)
                                     || (profile->enable_ipv6 && IPv6ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)) {
                                 const unsigned allow_time[] = {5, 10, 20, 40, 60};

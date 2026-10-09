@@ -183,11 +183,22 @@ _qcm_deactivate_pdp() {
 		*"+CGACT: $cid,1"*)
 			logger -t gl-cellular \
 				"deactivating stale modem PDP context CID $cid (APN $want_apn) before QMI dial"
-			case "$(_qcm_at "AT+CGACT=0,$cid")" in
-			*OK*) sleep 1 ;;
-			*) logger -p daemon.err -t gl-cellular \
-				"could not deactivate modem PDP context CID $cid" ;;
-			esac
+			# Right after a handover the modem can refuse this for a few
+			# seconds; dialling with the context still up only earns ESM
+			# cause 55 again, so give it a couple more tries first.
+			local try=0
+			while :; do
+				case "$(_qcm_at "AT+CGACT=0,$cid")" in
+				*OK*) sleep 1; break ;;
+				esac
+				try=$((try + 1))
+				[ "$try" -ge 3 ] && {
+					logger -p daemon.err -t gl-cellular \
+						"could not deactivate modem PDP context CID $cid"
+					break
+				}
+				sleep 3
+			done
 			;;
 		esac
 	done
@@ -318,7 +329,7 @@ local pdp="-4 -6"
 	fi
 	rm -f "$nosvc"
 
-	proto_run_command "$interface" env QCM_NO_DHCP4=1 /usr/sbin/quectel-CM \
+	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM \
 		-i "$ifname" $pdp \
 		${apn:+-s "$apn" ${username:+"$username" "$password" $auth}}
 

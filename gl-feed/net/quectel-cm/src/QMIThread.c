@@ -1902,6 +1902,7 @@ static int requestSetupDataCall(PROFILE_T *profile, int curIpFamily) {
 
 //DualIPSupported means can get ipv4 & ipv6 address at the same time, one wds for ipv4, the other wds for ipv6
     profile->curIpFamily = curIpFamily;
+    g_pdn_conflict = 0;
     pRequest = ComposeQMUXMsg(QMIType, QMIWDS_START_NETWORK_INTERFACE_REQ, WdsStartNwInterfaceReq, profile);
     err = QmiThreadSendQMITimeout(pRequest, &pResponse, 120 * 1000, __func__);
     qmi_rsp_check();
@@ -1924,6 +1925,8 @@ static int requestSetupDataCall(PROFILE_T *profile, int curIpFamily) {
 
             dbg_time("call_end_reason_type is %d", call_end_reason_type);
             dbg_time("call_end_reason_verbose is %d", verbose_call_end_reason);
+            if (call_end_reason_type == 6 && verbose_call_end_reason == 55)
+                g_pdn_conflict = 1;
         }
 
         err = le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);
