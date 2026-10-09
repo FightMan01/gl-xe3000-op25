@@ -67,8 +67,12 @@ opt() {
 }
 
 at() {
+	# Escape the quotes every mode_pref command carries; unescaped they make
+	# the JSON invalid and ubus drops the command without reaching the modem.
+	local cmd
+	cmd="$(printf '%s' "$1" | sed 's/"/\\"/g')"
 	ubus -t 8 call cellular.at command \
-		"{\"cmd\":\"$1\",\"timeout\":6}" 2>/dev/null |
+		"{\"cmd\":\"$cmd\",\"timeout\":6}" 2>/dev/null |
 		jsonfilter -e '@.response' 2>/dev/null
 }
 

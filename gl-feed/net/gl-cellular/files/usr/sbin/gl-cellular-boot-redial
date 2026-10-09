@@ -188,7 +188,9 @@ reset_state() {
 # or nothing if the daemon/port is unavailable - callers must treat an
 # empty result as "unknown", not as a failure.
 at_query() {
-	ubus -t 5 call cellular.at command "{\"cmd\":\"$1\",\"timeout\":3}" 2>/dev/null |
+	local cmd
+	cmd="$(printf '%s' "$1" | sed 's/"/\\"/g')"
+	ubus -t 5 call cellular.at command "{\"cmd\":\"$cmd\",\"timeout\":3}" 2>/dev/null |
 		jsonfilter -e '@.response' 2>/dev/null
 }
 

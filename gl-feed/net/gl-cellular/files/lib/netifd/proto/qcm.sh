@@ -87,8 +87,12 @@ proto_qcm_setup() {
 esac
 
 _qcm_at() {
+	# Quotes inside the AT command must be escaped for the JSON payload, or
+	# ubus rejects it and commands like AT+QNWPREFCFG="..." never run.
+	local cmd
+	cmd="$(printf '%s' "$1" | sed 's/"/\\"/g')"
 	ubus -t 8 call cellular.at command \
-		"{\"cmd\":\"$1\",\"timeout\":6}" 2>/dev/null |
+		"{\"cmd\":\"$cmd\",\"timeout\":6}" 2>/dev/null |
 		jsonfilter -e '@.response' 2>/dev/null
 }
 
