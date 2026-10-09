@@ -183,6 +183,19 @@ return {
 					f:close()
 					local ok, entry = pcall(cjson.decode, data)
 					if ok and type(entry) == "table" then
+						-- GL ships the modem upgrade page as a level:0
+						-- route that nothing in the 4.10 UI links to.
+						-- List it under System, right after Upgrade.
+						if entry.view == "modem-upgrade" and entry.level == 0 then
+							entry.level = 2
+							entry.index = 21
+							entry.parent = "system"
+							entry.parent_icon = "setting"
+							entry.parent_index = 70
+							-- No menu_modem-upgrade string exists in GL's
+							-- locales (stock never lists the page).
+							entry.title = entry.title or "Modem Upgrade"
+						end
 						table.insert(entries, entry)
 					end
 				end
