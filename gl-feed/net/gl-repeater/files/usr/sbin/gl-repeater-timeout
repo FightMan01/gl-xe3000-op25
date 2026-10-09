@@ -11,6 +11,15 @@ RETRY_BACKOFF_MAX=300
 # clears the counter.
 MAX_RETRIES=$(uci -q get gl-repeater.settings.max_retries)
 [ -n "$MAX_RETRIES" ] || MAX_RETRIES=6
+# A network that already worked this boot (a train or hotel AP that dropped
+# us, roamed, or rebooted) is worth waiting for: give wpa_supplicant longer to
+# find it again, retry on a short fixed interval, and never give up on it.
+KNOWN_FLAG=/tmp/gl-repeater-known-ssid
+KNOWN_CONNECT_TIMEOUT=60
+KNOWN_RETRY_INTERVAL=20
+# ...but only for a while after it was last up, so a network left behind (the
+# train after getting home) stops bouncing the shared radio.
+KNOWN_WINDOW=1800
 FAIL_FLAG=/tmp/gl-repeater-fail-type
 RETRY_FLAG=/tmp/gl-repeater-retry-at
 RETRY_COUNT_FLAG=/tmp/gl-repeater-retry-count
@@ -149,18 +158,26 @@ while true; do
 	if [ "$up" = "true" ]; then
 		connecting_since=""
 		last_nak_line=""
+		uci -q get wireless."$sta_section".ssid > "$KNOWN_FLAG"
 		rm -f "$FAIL_FLAG" "$AUTOFIX_COUNT_FLAG" "$RETRY_COUNT_FLAG"
 		sleep 5
 		continue
 	fi
 
 	now=$(date +%s)
+	known=0
+	[ -s "$KNOWN_FLAG" ] &&
+		[ "$(cat "$KNOWN_FLAG")" = "$(uci -q get wireless."$sta_section".ssid)" ] &&
+		[ $((now - $(date -r "$KNOWN_FLAG" +%s))) -lt "$KNOWN_WINDOW" ] &&
+		known=1
+	timeout=$CONNECT_TIMEOUT
+	[ "$known" = 1 ] && timeout=$KNOWN_CONNECT_TIMEOUT
 	if [ -z "$connecting_since" ]; then
 		connecting_since=$now
 		rm -f "$FAIL_FLAG"
 	elif try_eap_autofix; then
 		connecting_since=$now
-	elif [ $((now - connecting_since)) -ge "$CONNECT_TIMEOUT" ] &&
+	elif [ $((now - connecting_since)) -ge "$timeout" ] &&
 		with_net_lock set_sta_disabled 1; then
 		# (lock busy: nothing recorded, the timeout is re-evaluated next pass)
 		retries=$(cat "$RETRY_COUNT_FLAG" 2>/dev/null || echo 0)
@@ -169,7 +186,11 @@ while true; do
 		echo "not-found" > "$FAIL_FLAG"
 		connecting_since=""
 		last_nak_line=""
-		if [ "$retries" -ge "$MAX_RETRIES" ]; then
+		if [ "$known" = 1 ]; then
+			echo $((now + KNOWN_RETRY_INTERVAL)) > "$RETRY_FLAG"
+			logger -p daemon.notice -t gl-repeater \
+				"lost known network; retry $retries in ${KNOWN_RETRY_INTERVAL}s"
+		elif [ "$retries" -ge "$MAX_RETRIES" ]; then
 			# Stop trying: a STA iface shares its radio with the AP on that
 			# band, so endlessly re-enabling a network that cannot associate
 			# keeps that band occupied/degraded. Leaving it disabled frees
