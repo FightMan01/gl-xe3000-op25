@@ -1,11 +1,9 @@
 #!/bin/sh
-# lua-eco installs its Lua + C modules under /usr/local/lib/lua/5.4, but the
-# eco interpreter's compiled-in package.path/cpath only search /usr/share/lua
-# and /usr/lib/lua. Without this, every eco-based daemon dies at startup with
-# "module 'eco.ubus' not found" - gl-ngx-session (the whole GL UI login/session
-# API) and gl-cellular-atd (the cellular ubus objects the UI's modem cards and
-# signal LEDs depend on). The package ships these as symlinks; recreate them
-# here in case the overlay lost them.
+# Older lua-eco builds installed their modules under /usr/local/lib/lua/5.4,
+# which the eco interpreter does not search, so every eco daemon died at
+# startup with "module .eco.ubus. not found". Current lua-eco and lua-cjson
+# install into /usr/lib/lua directly; this only links anything an older
+# install left under /usr/local.
 mkdir -p /usr/lib/lua/5.4
 for f in /usr/local/lib/lua/5.4/*; do
 	[ -e "$f" ] || continue
