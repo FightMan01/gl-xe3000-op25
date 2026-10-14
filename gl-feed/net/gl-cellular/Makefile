@@ -15,7 +15,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-cellular
 PKG_VERSION:=1
-PKG_RELEASE:=20
+PKG_RELEASE:=22
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -59,6 +59,7 @@ define Package/gl-cellular/postinst
 	/etc/init.d/gl-cellular-atd enable
 	/etc/init.d/gl-cellular-pcie-pm enable
 	/etc/init.d/gl-cellular-boot-redial enable
+	/etc/init.d/gl-cellular-relock-trace enable
 }
 exit 0
 endef

@@ -39,6 +39,7 @@
 	uci -q batch <<-EOT
 		set mwan3.gl_failover_v6=policy
 		add_list mwan3.gl_failover_v6.use_member='wwan6_m2_w1'
+		set mwan3.gl_failover_v6.last_resort='default'
 	EOT
 }
 

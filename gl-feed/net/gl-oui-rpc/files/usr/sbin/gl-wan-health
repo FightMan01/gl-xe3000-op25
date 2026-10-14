@@ -63,6 +63,7 @@ RESET_GRACE=$(opt reset_grace_sec 90)
 STARTUP_GRACE=$(opt startup_grace_sec 120)
 
 fail_count=0
+quality_noted=0
 reset_count=0
 reset_window_start=0
 grace_until=$(( $(date +%s) + STARTUP_GRACE ))
@@ -128,11 +129,15 @@ is_modem_iface() {
 #   online_any  mwan3 reports at least one interface online
 #   online_good at least one interface mwan3 says is online really works
 #   up_good     at least one interface that is up really works
+#   up_wedged   a working interface whose mwan3 state is neither online nor
+#               offline (stuck "connecting"/unknown: the tracker bug). A plain
+#               "offline" is the tracker's quality verdict, not a wedge.
 #   best_iface  a non-modem interface to refresh as a last resort
 probe() {
 	online_any=0
 	online_good=0
 	up_good=0
+	up_wedged=0
 	best_iface=""
 	local ifc dev st up ok
 	for ifc in $(mwan3_tracked_ifaces); do
@@ -146,7 +151,13 @@ probe() {
 		st="$(mwan3_state "$ifc")"
 		[ "$st" = "online" ] && online_any=1
 		[ "$st" = "online" ] && [ "$ok" = "1" ] && online_good=1
-		[ "$up" = "1" ] && [ "$ok" = "1" ] && up_good=1
+		if [ "$up" = "1" ] && [ "$ok" = "1" ]; then
+			up_good=1
+			case "$st" in
+			online|offline) ;;
+			*) up_wedged=1 ;;
+			esac
+		fi
 		[ "$up" = "1" ] && [ -z "$best_iface" ] && ! is_modem_iface "$ifc" && best_iface="$ifc"
 	done
 }
@@ -208,14 +219,31 @@ while :; do
 		sleep "$CHECK_PERIOD"
 		continue
 	fi
-	echo 0 > "$STATE_FILE"
+	echo "$up_good" > "$STATE_FILE"
 
 	# Is this mwan3 contradicting reality, or a genuine outage?
 	#   online_any && !online_good : mwan3 claims connected, nothing works
-	#   !online_any && up_good     : a working uplink exists but mwan3 uses none
+	#   !online_any && up_wedged   : a working uplink exists but mwan3 is stuck
+	#                                in a non-verdict state and uses none
+	# An uplink the tracker has plainly marked offline (loss/latency on a
+	# marginal cell) that still passes the probe is not wedged: restarting
+	# mwan3 only resets it to "online" for a few minutes and flushes every
+	# client's connections. The policy's last_resort keeps traffic flowing.
 	contradiction=0
 	[ "$online_any" = "1" ] && [ "$online_good" = "0" ] && contradiction=1
-	[ "$online_any" = "0" ] && [ "$up_good" = "1" ] && contradiction=1
+	[ "$online_any" = "0" ] && [ "$up_wedged" = "1" ] && contradiction=1
+
+	if [ "$contradiction" = "0" ] && [ "$up_good" = "1" ]; then
+		fail_count=0
+		if [ "$quality_noted" = "0" ]; then
+			log daemon.notice \
+				"mwan3 marks the uplink offline but it passes traffic; leaving mwan3 alone"
+			quality_noted=1
+		fi
+		sleep "$CHECK_PERIOD"
+		continue
+	fi
+	quality_noted=0
 
 	if [ "$contradiction" = "0" ]; then
 		# No internet through any uplink at all - a real outage. The

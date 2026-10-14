@@ -1,0 +1,76 @@
+#!/bin/sh
+# Passive modem tracer. Keeps a RAM ring of read-only AT snapshots and writes
+# it to /root/relock-traces when the SIM falls back to PIN-locked or the PS
+# attach drops, so the seconds before such an event survive a reboot.
+
+RING=/tmp/relock-trace.log
+OUT=/root/relock-traces
+INTERVAL=5
+RING_LINES=1500
+TAIL_SEC=30
+MAX_DUMPS=6
+COOLDOWN=180
+
+at() {
+	ubus -t 6 call cellular.at command "{\"cmd\":\"$1\",\"timeout\":4}" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null | tr '\r\n' '  ' | sed 's/  */ /g'
+}
+
+dump() {
+	local f
+	mkdir -p "$OUT"
+	f="$OUT/trace-$(date +%Y%m%d-%H%M%S)-$1.log"
+	{
+		echo "# reason=$1 uptime=$(cut -d' ' -f1 /proc/uptime)"
+		cat "$RING"
+		echo "# ---- logread"
+		logread | tail -400
+		echo "# ---- dmesg"
+		dmesg | tail -80
+	} > "$f"
+	ls -t "$OUT"/trace-*.log 2>/dev/null | tail -n +$((MAX_DUMPS + 1)) | xargs rm -f 2>/dev/null
+}
+
+prev_pin=0
+prev_att=""
+dump_at=0
+dump_reason=""
+last_dump=0
+n=0
+
+while :; do
+	now=$(date +%s)
+	cpin=$(at 'AT+CPIN?')
+	att=$(at 'AT+CGATT?' | grep -oE 'CGATT: [01]' | tail -n1)
+	line="$(date +%H:%M:%S) cpin=[$cpin] att=[$att]"
+	line="$line eng=[$(at 'AT+QENG=\"servingcell\"')]"
+	line="$line ca=[$(at 'AT+QCAINFO')]"
+	line="$line c5=[$(at 'AT+C5GREG?')] ce=[$(at 'AT+CEREG?')]"
+	if [ $((n % 6)) -eq 0 ]; then
+		line="$line temp=[$(at 'AT+QTEMP' | grep -oE '\"(mdmss-0-usr|modem-lte-sub6-pa1)\",\"[0-9-]+\"' | tr '\n' ' ')]"
+	fi
+	echo "$line" >> "$RING"
+	n=$((n + 1))
+	if [ $((n % 100)) -eq 0 ]; then
+		tail -n "$RING_LINES" "$RING" > "$RING.new" && mv "$RING.new" "$RING"
+	fi
+
+	pin=0
+	case "$cpin" in *"SIM PIN"*) pin=1 ;; esac
+	if [ "$dump_at" -eq 0 ] && [ $((now - last_dump)) -ge "$COOLDOWN" ]; then
+		if [ "$pin" -eq 1 ] && [ "$prev_pin" -eq 0 ]; then
+			dump_at=$((now + TAIL_SEC)); dump_reason=simpin
+		elif [ "$att" = "CGATT: 0" ] && [ "$prev_att" = "CGATT: 1" ]; then
+			dump_at=$((now + TAIL_SEC)); dump_reason=detach
+		fi
+	fi
+	prev_pin=$pin
+	[ -n "$att" ] && prev_att=$att
+
+	if [ "$dump_at" -ne 0 ] && [ "$now" -ge "$dump_at" ]; then
+		dump "$dump_reason"
+		last_dump=$now
+		dump_at=0
+	fi
+	sleep "$INTERVAL"
+done

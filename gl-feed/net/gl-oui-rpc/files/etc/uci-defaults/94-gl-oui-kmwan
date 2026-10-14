@@ -122,6 +122,7 @@ uci -q batch <<-EOF
 	add_list mwan3.gl_failover.use_member='wwan4_m2_w1'
 	add_list mwan3.gl_failover.use_member='repeater_m3_w1'
 	add_list mwan3.gl_failover.use_member='tethering_m4_w1'
+	set mwan3.gl_failover.last_resort='default'
 
 	set mwan3.gl_default_rule=rule
 	set mwan3.gl_default_rule.dest_ip='0.0.0.0/0'
