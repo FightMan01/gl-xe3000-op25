@@ -495,7 +495,51 @@ local function modem_lock_state()
 	return nil
 end
 
-return {
+local PROFILE_MAX = 8
+
+local PROFILE_IP_TYPE = { ipv4v6 = 0, ipv4 = 1, ip = 1, ipv6 = 2 }
+
+local function uci_list(v)
+	if type(v) == "table" then return v end
+	if type(v) == "string" then return { v } end
+	return {}
+end
+
+-- One saved profile in the shape the UI feeds back into the SIM settings
+-- form (same field names as get_sim_config). Profiles saved by older
+-- builds only have name/apn/auth/username and a text ip_type.
+local function profile_entry(s)
+	local ip_type = tonumber(s.ip_type)
+	if ip_type == nil then ip_type = PROFILE_IP_TYPE[tostring(s.ip_type or ""):lower()] or 0 end
+	return {
+		id = s[".name"],
+		name = s.name or "",
+		apn = s.apn or "",
+		protocol = s.protocol or "",
+		device = s.device or "",
+		service = s.service or "",
+		dial_number = s.dial_number or "",
+		auth = (s.auth or "none"):upper(),
+		username = s.username or "",
+		password = s.password or "",
+		ip_type = ip_type,
+		network_mode = s.network_mode or "AUTO",
+		roaming = s.roaming ~= "0",
+		ttl = tonumber(s.ttl),
+		hl = tonumber(s.hl),
+		mtu = tonumber(s.mtu),
+		band_enable = s.band_enable == "1",
+		band_filter_mode = tonumber(s.band_filter_mode) or 1,
+		band_list = {
+			LTE = as_array(uci_list(s.lte_bands)),
+			["NR-NSA"] = as_array(uci_list(s.nsa_bands)),
+			["NR-SA"] = as_array(uci_list(s.sa_bands)),
+		},
+	}
+end
+
+local methods
+methods = {
 	get_modem_info = function(args)
 		return { imei = get_imei(), model = MODEM_MODEL }
 	end,
@@ -1304,51 +1348,132 @@ return {
 
 	-- --- APN profiles ---
 
+	-- The page sends {active_slots=[{bus,iccid,slot}]} and reads back
+	-- {active_slots, custom_profiles}: each active slot carries that SIM's
+	-- current dial settings (so "save as profile" has something to save),
+	-- custom_profiles is the saved list. At most PROFILE_MAX profiles; the
+	-- UI hides "add" at the same count.
 	get_profile_list = function(args)
 		local cursor = uci.cursor()
 		local profiles = {}
 		cursor:foreach("gl-cellular", "apn_profile", function(s)
-			table.insert(profiles, {
-				id = s[".name"], name = s.name, apn = s.apn,
-				auth = s.auth, username = s.username, ip_type = s.ip_type,
-			})
+			table.insert(profiles, profile_entry(s))
 		end)
-		return { profiles = as_array(profiles) }
+
+		local active = tonumber(cursor:get("gl-cellular", "state", "active_slot")) or 1
+		local slots = {}
+		if type(args.active_slots) == "table" then
+			for _, s in ipairs(args.active_slots) do
+				local entry = { bus = s.bus, iccid = s.iccid, slot = tonumber(s.slot) }
+				if entry.slot == active then
+					for k, v in pairs(methods.get_sim_config({})) do
+						if entry[k] == nil then entry[k] = v end
+					end
+				end
+				table.insert(slots, entry)
+			end
+		end
+		return { active_slots = as_array(slots), custom_profiles = as_array(profiles) }
 	end,
 
+	-- action 1 = add, 2 = modify (args.id). The UI also passes the SIM's
+	-- bus/iccid/slot when saving the current settings; those are not part
+	-- of a profile.
 	set_profile = function(args)
-		if type(args.name) ~= "string" or args.name == "" then
-			return { code = 1, message = "missing name" }
+		local name = args.name
+		if type(name) ~= "string" or name == "" then
+			return { err_code = 1, err_msg = "missing name" }
+		end
+		if #name > 64 then
+			return { err_code = 1, err_msg = "name too long" }
 		end
 		local cursor = uci.cursor()
-		local id = args.id
-		if not id or not cursor:get("gl-cellular", id) then
-			id = cursor:add("gl-cellular", "apn_profile")
+		local count, editing = 0, nil
+		local clash = false
+		cursor:foreach("gl-cellular", "apn_profile", function(s)
+			count = count + 1
+			if s[".name"] == args.id then editing = s[".name"] end
+			if s.name == name and s[".name"] ~= args.id then clash = true end
+		end)
+		if clash then
+			return { err_code = 1, err_msg = "profile name already exists" }
 		end
-		cursor:set("gl-cellular", id, "name", args.name)
-		if args.apn then cursor:set("gl-cellular", id, "apn", args.apn) end
-		if args.auth then cursor:set("gl-cellular", id, "auth", args.auth) end
-		if args.username then cursor:set("gl-cellular", id, "username", args.username) end
-		if args.ip_type then cursor:set("gl-cellular", id, "ip_type", args.ip_type) end
+
+		local id = editing
+		if not id then
+			if count >= PROFILE_MAX then
+				return { err_code = 1, err_msg = "too many profiles" }
+			end
+			id = string.format("p%d%03d", os.time(), math.random(0, 999))
+			cursor:set("gl-cellular", id, "apn_profile")
+		end
+
+		local function put(key, value)
+			if value == nil or value == "" then
+				cursor:delete("gl-cellular", id, key)
+			else
+				cursor:set("gl-cellular", id, key, tostring(value))
+			end
+		end
+		put("name", name)
+		put("apn", args.apn)
+		put("protocol", args.protocol)
+		put("device", args.device)
+		put("service", args.service)
+		put("dial_number", args.dial_number)
+		put("auth", args.auth and tostring(args.auth):lower())
+		put("username", args.username)
+		put("password", args.password)
+		put("ip_type", tonumber(args.ip_type) or 0)
+		put("network_mode", args.network_mode)
+		if args.roaming ~= nil then put("roaming", args.roaming and "1" or "0") end
+		for _, key in ipairs({ "ttl", "hl", "mtu" }) do
+			local n = tonumber(args[key])
+			put(key, n and n > 0 and n or nil)
+		end
+		put("band_enable", args.band_enable and "1" or "0")
+		put("band_filter_mode", tonumber(args.band_filter_mode))
+		local bands = type(args.band_list) == "table" and args.band_list or {}
+		for key, src in pairs({ lte_bands = "LTE", nsa_bands = "NR-NSA", sa_bands = "NR-SA" }) do
+			cursor:delete("gl-cellular", id, key)
+			if type(bands[src]) == "table" and #bands[src] > 0 then
+				local list = {}
+				for _, b in ipairs(bands[src]) do list[#list + 1] = tostring(b) end
+				cursor:set("gl-cellular", id, key, list)
+			end
+		end
 		cursor:commit("gl-cellular")
 		return { id = id }
 	end,
 
 	remove_profile = function(args)
-		if not args.id then
-			return { code = 1, message = "missing id" }
+		if type(args.id) ~= "string" or args.id == "" then
+			return { err_code = 1, err_msg = "missing id" }
 		end
 		local cursor = uci.cursor()
+		-- Only profile sections: the id comes from the client and this
+		-- file also holds the daemon's state/watchdog sections.
+		if cursor:get("gl-cellular", args.id) ~= "apn_profile" then
+			return { err_code = 1, err_msg = "no such profile" }
+		end
 		cursor:delete("gl-cellular", args.id)
 		cursor:commit("gl-cellular")
 		return {}
 	end,
 
-	-- APN database update - no remote update source/signing story defined
-	-- yet, so this acknowledges the request without claiming a real
-	-- update happened.
+	-- Asks the APN database service for a newer database and installs it
+	-- (gl-cellular-apn-db-update, which does the version check, download,
+	-- size/sha256 verification and atomic install). The page maps
+	-- 20002053 -> "check your internet connection", 20002054 -> "try again
+	-- later" and treats 20002055 (already current) as success.
 	set_apn_db_update = function(args)
-		return { code = 0, note = "APN database update not yet implemented" }
+		local p = io.popen("/usr/sbin/gl-cellular-apn-db-update >/dev/null 2>&1; echo $?")
+		local rc = p and tonumber(p:read("*l")) or 2
+		if p then p:close() end
+		if rc == 0 then return {} end
+		if rc == 6 then return { err_code = 20002055, err_msg = "apn database is up to date" } end
+		if rc == 7 then return { err_code = 20002054, err_msg = "update already running" } end
+		return { err_code = 20002053, err_msg = "apn database update failed (" .. rc .. ")" }
 	end,
 
 	-- --- Data usage / traffic accounting ---
@@ -1548,3 +1673,5 @@ return {
 		return {}
 	end,
 }
+
+return methods

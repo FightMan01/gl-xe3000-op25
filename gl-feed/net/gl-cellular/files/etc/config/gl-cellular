@@ -90,3 +90,18 @@ config watchdog 'watchdog'
 	option lte_fallback '1'
 	option lte_fallback_after '2'
 	option lte_fallback_hold_sec '900'
+	# Seconds between watchdog checks while the link is healthy (traffic
+	# flowing). Any bad tick, redial grace or no-baseline tick still uses
+	# check_period_sec, and an mwan3 disconnecting/disconnected or wwan_4
+	# ifdown event wakes the watchdog at once.
+	option idle_period_sec '30'
+	# Debug: record AT snapshots around SIM re-lock / PS detach events to
+	# /root/relock-traces (gl-cellular-relock-trace). Costs several AT
+	# commands every 10s; restart that service after changing this.
+	option relock_trace '0'
+
+config apn 'apn'
+	# Service queried by the Cellular page's "update APN database" action.
+	# Same endpoint the stock firmware uses; the reply names the database
+	# file to download, which is verified (TLS, size, sha256) before use.
+	option url 'https://firmware-api.gl-inet.com'

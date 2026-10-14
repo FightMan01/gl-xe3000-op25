@@ -39,6 +39,8 @@ local ubus = require 'eco.ubus'
 local uci = require 'eco.uci'
 local log = require 'eco.log'
 local cjson = require 'cjson'
+local apndb_ok, apndb = pcall(require, 'gloui.apndb')
+if not apndb_ok then apndb = nil end
 
 local function as_array(t)
 	if next(t) == nil then return cjson.empty_array end
@@ -901,14 +903,22 @@ local cellular_methods = {
 			local imsi_resp = send_at('AT+CIMI', 2)
 			local iccid_value = iccid and iccid[1]
 			if iccid_value then iccid_value = iccid_value:gsub('F$', '') end
+			local imsi = numeric_result(imsi_resp, 14)
+			-- Suggested APNs for the SIM's home network, from the APN
+			-- database. Never let a lookup problem break the status push.
+			local apns = {}
+			if apndb and imsi then
+				local ok, list = pcall(apndb.lookup, imsi)
+				if ok and type(list) == 'table' then apns = list end
+			end
 			con:reply(req, { sims = {
 				{
 					bus = MODEM_BUS,
 					slot = 1,
 					type = 0,
 					iccid = iccid_value,
-					imsi = numeric_result(imsi_resp, 14),
-					apn_list = cjson.empty_array,
+					imsi = imsi,
+					apn_list = #apns > 0 and apns or cjson.empty_array,
 					phone_number = '',
 				},
 			} })

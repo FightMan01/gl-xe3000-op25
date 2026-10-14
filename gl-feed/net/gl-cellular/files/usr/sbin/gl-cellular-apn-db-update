@@ -1,0 +1,88 @@
+#!/bin/sh
+# Fetch a newer APN database from the update service and install it under
+# /etc/gl-cellular/apn-db, where gloui.apndb prefers it over the bundled
+# copy. The protocol is the stock firmware's (apn_db_update.sh): POST the
+# current version, get {upgrade_available, apn_db_new_version, download_path,
+# sha256, size}. TLS is verified, and the file is checked for size, sha256,
+# gzip and JSON structure before it replaces anything.
+#
+# Exit codes: 0 updated, 1 no network, 2 request failed, 3 bad HTTP status,
+# 4 empty or invalid reply, 6 already current, 7 already running,
+# 8 download failed, 9 size mismatch, 10 sha256 mismatch, 11 install failed.
+
+TAG=gl-apn-db
+DB_DIR=/etc/gl-cellular/apn-db
+BUNDLED_DIR=/www/js
+LOCK=/var/run/gl-apn-db-update.lock
+TMP="$DB_DIR/.download.$$"
+
+log() {
+	logger -t "$TAG" "$1"
+}
+
+cleanup() {
+	rm -f "$TMP" "$TMP.json"
+}
+trap cleanup EXIT
+
+exec 9>"$LOCK"
+flock -n 9 || exit 7
+
+BASE="$(uci -q get gl-cellular.apn.url)"
+BASE="${BASE:-https://firmware-api.gl-inet.com}"
+
+current_file="$(ls -1 "$DB_DIR"/apns-full-conf-*.json.gz "$BUNDLED_DIR"/apns-full-conf-*.json.gz 2>/dev/null | head -n 1)"
+current="$(echo "$current_file" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+current="${current:-0.0.0}"
+
+reply="$(curl -sS --connect-timeout 5 -m 20 -w '\n%{http_code}' \
+	-X POST -H 'Content-Type: application/json' \
+	--data "{\"apn_db_version\": \"$current\"}" \
+	"$BASE/api/firmware/apn-db-check" 2>/dev/null)"
+rc=$?
+if [ $rc -ne 0 ]; then
+	log "update check failed (curl $rc)"
+	case "$rc" in
+		5|6|7|28) exit 1 ;;
+		*) exit 2 ;;
+	esac
+fi
+code="$(echo "$reply" | tail -n 1)"
+body="$(echo "$reply" | sed '$d')"
+[ "$code" = "200" ] || { log "update check returned HTTP $code"; exit 3; }
+[ -n "$body" ] || exit 4
+
+[ "$(echo "$body" | jsonfilter -e '@.upgrade_available' 2>/dev/null)" = "true" ] || exit 6
+
+version="$(echo "$body" | jsonfilter -e '@.apn_db_new_version' 2>/dev/null)"
+url="$(echo "$body" | jsonfilter -e '@.download_path' 2>/dev/null)"
+sha="$(echo "$body" | jsonfilter -e '@.sha256' 2>/dev/null)"
+size="$(echo "$body" | jsonfilter -e '@.size' 2>/dev/null)"
+
+# The version ends up in a file name and the rest drives a download: refuse
+# anything that is not exactly the expected shape.
+echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || exit 4
+case "$url" in https://*) ;; *) exit 4 ;; esac
+echo "$sha" | grep -qE '^[0-9a-fA-F]{64}$' || exit 4
+echo "$size" | grep -qE '^[0-9]+$' || exit 4
+[ "$size" -gt 0 ] && [ "$size" -le 20971520 ] || exit 4
+
+mkdir -p "$DB_DIR" || exit 11
+log "downloading APN database $version"
+curl -fsSL --connect-timeout 5 -m 180 -o "$TMP" "$url" 2>/dev/null || exit 8
+
+[ "$(wc -c < "$TMP")" -eq "$size" ] || { log "size mismatch"; exit 9; }
+[ "$(sha256sum "$TMP" | cut -d' ' -f1)" = "$(echo "$sha" | tr 'A-F' 'a-f')" ] ||
+	{ log "sha256 mismatch"; exit 10; }
+
+gzip -dc "$TMP" > "$TMP.json" 2>/dev/null || exit 11
+[ -n "$(jsonfilter -i "$TMP.json" -e '@["apns"][0]["-apn"]' 2>/dev/null)" ] ||
+	{ log "database has no entries"; exit 11; }
+
+final="$DB_DIR/apns-full-conf-$version.json.gz"
+mv "$TMP" "$final" || exit 11
+for f in "$DB_DIR"/apns-full-conf-*.json.gz; do
+	[ "$f" = "$final" ] || rm -f "$f"
+done
+log "installed APN database $version"
+exit 0
