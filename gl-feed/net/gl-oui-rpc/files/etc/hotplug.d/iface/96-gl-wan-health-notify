@@ -1,0 +1,20 @@
+#!/bin/sh
+# mwan3track's connected/disconnected verdicts are the moments the Internet
+# LED and /var/run/gl-wan-online are most likely to be stale. Wake
+# gl-wan-health (or, while it is disabled, the gl-internet-led fallback) so
+# it re-checks now instead of at the end of its sleep. Both keep their own
+# poll, so a missed signal only costs latency. Signalling a service that is
+# not running is a harmless ubus error.
+
+case "$ACTION" in
+	connected|disconnected) ;;
+	*) exit 0 ;;
+esac
+
+for svc in gl-wan-health gl-internet-led; do
+	ubus call service signal \
+		"{\"name\":\"$svc\",\"instance\":\"instance1\",\"signal\":10}" \
+		>/dev/null 2>&1
+done
+
+exit 0

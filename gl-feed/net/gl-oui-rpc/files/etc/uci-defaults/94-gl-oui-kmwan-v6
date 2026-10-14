@@ -18,13 +18,26 @@
 		set mwan3.wwan_6.reliability='1'
 		set mwan3.wwan_6.count='2'
 		set mwan3.wwan_6.timeout='4'
-		set mwan3.wwan_6.interval='10'
+		set mwan3.wwan_6.interval='30'
+		set mwan3.wwan_6.failure_interval='5'
+		set mwan3.wwan_6.recovery_interval='10'
 		set mwan3.wwan_6.down='3'
 		set mwan3.wwan_6.up='3'
 		set mwan3.wwan_6.flush_conntrack='ifup'
 		add_list mwan3.wwan_6.flush_conntrack='ifdown'
 	EOT
 }
+
+# Routers seeded by an older build still probe the metered link every 10s.
+# Move only an untouched old default; a value the user changed stays.
+if [ "$(uci -q get mwan3.wwan_6.interval)" = "10" ] &&
+	[ -z "$(uci -q get mwan3.wwan_6.failure_interval)" ]; then
+	uci -q batch <<-EOT
+		set mwan3.wwan_6.interval='30'
+		set mwan3.wwan_6.failure_interval='5'
+		set mwan3.wwan_6.recovery_interval='10'
+	EOT
+fi
 
 [ "$(uci -q get mwan3.wwan6_m2_w1)" = "member" ] || {
 	uci -q batch <<-EOT

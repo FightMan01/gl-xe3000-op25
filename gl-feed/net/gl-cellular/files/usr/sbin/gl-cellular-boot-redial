@@ -28,6 +28,14 @@ opt() {
 # coming back anyway - just don't mistake OFFLINE_THRESHOLD x CHECK_PERIOD
 # for the real elapsed time.
 CHECK_PERIOD=$(opt check_period_sec 10)
+# Tick length while the link is confirmed healthy. Every bad, grace or
+# no-baseline tick still runs at CHECK_PERIOD, so the redial ladder's own
+# timing is unchanged; only the wait before the first bad tick can grow, and
+# the mwan3 and wwan_4 ifdown hotplug events cut that wait short. 30s also
+# matches mwan3's wwan_4 interval, whose pings keep rx_bytes moving on an
+# otherwise idle link, so a quiet link rarely needs a probe of its own.
+IDLE_PERIOD=$(opt idle_period_sec 30)
+[ "$IDLE_PERIOD" -ge "$CHECK_PERIOD" ] 2>/dev/null || IDLE_PERIOD=$CHECK_PERIOD
 OFFLINE_THRESHOLD=$(opt offline_threshold 5)
 TRIGGER_WINDOW=$(opt restore_trigger_window_sec 300)
 TRIGGER_MAX=$(opt restore_trigger_max_cnt 3)
@@ -131,22 +139,72 @@ lte_fallback_since=0
 SLEEP_PID=""
 trap 'kill "$SLEEP_PID" 2>/dev/null' USR1
 
+# USR2 (sent on a netifd ifdown of wwan_4) only ends a healthy-link sleep.
+# A trapped signal also interrupts `wait`, so on any other sleep the wait is
+# resumed: those ticks pace the redial ladder and must stay CHECK_PERIOD
+# apart however many events arrive.
+IDLE_SLEEP=0
+NUDGED=0
+trap 'NUDGED=1; [ "$IDLE_SLEEP" = 1 ] && kill "$SLEEP_PID" 2>/dev/null' USR2
+
 do_sleep() {
 	sleep "$1" &
 	SLEEP_PID=$!
-	wait "$SLEEP_PID" 2>/dev/null
+	while :; do
+		NUDGED=0
+		wait "$SLEEP_PID" 2>/dev/null
+		[ "$NUDGED" = 1 ] && [ "$IDLE_SLEEP" != 1 ] || break
+	done
 	SLEEP_PID=""
 }
 
+idle_sleep() {
+	IDLE_SLEEP=1
+	do_sleep "$1"
+	IDLE_SLEEP=0
+}
+
+# One netifd read for both fields; ifstatus is itself a script around two
+# ubus calls, and the loop used to run it twice per tick.
+wwan4_status() {
+	local st
+	st="$(ubus call network.interface.wwan_4 status 2>/dev/null)"
+	up="$(jsonfilter -s "$st" -e '@.up' 2>/dev/null)"
+	device="$(jsonfilter -s "$st" -e '@.l3_device' 2>/dev/null)"
+}
+
+# Last AT+CPIN? reply, shared by sim_lock_watch() and enabled(). While the
+# link is healthy it is refreshed once a minute instead of twice per tick: a
+# re-lock that matters stops the traffic, and the next (bad) tick re-checks
+# at once. cpin_valid=0 forces a fresh query on the next use.
+CPIN_EVERY=60
+cpin=""
+cpin_valid=0
+cpin_at=0
+recheck_cpin=1
+
+cpin_query() {
+	cpin="$(at_query 'AT+CPIN?')"
+	cpin_valid=1
+}
+
 enabled() {
-	[ "$(uci -q get network.wwan.auto)" != "0" ] || return 1
-	[ "$(uci -q get network.wwan.disabled)" != "1" ] || return 1
-	[ "$(uci -q get gl-cellular.state.dial_enabled)" != "0" ] || return 1
+	local net state scanning
+	# One `uci show` per config instead of a get per option.
+	net="$(uci -q show network.wwan)"
+	case "$net" in
+		*"network.wwan.auto='0'"*|*"network.wwan.disabled='1'"*) return 1 ;;
+	esac
+	state="$(uci -q show gl-cellular.state)"
+	case "$state" in
+		*"gl-cellular.state.dial_enabled='0'"*) return 1 ;;
+	esac
 
 	# Stand down while the SIM is PIN/PUK locked: nothing can be dialled and
 	# a radio/PCIe reset would only re-lock it. The PIN is entered by
 	# gl-cellular-sim-unlock or through the UI.
-	case "$(at_query 'AT+CPIN?')" in
+	[ "$cpin_valid" = 1 ] || cpin_query
+	case "$cpin" in
 		*"SIM PIN"*|*"SIM PUK"*) return 1 ;;
 	esac
 
@@ -155,7 +213,11 @@ enabled() {
 	# timestamp guards against a scan whose browser request was aborted
 	# before it could clear the flag - after 15 minutes it is treated as
 	# stale so a wedged flag can never permanently disable recovery.
-	if [ "$(uci -q get gl-cellular.state.scan_in_progress)" = "1" ]; then
+	case "$state" in
+		*"gl-cellular.state.scan_in_progress='1'"*) scanning=1 ;;
+		*) scanning=0 ;;
+	esac
+	if [ "$scanning" = 1 ]; then
 		local started now
 		started="$(uci -q get gl-cellular.state.scan_started_at)"
 		now="$(date +%s)"
@@ -325,8 +387,7 @@ traffic_advancing() {
 # CGPADDR-vs-interface-IP comparison) is a proxy that can be wrong. Uses
 # the bearer's own DNS server (learned over DHCP from the modem, already
 # installed on wwan_4) ahead of a public fallback, so this isn't just
-# re-pinging the exact two IPs mwan3 already probes on the same interface
-# every 10s.
+# re-pinging the exact two IPs mwan3 already probes on the same interface.
 #
 # 2 packets / 4s timeout per target (up from 1/2s): the user has measured
 # ~3s RTTs to public targets while the vehicle is moving, comfortably
@@ -538,6 +599,8 @@ do_redial() {
 			tries=$((tries + 1))
 			sleep 1
 		done
+		# Fresh SIM state, as before the cache existed (subshell-local).
+		cpin_valid=0
 		if enabled; then ifup wwan >/dev/null 2>&1; fi
 	) 9>"$NET_LOCK"
 	if [ "$?" -ne 0 ]; then
@@ -854,17 +917,18 @@ sim_was_locked=0
 last_pin_bounce=0
 
 relock_reconnect() {
-	local deadline up dev
+	local deadline up device
 	/usr/sbin/gl-cellular-wwan-reconnect
 	sim_was_locked=0
 	sim_locked_ticks=0
+	# enabled() must see the SIM state after the reconnect, not before it.
+	cpin_valid=0
 	deadline=$(( $(date +%s) + 60 ))
 	while [ "$(date +%s)" -lt "$deadline" ]; do
 		sleep 5
-		up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
-		dev="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
-		if [ "$up" = "true" ] && [ -n "$dev" ]; then
-			ping_confirms "$dev" && return 0
+		wwan4_status
+		if [ "$up" = "true" ] && [ -n "$device" ]; then
+			ping_confirms "$device" && return 0
 		fi
 	done
 	logger -p daemon.err -t "$TAG" \
@@ -874,7 +938,8 @@ relock_reconnect() {
 
 sim_lock_watch() {
 	local now
-	case "$(at_query 'AT+CPIN?')" in
+	cpin_query
+	case "$cpin" in
 	*"SIM PIN"*)
 		sim_was_locked=1
 		sim_locked_ticks=$((sim_locked_ticks + 1))
@@ -902,10 +967,24 @@ sleep 25
 check_sim_swap
 sync_mtu
 while :; do
-	sim_lock_watch
+	# Every tick that was not a confirmed-good one, and every tick of a
+	# re-lock in progress, checks the SIM as before.
+	read -r tick_up _ < /proc/uptime
+	tick_up=${tick_up%%.*}
+	if [ "$recheck_cpin" = 1 ] || [ "$sim_was_locked" -eq 1 ] ||
+		[ "$sim_locked_ticks" -gt 0 ] || [ $((tick_up - cpin_at)) -ge "$CPIN_EVERY" ]; then
+		cpin_at=$tick_up
+		sim_lock_watch
+	fi
+	recheck_cpin=1
 
 	if ! enabled; then
 		reset_state
+		# Dialling turned off by the user is not a fault; a locked SIM is.
+		case "$cpin" in
+			*"SIM PIN"*|*"SIM PUK"*) ;;
+			*) recheck_cpin=0 ;;
+		esac
 		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
@@ -918,7 +997,7 @@ while :; do
 	fi
 
 	if [ "$redial_pending" -eq 1 ]; then
-		up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+		wwan4_status
 		if [ "$up" = "true" ]; then
 			# Came back up - no need to wait out the rest of GRACE_SEC.
 			# Fall straight into this tick's normal evaluation below;
@@ -950,15 +1029,14 @@ while :; do
 			fi
 			logger -p daemon.warning -t "$TAG" \
 				"interface still down ${GRACE_SEC}s after a redial; escalating immediately"
-			device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
+			wwan4_status
 			escalate
 			do_sleep "$CHECK_PERIOD"
 			continue
 		fi
 	fi
 
-	device="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
-	up="$(ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+	wwan4_status
 
 	good=1
 	traffic_state=""
@@ -1090,7 +1168,14 @@ while :; do
 		# window, so lte_fallback_since survives the counter reset that
 		# traffic_state=2 causes.
 		lte_fallback_release
-		do_sleep "$CHECK_PERIOD"
+		recheck_cpin=0
+		# No baseline yet (just redialed): confirm real traffic one normal
+		# tick later before relaxing to the idle period.
+		if [ "$traffic_state" = "2" ]; then
+			do_sleep "$CHECK_PERIOD"
+		else
+			idle_sleep "$IDLE_PERIOD"
+		fi
 		continue
 	fi
 

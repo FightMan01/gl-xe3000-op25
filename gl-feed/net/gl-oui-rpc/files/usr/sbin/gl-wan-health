@@ -41,13 +41,26 @@
 # rate-limited and serialized on /var/run/gl-net-reconfig.lock so the worst
 # case is a bounded restart, never a loop.
 #
-# It also publishes real connectivity to /var/run/gl-wan-online, which
-# gl-internet-led uses so the LED stops lying when mwan3 is stuck.
+# It also publishes real connectivity to /var/run/gl-wan-online and drives
+# the Internet LED from it, so the LED stops lying when mwan3 is stuck
+# (gl-internet-led only runs as a fallback while this is disabled).
+#
+# Probing is event-assisted: the mwan3 connected/disconnected hotplug event
+# (96-gl-wan-health-notify) cuts a quiet sleep short. The fixed check period
+# stays as the only clock for contradiction counting, because a wedged
+# tracker is exactly the case where mwan3 sends no event.
 
 TAG=gl-wan-health
 NET_LOCK=/var/run/gl-net-reconfig.lock
 STATE_FILE=/var/run/gl-wan-online
 CONFIG=gl-wan-health
+LED=/sys/class/leds/green:wan
+
+# Installed first thing: an untrapped USR1 would kill the daemon. Not
+# ignored (''), since ignored signals stay ignored in everything this
+# script runs, mwan3 restarts included.
+SLEEP_PID=""
+trap '[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null' USR1
 
 opt() {
 	local val
@@ -72,30 +85,85 @@ log() {
 	logger -p "$1" -t "$TAG" "$2"
 }
 
-# Every mwan3 interface that is enabled and actually ping-tracked.
+# Every mwan3 interface that is enabled and actually ping-tracked, in
+# config order. One `uci show` per pass instead of two gets per interface.
 mwan3_tracked_ifaces() {
-	local ifc
-	for ifc in $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^.]*\)=interface$/\1/p'); do
-		[ "$(uci -q get mwan3."$ifc".enabled)" = "0" ] && continue
-		[ -z "$(uci -q get mwan3."$ifc".track_ip)" ] && continue
-		echo "$ifc"
-	done
-}
-
-iface_up() {
-	[ "$(ubus call network.interface."$1" status 2>/dev/null |
-		jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
-}
-
-iface_dev() {
-	ubus call network.interface."$1" status 2>/dev/null |
-		jsonfilter -e '@.l3_device' 2>/dev/null
+	uci -q show mwan3 2>/dev/null | awk -v q="'" '
+		/^mwan3\.[^.=]+=interface$/ {
+			s = substr($0, 7); sub(/=.*/, "", s); ifc[++n] = s; next
+		}
+		/^mwan3\.[^.=]+\.enabled=/ {
+			split($0, a, "."); v = $0; sub(/^[^=]*=/, "", v)
+			if (v == q "0" q) off[a[2]] = 1
+			next
+		}
+		/^mwan3\.[^.=]+\.track_ip=/ { split($0, a, "."); trk[a[2]] = 1 }
+		END { for (i = 1; i <= n; i++) if (!off[ifc[i]] && trk[ifc[i]]) print ifc[i] }'
 }
 
 # mwan3's own opinion of an interface: online / offline / connecting / ...
+# Read from the snapshot probe() takes once per pass.
 mwan3_state() {
-	ubus call mwan3 status 2>/dev/null |
-		jsonfilter -e "@.interfaces[\"$1\"].status" 2>/dev/null
+	jsonfilter -s "$MWAN3_STATUS" -e "@.interfaces[\"$1\"].status" 2>/dev/null
+}
+
+# On a point-to-point modem device rx_bytes only grows when something
+# upstream sends us traffic, so growth since the last pass stands in for a
+# probe on the metered link. Not used for Ethernet, Wi-Fi or USB: broadcasts
+# from a live LAN segment grow the counter with the upstream dead.
+rx_gated() {
+	case "$1" in
+	wwan|wwan_*|modem*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Returns 0 when the probe for $1 (device $2) can be skipped. Only after a
+# probe that passed: a carrier that answers with ICMP errors grows rx_bytes
+# on a dead link, so a failed probe is repeated until one passes again, and
+# a real probe still runs every third pass, so FAIL_THRESHOLD (4) passes in
+# a row always include at least one real probe.
+RX_MAX_SKIP=2
+rx_skip_probe() {
+	local ifc="$1" dev="$2" now prev pdev okp skips
+	[ -r "/sys/class/net/$dev/statistics/rx_bytes" ] || return 1
+	read -r now < "/sys/class/net/$dev/statistics/rx_bytes" || return 1
+	eval "prev=\$rx_$ifc pdev=\$rxdev_$ifc okp=\$okprev_$ifc skips=\${skips_$ifc:-0}"
+	eval "rx_$ifc=\$now rxdev_$ifc=\$dev"
+	[ "$okp" = "1" ] && [ "$pdev" = "$dev" ] && [ -n "$prev" ] &&
+		[ "$now" -gt "$prev" ] && [ "$skips" -lt "$RX_MAX_SKIP" ] || {
+		eval "skips_$ifc=0"
+		return 1
+	}
+	eval "skips_$ifc=$((skips + 1))"
+	return 0
+}
+
+# Publish real connectivity: state file plus the Internet LED, written only
+# when it actually changes. led.lua turns every LED off when
+# system.gl_led.led_enable=0; honour that here too.
+publish() {
+	local want="$1" cur
+	echo "$want" > "$STATE_FILE"
+	[ -d "$LED" ] || return 0
+	[ "$(uci -q get system.gl_led.led_enable)" = "0" ] && want=0
+	cur=""
+	read -r cur < "$LED/brightness" 2>/dev/null
+	[ "$cur" = "$want" ] || echo "$want" > "$LED/brightness"
+}
+
+# $2=1: an mwan3 hotplug event may end the sleep early. Only used where an
+# early pass cannot advance fail_count faster than one per CHECK_PERIOD;
+# elsewhere the sleep runs in the foreground, which a signal cannot cut.
+do_sleep() {
+	if [ "$2" != "1" ]; then
+		sleep "$1"
+		return
+	fi
+	sleep "$1" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" 2>/dev/null
+	SLEEP_PID=""
 }
 
 # Real reachability through a specific egress. ICMP first, then HTTP(S): a
@@ -139,16 +207,23 @@ probe() {
 	up_good=0
 	up_wedged=0
 	best_iface=""
-	local ifc dev st up ok
+	local ifc dev st up ok ns
+	MWAN3_STATUS="$(ubus call mwan3 status 2>/dev/null)"
 	for ifc in $(mwan3_tracked_ifaces); do
+		ns="$(ubus call network.interface."$ifc" status 2>/dev/null)"
 		up=0
-		iface_up "$ifc" && up=1
-		# Only probe interfaces that could plausibly carry traffic.
-		[ "$up" = "1" ] || [ "$(mwan3_state "$ifc")" = "online" ] || continue
-		dev="$(iface_dev "$ifc")"
-		ok=0
-		conn_ok "$dev" && ok=1
+		[ "$(jsonfilter -s "$ns" -e '@.up' 2>/dev/null)" = "true" ] && up=1
 		st="$(mwan3_state "$ifc")"
+		# Only probe interfaces that could plausibly carry traffic.
+		[ "$up" = "1" ] || [ "$st" = "online" ] || continue
+		dev="$(jsonfilter -s "$ns" -e '@.l3_device' 2>/dev/null)"
+		ok=0
+		if rx_gated "$ifc" && [ -n "$dev" ] && rx_skip_probe "$ifc" "$dev"; then
+			ok=1
+		elif conn_ok "$dev"; then
+			ok=1
+		fi
+		rx_gated "$ifc" && eval "okprev_$ifc=$ok"
 		[ "$st" = "online" ] && online_any=1
 		[ "$st" = "online" ] && [ "$ok" = "1" ] && online_good=1
 		if [ "$up" = "1" ] && [ "$ok" = "1" ]; then
@@ -207,7 +282,8 @@ recover() {
 	return 0
 }
 
-echo 0 > "$STATE_FILE"
+[ -d "$LED" ] && echo none > "$LED/trigger"
+publish 0
 
 while :; do
 	probe
@@ -215,11 +291,11 @@ while :; do
 	# Healthy: mwan3 reports an interface online and it really has internet.
 	if [ "$online_good" = "1" ]; then
 		fail_count=0
-		echo 1 > "$STATE_FILE"
-		sleep "$CHECK_PERIOD"
+		publish 1
+		do_sleep "$CHECK_PERIOD" 1
 		continue
 	fi
-	echo "$up_good" > "$STATE_FILE"
+	publish "$up_good"
 
 	# Is this mwan3 contradicting reality, or a genuine outage?
 	#   online_any && !online_good : mwan3 claims connected, nothing works
@@ -240,7 +316,7 @@ while :; do
 				"mwan3 marks the uplink offline but it passes traffic; leaving mwan3 alone"
 			quality_noted=1
 		fi
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD" 1
 		continue
 	fi
 	quality_noted=0
@@ -252,19 +328,19 @@ while :; do
 		fail_count=0
 		log daemon.notice \
 			"no internet through any uplink; leaving recovery to the per-uplink watchdogs"
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD" 1
 		continue
 	fi
 
 	now="$(date +%s)"
 	if [ "$now" -lt "$grace_until" ]; then
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD" 1
 		continue
 	fi
 
 	fail_count=$((fail_count + 1))
 	if [ "$fail_count" -lt "$FAIL_THRESHOLD" ]; then
-		sleep "$CHECK_PERIOD"
+		do_sleep "$CHECK_PERIOD"
 		continue
 	fi
 	fail_count=0
@@ -278,5 +354,5 @@ while :; do
 	fi
 	recover
 
-	sleep "$CHECK_PERIOD"
+	do_sleep "$CHECK_PERIOD"
 done

@@ -1,6 +1,16 @@
 #!/bin/sh
+#
+# Fallback Internet LED driver. gl-wan-health drives the LED itself from its
+# own probes, and the init script only starts this while gl-wan-health is
+# disabled. Woken by the mwan3 connected/disconnected hotplug event
+# (96-gl-wan-health-notify); the slow poll only catches a missed event or a
+# change of system.gl_led.led_enable.
 
 LED=/sys/class/leds/green:wan
+POLL=60
+
+SLEEP_PID=""
+trap '[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null' USR1
 
 [ -d "$LED" ] || exit 0
 echo none > "$LED/trigger"
@@ -27,5 +37,8 @@ while true; do
 		esac
 	fi
 	echo "$online" > "$LED/brightness"
-	sleep 5
+	sleep "$POLL" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" 2>/dev/null
+	SLEEP_PID=""
 done

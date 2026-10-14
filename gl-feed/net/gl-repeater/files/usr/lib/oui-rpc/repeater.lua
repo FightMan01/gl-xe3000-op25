@@ -66,6 +66,15 @@ local function clear_retry_state()
 	os.execute("rm -f /tmp/gl-repeater-retry-at /tmp/gl-repeater-fail-type /tmp/gl-repeater-eap-autofix-count /tmp/gl-repeater-retry-count")
 end
 
+-- gl-repeater-timeout sleeps up to 30s while it has nothing to time out;
+-- wake it so a new, re-enabled or dropped STA is picked up at once.
+local function reload_wifi()
+	os.execute("wifi reload >/dev/null 2>&1")
+	os.execute("ubus call service signal " ..
+		"'{\"name\":\"gl-repeater-timeout\",\"instance\":\"instance1\",\"signal\":10}'" ..
+		" >/dev/null 2>&1")
+end
+
 local function set_portal_gate(enabled)
 	local f = io.open("/proc/net/wifidog-ng/config", "w")
 	if not f then return false end
@@ -566,7 +575,7 @@ local function apply_config(args)
 	end
 	cursor:commit("gl-repeater")
 
-	os.execute("wifi reload >/dev/null 2>&1")
+	reload_wifi()
 	return {}
 end
 
@@ -659,7 +668,7 @@ return {
 			cursor:delete("wireless", iface, "bssid")
 			cursor:set("wireless", iface, "disabled", "0")
 			cursor:commit("wireless")
-			os.execute("wifi reload >/dev/null 2>&1")
+			reload_wifi()
 		end
 		return {}
 	end,
@@ -672,7 +681,7 @@ return {
 		if iface then
 			cursor:set("wireless", iface, "disabled", "1")
 			cursor:commit("wireless")
-			os.execute("wifi reload >/dev/null 2>&1")
+			reload_wifi()
 		end
 		return {}
 	end,
@@ -689,7 +698,7 @@ return {
 		end
 		cursor:set("wireless", iface, "disabled", "0")
 		cursor:commit("wireless")
-		os.execute("wifi reload >/dev/null 2>&1")
+		reload_wifi()
 		return {}
 	end,
 

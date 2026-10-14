@@ -1,0 +1,20 @@
+#!/bin/sh
+# The repeater uplink came up or went away: wake gl-repeater-timeout out of
+# its idle sleep, and give gl-repeater-portal an immediate pass (it keeps
+# all state in /tmp/gl-repeater-portal.json, so a restart is just an early
+# tick). Both keep a slow poll, so a missed event only costs latency.
+
+[ "$INTERFACE" = "repeater" ] || exit 0
+case "$ACTION" in
+	ifup|ifdown) ;;
+	*) exit 0 ;;
+esac
+
+ubus call service signal \
+	'{"name":"gl-repeater-timeout","instance":"instance1","signal":10}' \
+	>/dev/null 2>&1
+
+/etc/init.d/gl-repeater-portal running >/dev/null 2>&1 &&
+	/etc/init.d/gl-repeater-portal restart >/dev/null 2>&1
+
+exit 0

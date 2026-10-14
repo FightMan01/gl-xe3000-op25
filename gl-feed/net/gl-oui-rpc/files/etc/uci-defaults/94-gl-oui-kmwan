@@ -50,8 +50,9 @@ uci -q batch <<-EOF
 	set mwan3.wwan_4.reliability='2'
 	set mwan3.wwan_4.count='3'
 	set mwan3.wwan_4.timeout='2'
-	set mwan3.wwan_4.interval='10'
+	set mwan3.wwan_4.interval='30'
 	set mwan3.wwan_4.failure_interval='5'
+	set mwan3.wwan_4.recovery_interval='10'
 	set mwan3.wwan_4.down='3'
 	set mwan3.wwan_4.up='5'
 	set mwan3.wwan_4.check_quality='1'
@@ -90,7 +91,9 @@ uci -q batch <<-EOF
 	set mwan3.tethering.reliability='1'
 	set mwan3.tethering.count='2'
 	set mwan3.tethering.timeout='4'
-	set mwan3.tethering.interval='10'
+	set mwan3.tethering.interval='30'
+	set mwan3.tethering.failure_interval='5'
+	set mwan3.tethering.recovery_interval='10'
 	set mwan3.tethering.down='3'
 	set mwan3.tethering.up='3'
 	set mwan3.tethering.flush_conntrack='ifup'
@@ -136,6 +139,13 @@ EOF
 # working repeater in that state. check_quality marks a target failed on loss
 # or latency too, two of the four targets must pass, and recovery needs five
 # clean rounds so a briefly good cell does not drag traffic straight back.
+#
+# Cellular and tethering are metered and every round wakes the radio, so a
+# healthy link is only checked every 30s. After the first failed round the
+# tracker switches to failure_interval, and a recovering link to
+# recovery_interval, so the rounds that decide a state change run at least
+# as fast as with the old 10s interval.
+# kmwan.lua scales its presets the same way for these two (METERED_SCALE).
 
 # The upstream mwan3 sample configuration ships catch-all/HTTPS rules
 # pointing at its `balanced` policy. Keep the sections for UI compatibility,

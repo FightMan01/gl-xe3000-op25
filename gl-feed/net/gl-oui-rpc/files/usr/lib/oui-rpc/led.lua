@@ -84,6 +84,15 @@ return {
 			-- Restore a useful default indication immediately instead of
 			-- merely persisting the toggle while all LEDs remain dark.
 			write_attr("power", "trigger", "default-on")
+			-- gl-wan-health only rewrites the Internet LED on its next
+			-- pass; restore it from its last verdict right away.
+			local f = io.open("/var/run/gl-wan-online", "r")
+			if f then
+				local online = f:read("*l") == "1"
+				f:close()
+				write_attr("wan", "trigger", "none")
+				write_attr("wan", "brightness", online and "1" or "0")
+			end
 		end
 
 		if type(args.leds) == "table" then

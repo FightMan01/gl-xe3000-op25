@@ -18,7 +18,13 @@ local STATE = "/tmp/gl-repeater-portal.json"
 local PORTAL_HTML = "/var/log/gl-repeater/portal.html"
 local PROBE_MARK = 0x8000
 local PROBE_TIMEOUT = 6
+-- While a portal is pending or the probe could not decide, re-probe every
+-- POLL_INTERVAL. With the repeater down, or up and past any portal, every
+-- IDLE_INTERVAL: the repeater ifup/ifdown hotplug event
+-- (30-gl-repeater-notify) restarts this daemon for an immediate pass, so the
+-- long interval only matters for a missed event or an expired portal session.
 local POLL_INTERVAL = 15
+local IDLE_INTERVAL = 60
 
 local PROBES = {
 	{
@@ -100,7 +106,7 @@ end
 -- a captive portal is pending.  A router may otherwise continue forwarding
 -- DNS to an old VPN/AdGuard/custom server, which makes the portal URL fail to
 -- resolve even though the STA itself can reach the upstream login page.
--- Both of these run from the 15s detection loop, so they must be
+-- Both of these run from the detection loop, so they must be
 -- idempotent: reloading dnsmasq on every tick (as an earlier version did)
 -- means a needless reload every 15s for the entire time no portal is
 -- pending, and again for every tick while one is.  Only touch dnsmasq
@@ -312,10 +318,12 @@ local function detect(settings)
 	return false
 end
 
+-- Returns the seconds until the next pass.
 local function tick()
 	local settings = repeater_settings()
 	if settings and settings.up and settings.device then
-		detect(settings)
+		if detect(settings) then return POLL_INTERVAL end
+		return load_state().status == "portal pass" and IDLE_INTERVAL or POLL_INTERVAL
 	else
 		local old = load_state()
 		restore_portal_dns()
@@ -325,12 +333,13 @@ local function tick()
 			status = "idle", last_error = "",
 		})
 	end
+	return IDLE_INTERVAL
 end
 
 -- A transient ubus/uci failure (this starts at boot, before netifd/wifi are
 -- up) must not kill the service and burn procd's respawn budget.
 while true do
-	local ok, err = pcall(tick)
-	if not ok then io.stderr:write("gl-repeater-portal: " .. tostring(err) .. "\n") end
-	time.sleep(POLL_INTERVAL)
+	local ok, res = pcall(tick)
+	if not ok then io.stderr:write("gl-repeater-portal: " .. tostring(res) .. "\n") end
+	time.sleep(ok and res or POLL_INTERVAL)
 end

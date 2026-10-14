@@ -2,10 +2,12 @@
 # Passive modem tracer. Keeps a RAM ring of read-only AT snapshots and writes
 # it to /root/relock-traces when the SIM falls back to PIN-locked or the PS
 # attach drops, so the seconds before such an event survive a reboot.
+# Opt-in: started only with gl-cellular.watchdog.relock_trace=1.
 
 RING=/tmp/relock-trace.log
 OUT=/root/relock-traces
-INTERVAL=5
+# 10s keeps three samples inside TAIL_SEC and halves the AT traffic of 5s.
+INTERVAL=10
 RING_LINES=1500
 TAIL_SEC=30
 MAX_DUMPS=6

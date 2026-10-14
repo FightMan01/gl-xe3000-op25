@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# Installed first: an untrapped USR1 would kill the daemon. USR1 comes from
+# the repeater ifup/ifdown hotplug event (30-gl-repeater-notify) and from
+# repeater.lua after it reloads wifi, and ends a quiet sleep early.
+SLEEP_PID=""
+trap '[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null' USR1
+
 CONNECT_TIMEOUT=20
 RETRY_INTERVAL=30
 # Backoff grows with each failed attempt up to this cap.
@@ -26,8 +32,18 @@ RETRY_COUNT_FLAG=/tmp/gl-repeater-retry-count
 AUTOFIX_COUNT_FLAG=/tmp/gl-repeater-eap-autofix-count
 AUTOFIX_MAX=3
 NET_LOCK=/var/run/gl-net-reconfig.lock
+# Sleep while there is nothing to time out: no STA, STA disabled, STA up, or
+# a retry still far off. Events normally end it; this is the safety net.
+IDLE_POLL=30
 
 . /lib/functions.sh
+
+idle_sleep() {
+	sleep "$1" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" 2>/dev/null
+	SLEEP_PID=""
+}
 
 # with_net_lock <cmd> [args]: run cmd holding $NET_LOCK, giving up after ~10s.
 #
@@ -133,24 +149,32 @@ while true; do
 		connecting_since=""
 		last_nak_line=""
 		rm -f "$FAIL_FLAG" "$RETRY_FLAG"
-		sleep 5
+		idle_sleep "$IDLE_POLL"
 		continue
 	fi
 
 	if [ -f "$RETRY_FLAG" ]; then
 		retry_at=$(cat "$RETRY_FLAG")
+		now=$(date +%s)
 		# Lock busy: RETRY_FLAG stays, so the retry is still due next pass.
-		[ "$(date +%s)" -ge "${retry_at:-0}" ] &&
+		if [ "$now" -ge "${retry_at:-0}" ]; then
 			with_net_lock set_sta_disabled 0 &&
-			rm -f "$RETRY_FLAG"
-		sleep 2
+				rm -f "$RETRY_FLAG"
+			sleep 2
+		else
+			# Wake when the retry is due (2s floor as before, IDLE_POLL cap).
+			wait_s=$((retry_at - now))
+			[ "$wait_s" -lt 2 ] && wait_s=2
+			[ "$wait_s" -gt "$IDLE_POLL" ] && wait_s=$IDLE_POLL
+			idle_sleep "$wait_s"
+		fi
 		continue
 	fi
 
 	if [ "$(uci -q get wireless."$sta_section".disabled)" = "1" ]; then
 		connecting_since=""
 		last_nak_line=""
-		sleep 5
+		idle_sleep "$IDLE_POLL"
 		continue
 	fi
 
@@ -160,7 +184,7 @@ while true; do
 		last_nak_line=""
 		uci -q get wireless."$sta_section".ssid > "$KNOWN_FLAG"
 		rm -f "$FAIL_FLAG" "$AUTOFIX_COUNT_FLAG" "$RETRY_COUNT_FLAG"
-		sleep 5
+		idle_sleep "$IDLE_POLL"
 		continue
 	fi
 

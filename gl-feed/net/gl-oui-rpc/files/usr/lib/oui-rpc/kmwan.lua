@@ -33,6 +33,11 @@
 --                          forgiving, strict checks often and is quick to
 --                          flip). mwan3 has no event-driven mode, so low
 --                          data is approximated by a long interval.
+--   metered members     -> cellular and tethering run every preset at
+--                          METERED_SCALE times the interval (Normal/medium
+--                          = 30s, matching 94-gl-oui-kmwan). A custom
+--                          interval is the user's explicit choice and is
+--                          applied as entered.
 
 local uci = require "uci"
 local cjson = require "cjson"
@@ -59,10 +64,13 @@ local MEMBERS = {
 	-- wwan.  Returning the friendly names "modem"/"repeater" prevented
 	-- interfaceConfig from reaching either card, so the stock
 	-- "connected but no Internet" warning could never render.
-	{ real = "wwan_4", member = "wwan4_m2_w1", frontend = "modem_mhi0" },
+	{ real = "wwan_4", member = "wwan4_m2_w1", frontend = "modem_mhi0", metered = true },
 	{ real = "repeater", member = "repeater_m3_w1", frontend = "wwan" },
-	{ real = "tethering", member = "tethering_m4_w1", frontend = "tethering" },
+	{ real = "tethering", member = "tethering_m4_w1", frontend = "tethering", metered = true },
 }
+
+-- Every tracking round on a metered uplink costs data and wakes the radio.
+local METERED_SCALE = 3
 
 local SENSITIVITY_PRESETS = {
 	low = 30,
@@ -136,13 +144,14 @@ local function ensure_rpc_section(cursor)
 	end
 end
 
--- Effective base interval (seconds) from the global sensitivity setting.
+-- Effective base interval (seconds) from the global sensitivity setting,
+-- and whether it came from a preset rather than a custom value.
 local function sensitivity_base(cursor)
 	local level = cursor:get(RPC_CONFIG, RPC_SECTION, "level") or "medium"
 	if level == "custom" then
-		return tonumber((cursor:get(RPC_CONFIG, RPC_SECTION, "sensitivity"))) or 10
+		return tonumber((cursor:get(RPC_CONFIG, RPC_SECTION, "sensitivity"))) or 10, false
 	end
-	return SENSITIVITY_PRESETS[level] or SENSITIVITY_PRESETS.medium
+	return SENSITIVITY_PRESETS[level] or SENSITIVITY_PRESETS.medium, true
 end
 
 -- The GL-level tracking view of one member, with defaults for configs that
@@ -195,7 +204,8 @@ local function apply_member_tracking(cursor, m)
 	end
 
 	cursor:set("mwan3", m.real, "track_method", "ping")
-	local base = sensitivity_base(cursor)
+	local base, preset = sensitivity_base(cursor)
+	if preset and m.metered then base = base * METERED_SCALE end
 	local mode = TRACK_MODES[t.track_mode] or TRACK_MODES[1]
 	local interval = math.max(mode.min_interval,
 		math.floor(base * mode.multiplier + 0.5))
