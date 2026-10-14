@@ -1,0 +1,72 @@
+#!/bin/sh
+# IPv6 for USB tethering: a dhcpv6 child riding the tethering device
+# (Android and iOS both advertise a /64 via RA), in the wan firewall zone and
+# tracked by mwan3 as the IPv6 uplink of last priority. Idempotent; also runs
+# on routers upgraded from a build that only had IPv4 tethering.
+
+. /lib/functions.sh
+
+[ "$(uci -q get network.tethering6)" = "interface" ] || {
+	uci -q batch <<-EOT
+		set network.tethering6=interface
+		set network.tethering6.proto='dhcpv6'
+		set network.tethering6.device='@tethering'
+		set network.tethering6.reqaddress='try'
+		set network.tethering6.reqprefix='no'
+		set network.tethering6.auto="$(uci -q get network.tethering.auto || echo 1)"
+	EOT
+	uci -q commit network
+}
+
+zone_section=""
+config_cb() {
+	if [ "$1" = "zone" ]; then
+		local name
+		config_get name "$2" name
+		[ "$name" = "wan" ] && zone_section="$2"
+	fi
+}
+config_load firewall
+if [ -n "$zone_section" ] &&
+	! uci -q get firewall."$zone_section".network | grep -qw tethering6; then
+	uci -q add_list firewall."$zone_section".network='tethering6'
+	uci -q commit firewall
+fi
+
+[ "$(uci -q get mwan3.tethering6)" = "interface" ] || {
+	uci -q batch <<-EOT
+		set mwan3.tethering6=interface
+		set mwan3.tethering6.enabled='1'
+		set mwan3.tethering6.family='ipv6'
+		set mwan3.tethering6.track_method='ping'
+		set mwan3.tethering6.track_ip='2001:4860:4860::8888'
+		add_list mwan3.tethering6.track_ip='2606:4700:4700::1111'
+		add_list mwan3.tethering6.track_ip='2620:fe::fe'
+		set mwan3.tethering6.reliability='1'
+		set mwan3.tethering6.count='2'
+		set mwan3.tethering6.timeout='4'
+		set mwan3.tethering6.interval='10'
+		set mwan3.tethering6.down='3'
+		set mwan3.tethering6.up='3'
+		set mwan3.tethering6.flush_conntrack='ifup'
+		add_list mwan3.tethering6.flush_conntrack='ifdown'
+	EOT
+}
+
+[ "$(uci -q get mwan3.tethering6_m4_w1)" = "member" ] || {
+	uci -q batch <<-EOT
+		set mwan3.tethering6_m4_w1=member
+		set mwan3.tethering6_m4_w1.interface='tethering6'
+		set mwan3.tethering6_m4_w1.metric='4'
+		set mwan3.tethering6_m4_w1.weight='1'
+	EOT
+}
+
+# Only touch the policy if kmwan-v6 already created it.
+if [ "$(uci -q get mwan3.gl_failover_v6)" = "policy" ] &&
+	! uci -q get mwan3.gl_failover_v6.use_member | grep -qw tethering6_m4_w1; then
+	uci -q add_list mwan3.gl_failover_v6.use_member='tethering6_m4_w1'
+fi
+
+uci -q commit mwan3
+exit 0

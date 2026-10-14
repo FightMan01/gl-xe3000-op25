@@ -1,0 +1,35 @@
+#!/bin/sh
+# iPhones only expose the ipheth network interface after usbmuxd has paired
+# with them, which needs "Trust This Computer" accepted on the phone. Retry
+# for about a minute so the user has time to tap it. Pair records live in
+# /etc/lockdown so a reboot does not ask again.
+
+[ "$ACTION" = "add" ] || exit 0
+[ "$DEVTYPE" = "usb_device" ] || exit 0
+case "$PRODUCT" in
+	5ac/12[9a-f]*) ;;
+	*) exit 0 ;;
+esac
+[ "$(uci -q get network.tethering.auto)" = "0" ] && exit 0
+command -v idevicepair >/dev/null 2>&1 || exit 0
+
+(
+	flock -n 9 || exit 0
+	if [ ! -e /var/lib/lockdown ]; then
+		mkdir -p /etc/lockdown /var/lib
+		ln -s /etc/lockdown /var/lib/lockdown
+	fi
+	pidof usbmuxd >/dev/null || /etc/init.d/usbmuxd start >/dev/null 2>&1
+	n=0
+	while [ $n -lt 15 ]; do
+		if [ -n "$(idevice_id -l 2>/dev/null)" ] && idevicepair pair >/dev/null 2>&1; then
+			logger -t gl-tethering "iPhone paired"
+			exit 0
+		fi
+		n=$((n + 1))
+		sleep 4
+	done
+	logger -t gl-tethering "iPhone pairing timed out (tap Trust on the phone, then replug)"
+) 9>/var/run/gl-ios-pair.lock >/dev/null 2>&1 &
+
+exit 0

@@ -2,7 +2,7 @@
 
 GL.iNet GL-XE3000 backend packages, rebuilt to run on stock OpenWrt 25.x instead of GL's own SDK4 firmware.
 
-The XE3000 normally ships with a customized OpenWrt build wired to GL's closed SDK4 stack: a SQLite-backed session daemon, a proprietary MediaTek wifi driver, a closed cellular management daemon, and so on. This repo replaces all of that with packages built against plain, mainline OpenWrt: hostapd/wpad-full instead of GL's wifi driver, mac80211/mt76, mwan3 for multi-WAN, Quectel's `pcie_mhi` driver + `quectel-CM` (the same QMI/QMAP stack GL ships) behind a `qcm` netifd proto for the modem, and a from-scratch `/rpc` + `/ws` backend that speaks the exact same wire protocol GL's own frontend expects.
+The XE3000 normally ships with a customized OpenWrt build wired to GL's closed SDK4 stack: a SQLite-backed session daemon, a proprietary MediaTek wifi driver, a closed cellular management daemon, and so on. This repo replaces all of that with packages built against plain, mainline OpenWrt: hostapd/wpad-full instead of GL's wifi driver, mac80211/mt76, mwan3-nft (native nftables mwan3, vendored in `gl-feed/net/mwan3-nft`) for multi-WAN, Quectel's `pcie_mhi` driver + `quectel-CM` (the same QMI/QMAP stack GL ships) behind a `qcm` netifd proto for the modem, and a from-scratch `/rpc` + `/ws` backend that speaks the exact same wire protocol GL's own frontend expects.
 
 GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the original firmware) is **not** included here - that's GL's compiled output, not something to redistribute. Everything in this repo is what serves and drives that GUI, not the GUI itself. You have two ways to get the GUI onto a router running this port:
 
@@ -69,7 +69,7 @@ You'll need a real OpenWrt source checkout, not just the SDK - the kernel patche
    cp openwrt-patches/mediatek-filogic/*.patch target/linux/mediatek/patches-6.18/
    ```
 4. Apply the `lua-cjson` patch against that package's own `patches/` directory (typically `feeds/packages/utils/lua-cjson/patches/`).
-5. `make menuconfig` - Target System: MediaTek Ralink/Filogic, Subtarget: filogic, Target Profile: GL.iNet GL-XE3000. Under Network, select `gl-oui-rpc`, `gl-oui-runtime`, `gl-cellular`, `gl-mcu`, `gl-repeater`, plus `mwan3` and `wpad-full` if they aren't already pulled in as dependencies.
+5. `make menuconfig` - Target System: MediaTek Ralink/Filogic, Subtarget: filogic, Target Profile: GL.iNet GL-XE3000. Under Network, select `gl-oui-rpc`, `gl-oui-runtime`, `gl-cellular`, `gl-mcu`, `gl-repeater`, plus `mwan3-nft` (not the official `mwan3`, which is iptables-based and conflicts with it) and `wpad-full` if they aren't already pulled in as dependencies.
 6. `make -j$(nproc) V=s`
 
 The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what you flash per the [Flashing](#flashing) section above.

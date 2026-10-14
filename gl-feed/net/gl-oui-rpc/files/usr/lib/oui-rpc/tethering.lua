@@ -16,13 +16,16 @@ return {
 		local connected = false
 		if conn then
 			local iface = conn:call("network.interface.tethering", "status", {})
+			local iface6 = conn:call("network.interface.tethering6", "status", {})
 			conn:close()
 			if iface and iface.up == true then
 				connected = true
 				local ipv4 = iface["ipv4-address"] and iface["ipv4-address"][1]
+				local ipv6 = iface6 and iface6.up == true and iface6["ipv6-address"] and iface6["ipv6-address"][1]
 				table.insert(devices, {
 					device = iface.device,
 					ipaddr = ipv4 and ipv4.address,
+					ipv6addr = ipv6 and ipv6.address or nil,
 				})
 			end
 		end
@@ -41,7 +44,7 @@ return {
 	end,
 
 	-- args.device: the usbN network device to bind tethering to (the
-	-- hotplug script, etc/hotplug.d/usb/20-gl-oui-tethering, already binds
+	-- hotplug script, etc/hotplug.d/net/20-gl-oui-tethering, already binds
 	-- automatically on phone plug-in; this lets the UI explicitly
 	-- (re)select among multiple attached devices).
 	set_connect = function(args)
@@ -50,19 +53,25 @@ return {
 			cursor:set("network", "tethering", "interface")
 		end
 		if type(args.device) == "string" and args.device ~= "" then
-			cursor:set("network", "tethering", "ifname", args.device)
+			cursor:set("network", "tethering", "device", args.device)
 		end
 		cursor:set("network", "tethering", "auto", "1")
+		if cursor:get("network", "tethering6") then
+			cursor:set("network", "tethering6", "auto", "1")
+		end
 		cursor:commit("network")
-		os.execute("ifup tethering >/dev/null 2>&1")
+		os.execute("ifup tethering >/dev/null 2>&1; ifup tethering6 >/dev/null 2>&1")
 		return {}
 	end,
 
 	disconnect = function(args)
 		local cursor = uci.cursor()
 		cursor:set("network", "tethering", "auto", "0")
+		if cursor:get("network", "tethering6") then
+			cursor:set("network", "tethering6", "auto", "0")
+		end
 		cursor:commit("network")
-		os.execute("ifdown tethering >/dev/null 2>&1")
+		os.execute("ifdown tethering6 >/dev/null 2>&1; ifdown tethering >/dev/null 2>&1")
 		return {}
 	end,
 }

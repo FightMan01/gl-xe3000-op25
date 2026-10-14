@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=17
+PKG_RELEASE:=18
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -28,10 +28,12 @@ define Package/gl-oui-rpc
 	+lua-eco +lua-eco-ubus +lua-eco-uci +lua-eco-sha256 +lua-eco-log \
 	+libubus-lua +libuci-lua +lua-cjson +libiwinfo-lua \
 	+kmod-mt7915e +kmod-mt7981-firmware +mt7981-wo-firmware wpad-openssl \
-	+mwan3 +px5g-mbedtls +sqm-scripts +tailscale +adguardhome +zerotier +tor \
+	+mwan3-nft +px5g-mbedtls +sqm-scripts +tailscale +adguardhome +zerotier +tor \
 	+ksmbd-server +avahi-nodbus-daemon +ksmbd-avahi-service +wireguard-tools \
 	+openvpn-openssl +openvpn-easy-rsa +openssl-util +kmod-ovpn-backports \
-	+unzip
+	+unzip \
+	+kmod-usb-net-rndis +kmod-usb-net-cdc-ether +kmod-usb-net-cdc-ncm \
+	+kmod-usb-net-ipheth +usbmuxd +libimobiledevice-utils
 endef
 
 define Package/gl-oui-rpc/conffiles

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Bind the "tethering" interface to a phone's USB network device.
+# Android: rndis_host (RNDIS), cdc_ether (ECM), cdc_ncm (NCM), cdc_eem.
+# iPhone: ipheth, which only appears once usbmuxd has paired with the
+# phone (see hotplug.d/usb/30-gl-oui-ios-pair).
+# First matching device wins.
+
+[ "$SUBSYSTEM" = "net" ] || exit 0
+[ -n "$INTERFACE" ] || exit 0
+
+case "$ACTION" in
+add)
+	[ "$(uci -q get network.tethering.auto)" = "0" ] && exit 0
+	sys=/sys/class/net/$INTERFACE/device
+	[ "$(basename "$(readlink "$sys/subsystem" 2>/dev/null)")" = "usb" ] || exit 0
+	case "$(basename "$(readlink "$sys/driver" 2>/dev/null)")" in
+	rndis_host|cdc_ether|cdc_ncm|cdc_eem|ipheth) ;;
+	*) exit 0 ;;
+	esac
+	[ "$(uci -q get network.tethering.device)" = "$INTERFACE" ] || {
+		uci -q set network.tethering.device="$INTERFACE"
+		uci -q commit network
+	}
+	ifup tethering >/dev/null 2>&1
+	ifup tethering6 >/dev/null 2>&1
+	;;
+remove)
+	[ "$(uci -q get network.tethering.device)" = "$INTERFACE" ] || exit 0
+	ifdown tethering6 >/dev/null 2>&1
+	ifdown tethering >/dev/null 2>&1
+	;;
+esac
+exit 0

@@ -1,0 +1,135 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. /lib/mwan3/mwan3.sh
+
+initscript=/etc/init.d/mwan3
+. /lib/functions/procd.sh
+
+
+SCRIPTNAME="mwan3-hotplug"
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || exit 1
+[ -n "$INTERFACE" ] || exit 2
+[ "$FIRSTCONNECT" = "1" ] || [ "$MWAN3_SHUTDOWN" = "1" ] && exit 0
+
+if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "connected" ] ; } && [ -z "$DEVICE" ]; then
+	LOG notice "$ACTION called on $INTERFACE with no device set"
+	exit 3
+fi
+
+[ "$MWAN3_STARTUP" = "init" ] || procd_lock
+
+# Exit silently if the nft table is not yet set up. This covers the boot
+# race where an external ifup hotplug fires before start_service completes,
+# and the case where mwan3 has been manually stopped. Checked before
+# mwan3_init to avoid recreating /var/run/mwan3 as a side effect, which
+# would corrupt the stopped-service indicator. start_service handles all
+# interface setup itself via its own mwan3_ifup calls.
+$NFT list chain inet mwan3 mwan3_prerouting &>/dev/null || exit 0
+
+mwan3_init
+
+if [ "$MWAN3_STARTUP" != "init" ] && [ "$ACTION" = "ifup" ]; then
+	mwan3_set_user_iface_rules $INTERFACE $DEVICE
+fi
+
+config_get_bool enabled $INTERFACE 'enabled' '0'
+[ "${enabled}" -eq 1 ] || {
+	LOG notice "mwan3 hotplug on $INTERFACE not called because interface disabled"
+	exit 0
+}
+
+config_get initial_state $INTERFACE initial_state "online"
+if [ "$initial_state" = "offline" ]; then
+	readfile status $MWAN3TRACK_STATUS_DIR/$INTERFACE/STATUS 2>/dev/null || status="unknown"
+	[ "$status" = "online" ] || status=offline
+else
+	status=online
+fi
+
+LOG notice "Execute $ACTION event on interface $INTERFACE (${DEVICE:-unknown})"
+
+case "$ACTION" in
+	connected)
+		# A tracker recovery must restore the member's routing before the policy
+		# re-selects it, so the member is routable the instant it is marked, then
+		# snap new flows off the worse-metric backups back toward it. The policy
+		# rebuild commits as one nft transaction so no packet classifies against a
+		# half-rebuilt policy chain. The snap-back stays outside that batch on
+		# purpose: a recovery's worse-metric pins point at backups that are still
+		# up, so a source re-pinned in the window before the snap reaches a live
+		# member, not a dead one, unlike a teardown whose pins must be flushed in
+		# the same transaction because they point at the departing member.
+
+		mwan3_set_iface_hotplug_state $INTERFACE "online"
+		mwan3_create_iface_nft $INTERFACE $DEVICE
+		mwan3_create_iface_rules $INTERFACE $DEVICE
+		mwan3_create_iface_route $INTERFACE $DEVICE
+		mwan3_nft_batch_start
+		mwan3_set_policies_nft
+		mwan3_nft_batch_commit
+		mwan3_flush_worse_metric_sticky $INTERFACE
+		mwan3_flush_unreplied_conntrack
+		;;
+	ifup)
+		mwan3_update_peer_track_ip $INTERFACE
+		mwan3_create_iface_nft $INTERFACE $DEVICE
+		mwan3_create_iface_rules $INTERFACE $DEVICE
+		mwan3_create_iface_route $INTERFACE $DEVICE
+		mwan3_set_iface_hotplug_state $INTERFACE "$status"
+		if [ "$MWAN3_STARTUP" != "init" ]; then
+			mwan3_set_general_rules
+			if [ "$status" = "online" ]; then
+
+				# Same atomic policy rebuild and out-of-batch snap-back as the
+				# connected arm above; see that comment for why the snap-back is
+				# not folded into the batch. The batch sits inside the online
+				# guard so the init path never opens one.
+
+				mwan3_nft_batch_start
+				mwan3_set_policies_nft
+				mwan3_nft_batch_commit
+				mwan3_flush_worse_metric_sticky $INTERFACE
+				mwan3_flush_unreplied_conntrack
+			fi
+		fi
+		[ "$ACTION" = ifup ] && procd_running mwan3 "track_$INTERFACE" && procd_send_signal mwan3 "track_$INTERFACE" USR2
+		;;
+	disconnected)
+		# A soft tracker failure drops the member from the policy; flush its
+		# sticky pins after the rebuild so a pinned source re-evaluates to the
+		# survivor, the same treatment a hard ifdown gets. The policy rebuild
+		# and the sticky flush commit as one nft transaction so no packet
+		# classifies against a half-rebuilt policy. The member's marked flows
+		# are cleared by the conntrack flush at the handler tail, which is
+		# kernel state outside nftables and stays a separate operation.
+
+		mwan3_set_iface_hotplug_state $INTERFACE "offline"
+		mwan3_nft_batch_start
+		mwan3_set_policies_nft
+		mwan3_delete_iface_map_entries $INTERFACE
+		mwan3_nft_batch_commit
+		;;
+	ifdown)
+		# Drop the member from the policy before tearing down its routing, so the
+		# policy never marks for a member whose rules are already gone; flush its
+		# sticky sets after the rebuild so the rebuild cannot re-seed them. The
+		# policy rebuild and the sticky flush commit as one nft transaction; the
+		# routing teardown and the conntrack flush follow as separate steps.
+
+		mwan3_set_iface_hotplug_state $INTERFACE "offline"
+		mwan3_nft_batch_start
+		mwan3_set_policies_nft
+		mwan3_delete_iface_map_entries $INTERFACE
+		mwan3_nft_batch_commit
+		mwan3_delete_iface_rules $INTERFACE
+		mwan3_delete_iface_route $INTERFACE
+		mwan3_delete_iface_nft $INTERFACE
+		procd_running mwan3 "track_$INTERFACE" && procd_send_signal mwan3 "track_$INTERFACE" USR1
+	;;
+esac
+
+mwan3_flush_conntrack "$INTERFACE" "$ACTION"
+
+exit 0

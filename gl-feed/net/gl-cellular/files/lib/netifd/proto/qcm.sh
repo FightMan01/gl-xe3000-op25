@@ -362,7 +362,7 @@ local pdp="-4 -6"
 		echo "0x1" > "/sys/class/net/$ifname/link_state" 2>/dev/null
 	) &
 
-	local zone="$(fw3 -q network "$interface" 2>/dev/null)"
+	local zone="$(fw4 -q network "$interface" 2>/dev/null)"
 
 	[ "$pdp" != "-6" ] && {
 		json_init
