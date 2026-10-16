@@ -45,6 +45,42 @@ _qcm_dns() {
 	sed -i "/# IPV$fam $dev\$/d" /etc/resolv.conf
 }
 
+# Stock's qcm applies the QMI-assigned IPv4 address itself when DHCP on the
+# QMAP netdev gets no answer (udhcpc_start -> update_ip_address_by_qmi). Here
+# netifd owns IPv4, so do the equivalent through netifd: if the dhcp child is
+# still not up after 25s but the data call is, replace it with a static child
+# of the same name carrying the address quectel-CM published.
+_qcm_static_fallback() {
+	local iface="$1" zone="$2" t4="$3" waited=0 up info addr gw d1 d2
+	while [ "$waited" -lt 25 ]; do
+		sleep 5
+		waited=$((waited + 5))
+		pidof quectel-CM >/dev/null || return 0
+		up="$(ubus call "network.interface.${iface}_4" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+		[ "$up" = "true" ] && return 0
+	done
+	[ -r /var/run/gl-cellular-qmi-ipv4 ] || return 0
+	read -r addr gw d1 d2 < /var/run/gl-cellular-qmi-ipv4
+	[ -n "$addr" ] && [ -n "$gw" ] || return 0
+	logger -p daemon.warn -t gl-cellular \
+		"no DHCP answer on ${iface}_4 after ${waited}s; applying the QMI address $addr via $gw"
+	json_init
+	json_add_string name "${iface}_4"
+	json_add_string ifname "@$iface"
+	json_add_string proto "static"
+	json_add_array ipaddr; json_add_string "" "$addr"; json_close_array
+	json_add_string gateway "$gw"
+	json_add_array dns
+	[ -n "$d1" ] && [ "$d1" != "0.0.0.0" ] && json_add_string "" "$d1"
+	[ -n "$d2" ] && [ "$d2" != "0.0.0.0" ] && [ "$d2" != "$d1" ] && json_add_string "" "$d2"
+	json_close_array
+	proto_add_dynamic_defaults
+	[ -n "$zone" ] && json_add_string zone "$zone"
+	[ -n "$t4" ] && json_add_string ip4table "$t4"
+	json_close_object
+	ubus call network add_dynamic "$(json_dump)"
+}
+
 proto_qcm_setup() {
 	local interface="$1"
 	local device ifname apn pincode auth username password pdptype ipv6 mtu
@@ -229,7 +265,17 @@ _qcm_deactivate_pdp() {
 	return 0
 }
 
-_qcm_deactivate_pdp "$apn" "$pdptype" || return 1
+# Stock never releases the modem's PDP context before dialling; doing it on
+# every dial can detach the only bearer the modem has. Do it on the first dial
+# after boot or a modem reset (the modem auto-activates CID 1 itself), and
+# after quectel-CM exited on ESM cause 55 (it leaves its marker file), not on
+# ordinary redials.
+local qcm_dialled=/var/run/gl-cellular-qcm-dialled qcm_conflict=/var/run/gl-cellular-pdn-conflict
+if [ -e "$qcm_conflict" ] || [ ! -e "$qcm_dialled" ]; then
+	rm -f "$qcm_conflict"
+	_qcm_deactivate_pdp "$apn" "$pdptype" || return 1
+fi
+: > "$qcm_dialled"
 
 # QMI over PCIe requires the modem's PCIe personality, not its MBIM
 # personality. QCFG is non-volatile; repair a stale setting left by an older
@@ -324,11 +370,28 @@ local pdp="-4 -6"
 	fi
 	rm -f "$nosvc"
 
+	# Like stock's qcm.sh, only hand the APN to quectel-CM when it has to
+	# change something: credentials are set, or the modem's profile 1 does not
+	# already hold this APN. With -s quectel-CM rewrites profile 1 on any
+	# difference and puts an APN TLV into StartNetwork, which asks the network
+	# for a second PDN on the APN the modem attached with. Without it the call
+	# is bound to the existing profile.
+	local qcm_apn_args=""
+	if [ -n "$apn" ]; then
+		local cur_apn
+		cur_apn="$(_qcm_at 'AT+CGDCONT?' | tr -d '\r' | sed -n 's/^+CGDCONT: *1,"[^"]*","\([^"]*\)".*/\1/p' | head -n1)"
+		if [ -n "$username" ] || [ "$cur_apn" != "$apn" ]; then
+			qcm_apn_args="-s $apn"
+			[ -n "$username" ] && qcm_apn_args="$qcm_apn_args $username $password $auth"
+		fi
+	fi
+
 	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM \
-		-i "$ifname" $pdp \
-		${apn:+-s "$apn" ${username:+"$username" "$password" $auth}}
+		-i "$ifname" $pdp $qcm_apn_args
 
 	proto_init_update "$qmapnet" 1
+	# As stock does: keep the interface when only the proto handler restarts.
+	proto_set_keep 1
 	proto_send_update "$interface"
 
 	# Bring the QMAP carrier up explicitly, as stock's qcm.sh does
@@ -365,6 +428,8 @@ local pdp="-4 -6"
 		[ -n "$ip4table" ] && json_add_string ip4table "$ip4table"
 		json_close_object
 		ubus call network add_dynamic "$(json_dump)"
+
+		( _qcm_static_fallback "$interface" "$zone" "$ip4table" ) &
 	}
 
 	[ "$pdp" != "-4" ] && {

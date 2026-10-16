@@ -666,6 +666,11 @@ if(profile->usb_dev.idProduct != 0x0316)
                                  * Retrying here can never succeed, so exit and let the caller
                                  * release the stale context before dialling again. */
                                 dbg_time("PDN for this APN already active, exiting so it can be released");
+                                {
+                                    /* tell qcm.sh to release the stale context on the next dial */
+                                    FILE *cf = fopen("/var/run/gl-cellular-pdn-conflict", "w");
+                                    if (cf) fclose(cf);
+                                }
                                 usbnet_link_change(0, profile);
 #ifdef USE_IPC_MSG_STATUS_IND
                                 main_send_status_to_fifo(QCM_PROCESS_EXIT);

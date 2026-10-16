@@ -20,7 +20,7 @@ with initialization and can leave the host in an AER recovery loop.
 +		 * before the modem driver probes; a later sysfs override races
 +		 * with initialization and can leave the host in an AER loop.
 +		 */
-+		bootargs = "console=ttyS0,115200n8 root=PARTLABEL=rootfs rootwait pcie_port_pm=off";
++		bootargs = "console=ttyS0,115200n8 root=PARTLABEL=rootfs rootwait pcie_port_pm=off pci=noaer";
  	};
  
  	aliases {

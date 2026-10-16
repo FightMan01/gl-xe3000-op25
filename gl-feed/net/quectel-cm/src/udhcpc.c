@@ -523,7 +523,23 @@ void udhcpc_start(PROFILE_T *profile) {
     }
 #endif
 
-    /* QCM_NO_DHCP4: netifd's dhcp proto owns IPv4 (see gl-cellular's qcm.sh) */
+    /* QCM_NO_DHCP4: netifd's dhcp proto owns IPv4 (see gl-cellular's qcm.sh).
+     * Stock qcm falls back to the QMI-assigned address when DHCP gets no
+     * answer; publish it so qcm.sh can do the same through netifd. */
+    if (profile->ipv4.Address != 0 && getenv("QCM_NO_DHCP4")) {
+        FILE *qf = fopen("/var/run/gl-cellular-qmi-ipv4", "w");
+        if (qf) {
+            unsigned prefix = 0, n;
+            for (n = 0; n < 32; n++)
+                if (profile->ipv4.SubnetMask & ((unsigned)1 << n))
+                    prefix++;
+            fprintf(qf, "%s/%u", ipv4Str(profile->ipv4.Address), prefix);
+            fprintf(qf, " %s", ipv4Str(profile->ipv4.Gateway));
+            fprintf(qf, " %s", ipv4Str(profile->ipv4.DnsPrimary));
+            fprintf(qf, " %s\n", ipv4Str(profile->ipv4.DnsSecondary));
+            fclose(qf);
+        }
+    }
     if (profile->ipv4.Address == 0 || getenv("QCM_NO_DHCP4"))
         goto set_ipv6;
 
@@ -729,10 +745,13 @@ void udhcpc_stop(PROFILE_T *profile) {
     profile->udhcpc_ip = 0;
 //it seems when call netif_carrier_on(), and netcard 's IP is "0.0.0.0", will cause netif_queue_stopped()
     if (!access("/sbin/ip", X_OK))
-        snprintf(shell_cmd, sizeof(shell_cmd), "ip addr flush dev %s", ifname);
+        /* IPv4 only: stock just zeroes the address (ifconfig 0.0.0.0); a full
+         * flush would also drop the IPv6 and link-local addresses. */
+        snprintf(shell_cmd, sizeof(shell_cmd), "ip -4 addr flush dev %s", ifname);
     else
         snprintf(shell_cmd, sizeof(shell_cmd), "ifconfig %s 0.0.0.0", ifname);
     ql_system(shell_cmd);
+    unlink("/var/run/gl-cellular-qmi-ipv4");
     ifc_set_state(ifname, 0);
 
 #ifdef QL_OPENWER_NETWORK_SETUP

@@ -1,0 +1,44 @@
+#!/bin/sh
+# AT port detection for the Quectel RM520N-GL's USB serial ports.
+#
+# usb-serial ports are announced in the "tty" subsystem (DEVPATH
+# .../1-1.2:1.2/ttyUSB2/tty/ttyUSB2), not "usb", which is why this lives in
+# hotplug.d/tty. The AT port is USB interface 2, matching Quectel's standard
+# 4-port composite layout (DM=0, NMEA=1, AT=2, PPP/secondary=3); matching the
+# interface number rather than the ttyUSB ordinal keeps it stable. A re-added
+# port (the modem re-enumerates after a PCIe reset) restarts the AT daemon so it
+# never holds a descriptor for the old device node.
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$DEVPATH" in
+	*/ttyUSB*)
+		devname="${DEVNAME:-${DEVPATH##*/}}"
+		[ -c "/dev/$devname" ] || exit 0
+
+		# Only the USB device the modem's QMI control interface belongs to.
+		modem_usb_port="$(uci -q get gl-cellular.state.usb_port)"
+		case "$DEVPATH" in
+			*"$modem_usb_port"*) ;;
+			*) [ -z "$modem_usb_port" ] || exit 0 ;;
+		esac
+
+		# ".../1-1.2/1-1.2:1.2/ttyUSB2/tty/ttyUSB2": the first path element
+		# before "/ttyUSB" is the interface "<usbdev>:<config>.<interface>".
+		ifpath="${DEVPATH%%/ttyUSB*}"
+		ifname="${ifpath##*/}"
+		ifnum="${ifname##*.}"
+		usbdev="${ifname%%:*}"
+
+		# Stock (libcmutils disable_usb_autosuspend) writes "on" to the modem's
+		# USB power/control so the USB side is never runtime-suspended.
+		[ -w "/sys/bus/usb/devices/$usbdev/power/control" ] &&
+			echo on > "/sys/bus/usb/devices/$usbdev/power/control"
+
+		if [ "$ifnum" = "2" ]; then
+			uci -q set gl-cellular.atport.dev="/dev/$devname"
+			uci -q commit gl-cellular
+			/etc/init.d/gl-cellular-atd restart >/dev/null 2>&1
+		fi
+		;;
+esac

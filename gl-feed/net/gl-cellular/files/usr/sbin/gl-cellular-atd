@@ -62,7 +62,13 @@ local function tofloat(n)
 end
 
 local cursor = uci.cursor()
-local dev = cursor:get('gl-cellular', 'atport', 'dev') or '/dev/ttyUSB2'
+local usb_dev = cursor:get('gl-cellular', 'atport', 'dev') or '/dev/ttyUSB2'
+-- Stock's modem_AT talks to the modem over its PCIe AT channel (/dev/mhi_DUN)
+-- and never touches the USB serial ports. Prefer it when it answers; fall back
+-- to the USB AT port (gl-cellular.atport.prefer_mhi=0 to skip the PCIe one).
+local prefer_mhi = cursor:get('gl-cellular', 'atport', 'prefer_mhi') ~= '0'
+local MHI_AT = '/dev/mhi_DUN'
+local dev = usb_dev
 local baudrate = tonumber(cursor:get('gl-cellular', 'atport', 'baudrate') or '115200')
 
 local speed_const = termios['B' .. tostring(baudrate)]
@@ -72,28 +78,60 @@ end
 
 local f = nil
 
-local function open_port()
-	local handle, err = file.open(dev, file.O_RDWR)
+local function open_port(path)
+	local handle, err = file.open(path, file.O_RDWR)
 	if not handle then
 		return nil, err
 	end
+	local is_tty = not path:find('/mhi_', 1, true)
 	local attr, gerr = termios.tcgetattr(handle.fd)
-	if not attr then
+	if attr then
+		attr:clr_flag('l', termios.ECHO)
+		attr:clr_flag('l', termios.ICANON)
+		attr:clr_flag('l', termios.ISIG)
+		attr:set_cc(termios.VMIN, 0)
+		attr:set_cc(termios.VTIME, 1)
+		attr:set_speed(speed_const)
+		local ok, serr = termios.tcsetattr(handle.fd, termios.TCSANOW, attr)
+		if not ok and is_tty then
+			handle:close()
+			return nil, serr
+		end
+	elseif is_tty then
 		handle:close()
 		return nil, gerr
 	end
-	attr:clr_flag('l', termios.ECHO)
-	attr:clr_flag('l', termios.ICANON)
-	attr:clr_flag('l', termios.ISIG)
-	attr:set_cc(termios.VMIN, 0)
-	attr:set_cc(termios.VTIME, 1)
-	attr:set_speed(speed_const)
-	local ok, serr = termios.tcsetattr(handle.fd, termios.TCSANOW, attr)
-	if not ok then
-		handle:close()
-		return nil, serr
-	end
 	return handle
+end
+
+-- Open `path` and make sure something answers AT on it.
+local function probe_port(path)
+	local handle = open_port(path)
+	if not handle then return nil end
+	handle:write('AT\r\n')
+	local deadline = os.time() + 3
+	while os.time() < deadline do
+		local line = handle:read('l', 1)
+		if line and line:match('^OK') then return handle end
+	end
+	handle:close()
+	return nil
+end
+
+-- Pick the AT port: the PCIe channel if it works, then the USB interface the
+-- hotplug hook recorded, then the default ttyUSB2.
+local function choose_port()
+	local tried, cands = {}, {}
+	local function add(p) if p and not tried[p] then tried[p] = true cands[#cands + 1] = p end end
+	if prefer_mhi then add(MHI_AT) end
+	add(uci.cursor():get('gl-cellular', 'atport', 'dev'))
+	add(usb_dev)
+	add('/dev/ttyUSB2')
+	for _, p in ipairs(cands) do
+		local h = probe_port(p)
+		if h then return h, p end
+	end
+	return nil
 end
 
 -- Sends `cmd` (without trailing CR), reads until "OK"/"ERROR" or timeout.
@@ -102,14 +140,78 @@ end
 -- service one command at a time anyway.
 local at_busy = false
 
+-- Wake gl-cellular-boot-redial so it checks the SIM now: it re-runs its own
+-- validated checks, this only saves the wait for its next tick.
+local last_nudge = 0
+local function nudge_watchdog(reason)
+	local now = os.time()
+	if now - last_nudge < 10 then return end
+	last_nudge = now
+	log.info('gl-cellular-atd: ' .. reason .. '; nudging the watchdog')
+	os.execute('touch /var/run/gl-cellular-svc-lost; ubus call service signal '
+		.. "'{\"name\":\"gl-cellular-boot-redial\",\"instance\":\"instance1\",\"signal\":10}'"
+		.. ' >/dev/null 2>&1')
+end
+
+-- Unsolicited SIM/network reports (between commands, or inside a reply). The
+-- only record of why the SIM dropped (detect-pin glitch, SIM refresh, card
+-- error); a SIM that is no longer ready also wakes the watchdog at once, which
+-- is what stock's cellular_manager does with its +CPIN URC handlers.
+local function handle_urc(line, cmd)
+	if line:match('^%+CPIN:') then
+		if cmd and cmd:match('CPIN') then return end
+		log.info('gl-cellular-atd: modem report: ' .. line)
+		if not line:match('READY') then nudge_watchdog('SIM not ready (' .. line .. ')') end
+	elseif line:match('^%+QSIMSTAT:') then
+		log.info('gl-cellular-atd: modem report: ' .. line)
+		if line:match(',%s*0%s*$') then nudge_watchdog('SIM removed (' .. line .. ')') end
+	elseif line:match('^%+QIND:') and not line:match('^%+QIND:%s*"csq"') then
+		log.info('gl-cellular-atd: modem report: ' .. line)
+	end
+end
+
+-- Stock's modem_AT lengthens the wait for commands that legitimately take long.
+local function timeout_floor(cmd)
+	if cmd:match('^AT%+CGACT=') then return 160 end
+	if cmd:match('^AT%+COPS=') then return 200 end
+	if cmd:match('^AT%+QSCAN') then return 380 end
+	return 0
+end
+
+-- While gl-cellular-boot-redial power-cycles the radio it holds this lock and
+-- nothing but AT+CFUN may reach the modem (stock: /tmp/cfun_lock in modem_AT).
+-- The timestamp makes a lock left by a crashed watchdog expire.
+local CFUN_LOCK = '/var/run/gl-cellular-cfun.lock'
+local function cfun_locked(cmd)
+	if cmd:match('^AT%+CFUN') then return false end
+	local lf = io.open(CFUN_LOCK, 'r')
+	if not lf then return false end
+	local ts = tonumber(lf:read('l'))
+	lf:close()
+	return ts ~= nil and os.time() - ts < 180
+end
+
+local empty_replies = 0
+
+local reopen_port
 local function send_at_unlocked(cmd, timeout_s)
 	if not f then
-		return nil, 'AT port not open'
+		reopen_port()
+		if not f then return nil, 'AT port not open' end
 	end
-	f:write(cmd .. '\r\n')
+	if cfun_locked(cmd) then
+		return nil, 'blocked by CFUN lock'
+	end
+	local ok, werr = f:write(cmd .. '\r\n')
+	if not ok then
+		log.err('gl-cellular-atd: write to ' .. dev .. ' failed (' .. tostring(werr) .. '); reopening')
+		reopen_port()
+		return nil, 'AT port write failed'
+	end
 
-	local deadline = os.time() + (timeout_s or 5)
+	local deadline = os.time() + math.max(timeout_s or 5, timeout_floor(cmd))
 	local buf = {}
+	local read_err = false
 	while os.time() < deadline do
 		local line, err = f:read('l', 1)
 		if line then
@@ -117,17 +219,21 @@ local function send_at_unlocked(cmd, timeout_s)
 			if line:match('^OK%s*$') or line:match('^ERROR') or line:match('^%+CME ERROR') then
 				break
 			end
+		elseif err and err ~= 'timeout' and err ~= 'eof' then
+			read_err = true
+			break
 		end
 	end
-	-- Unsolicited SIM/network reports arrive between commands and land in
-	-- the next reply. Log them: they are the only record of why the SIM
-	-- dropped (detect-pin glitch, SIM refresh, card error).
-	for _, line in ipairs(buf) do
-		if line:match('^%+QSIMSTAT:') or line:match('^%+QIND:')
-				or line:match('^%+CPIN: NOT')
-				or (line:match('^%+CPIN:') and not cmd:match('CPIN')) then
-			log.info('gl-cellular-atd: modem report: ' .. line)
-		end
+	for _, line in ipairs(buf) do handle_urc(line, cmd) end
+
+	-- A port that never answers (modem USB re-enumerated after a PCIe reset,
+	-- device node replaced) keeps a dead descriptor open forever: reopen it
+	-- after repeated silence or a hard read error.
+	if #buf == 0 then empty_replies = empty_replies + 1 else empty_replies = 0 end
+	if read_err or empty_replies >= 3 then
+		empty_replies = 0
+		log.err('gl-cellular-atd: no usable reply from ' .. dev .. '; reopening the AT port')
+		reopen_port()
 	end
 	return table.concat(buf, '\n')
 end
@@ -664,11 +770,8 @@ local function note_service_state()
 	if not lost then svc_lost_count = 0 return end
 	svc_lost_count = svc_lost_count + 1
 	if svc_lost_count ~= 2 then return end
-	log.info('gl-cellular-atd: modem reports no service (' .. tostring(last_cell_state)
-		.. ', last NR band ' .. tostring(last_nr_band) .. '); nudging the watchdog')
-	os.execute('touch /var/run/gl-cellular-svc-lost; ubus call service signal '
-		.. "'{\"name\":\"gl-cellular-boot-redial\",\"instance\":\"instance1\",\"signal\":10}'"
-		.. ' >/dev/null 2>&1')
+	nudge_watchdog('modem reports no service (' .. tostring(last_cell_state)
+		.. ', last NR band ' .. tostring(last_nr_band) .. ')')
 end
 
 local function signal_sample()
@@ -1171,12 +1274,27 @@ local cellular_methods = {
 	},
 }
 
-local handle, open_err = open_port()
-if not handle then
-	log.err('gl-cellular-atd: failed to open ' .. dev .. ': ' .. tostring(open_err))
-	os.exit(1)
+reopen_port = function()
+	if f then pcall(function() f:close() end) f = nil end
+	local handle, path = choose_port()
+	if handle then
+		f = handle
+		dev = path
+		log.info('gl-cellular-atd: AT port ' .. path)
+	end
 end
-f = handle
+
+do
+	local handle, path = choose_port()
+	if not handle then
+		log.err('gl-cellular-atd: no AT port answered (tried ' .. MHI_AT .. ', ' .. usb_dev .. ')')
+		os.exit(1)
+	end
+	f = handle
+	dev = path
+end
+-- Same indication setup stock's modem_AT does on every (re)open.
+send_at_unlocked('AT+QINDCFG="all",1,1', 3)
 -- Report SIM insertion/removal as +QSIMSTAT, so a SIM that drops out
 -- (and comes back PIN-locked) leaves a trace in the log.
 send_at_unlocked('AT+QSIMSTAT=1', 2)
@@ -1206,7 +1324,28 @@ if not cellular_obj then
 	error('gl-cellular-atd: ubus add (cellular) failed: ' .. tostring(cellular_add_err))
 end
 
+-- URCs that arrive while no command is waiting (a SIM dropping out is exactly
+-- that) would otherwise sit in the tty buffer until the next command. Drain
+-- them every couple of seconds; stock's modem_AT does the same continuously.
+local function urc_loop()
+	while true do
+		time.sleep(2)
+		if f and not at_busy then
+			at_busy = true
+			pcall(function()
+				while true do
+					local line = f:read('l', 0.05)
+					if not line then break end
+					handle_urc(line, nil)
+				end
+			end)
+			at_busy = false
+		end
+	end
+end
+
 eco.run(traffic_loop)
 eco.run(signal_loop)
+eco.run(urc_loop)
 
 log.info('gl-cellular-atd started on ' .. dev .. ' @ ' .. tostring(baudrate))

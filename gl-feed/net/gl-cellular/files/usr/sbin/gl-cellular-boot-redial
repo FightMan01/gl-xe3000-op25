@@ -762,7 +762,21 @@ modem_hard_reset() {
 # that a plain ifdown/ifup can't clear - but it costs 15-30s of
 # guaranteed downtime, so it's gated far more conservatively than a
 # redial and must never become the steady state.
+CFUN_LOCK=/var/run/gl-cellular-cfun.lock
+
+# gl-cellular-atd refuses every AT command except AT+CFUN while this file is
+# fresh (as stock's modem_AT does with /tmp/cfun_lock), so nothing else talks
+# to a modem that is mid power-cycle.
 do_cfun_cycle() {
+	local rc
+	date +%s > "$CFUN_LOCK"
+	_do_cfun_cycle
+	rc=$?
+	rm -f "$CFUN_LOCK"
+	return $rc
+}
+
+_do_cfun_cycle() {
 	local now attempt
 	now="$(date +%s)"
 	[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] || return 1
@@ -770,7 +784,10 @@ do_cfun_cycle() {
 	last_cfun=$now
 	logger -p daemon.err -t "$TAG" \
 		"$failed_cycles redial cycles did not restore traffic; power-cycling modem radio"
-	at_query 'AT+CFUN=0' >/dev/null
+	# CFUN=4 (flight mode), not 0: CFUN=0 powers the SIM down, so the card
+	# comes back PIN-locked, and stock's recovery never power-cycles the radio
+	# at all. 4 re-registers the radio and leaves the SIM alone.
+	at_query 'AT+CFUN=4' >/dev/null
 	sleep 5
 
 	# AT+CFUN=1 is the one command standing between a live radio and a

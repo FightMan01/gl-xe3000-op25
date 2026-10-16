@@ -609,7 +609,9 @@ methods = {
 	end,
 
 	set_airplane_mode = function(args)
-		local resp = at.command("AT+CFUN=" .. (args.enable and "0" or "1"), 8)
+		-- Flight mode (4), not minimum functionality (0): 0 powers the SIM down
+		-- and it would come back PIN-locked when airplane mode is switched off.
+		local resp = at.command("AT+CFUN=" .. (args.enable and "4" or "1"), 8)
 		if not resp or not resp:match("OK") then
 			return { code = 1, message = "modem rejected AT+CFUN" }
 		end
@@ -1231,14 +1233,23 @@ methods = {
 		if not tonumber(slot) then
 			return { code = 1, message = "missing/invalid slot" }
 		end
-		local resp = at.command("AT+QUIMSLOT=" .. tostring(math.floor(tonumber(slot))), 5)
-		if not resp or not resp:match("OK") then
-			return { code = 1, message = "modem rejected slot switch (AT+QUIMSLOT)" }
+		slot = math.floor(tonumber(slot))
+		-- Only touch the modem when the slot really changes: AT+QUIMSLOT
+		-- re-initialises the SIM even when it names the slot already in use.
+		local cur = at.command("AT+QUIMSLOT?", 5)
+		local cur_slot = cur and tonumber(cur:match("%+QUIMSLOT:%s*(%d+)"))
+		if cur_slot ~= slot then
+			local resp = at.command("AT+QUIMSLOT=" .. tostring(slot), 5)
+			if not resp or not resp:match("OK") then
+				return { code = 1, message = "modem rejected slot switch (AT+QUIMSLOT)" }
+			end
 		end
 		local cursor = uci.cursor()
 		cursor:set("gl-cellular", "state", "active_slot", tostring(math.floor(tonumber(slot))))
 		cursor:commit("gl-cellular")
-		os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
+		if cur_slot ~= slot then
+			os.execute("/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1 &")
+		end
 		return {}
 	end,
 

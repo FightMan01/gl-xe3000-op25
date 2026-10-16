@@ -8,6 +8,6 @@ START=19
 start() {
 	local temperature
 	temperature="$(uci -q get gl-oui-rpc.fan.temperature)"
-	[ -n "$temperature" ] || temperature=85
+	[ -n "$temperature" ] || temperature=75
 	/usr/sbin/gl-fan-set-threshold "$temperature" 2>/dev/null
 }

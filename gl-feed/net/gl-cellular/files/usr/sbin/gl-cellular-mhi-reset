@@ -7,7 +7,7 @@
 #   1. ifdown/ifup wwan          host-side QMI session only
 #   2. gl-cellular-rat fallback  LTE-only, plus a redial
 #   3. gl-cellular-mhi-reset     the MHI controller / QMAP channels (this)
-#   4. AT+CFUN=0/1               modem radio
+#   4. AT+CFUN=4/1               modem radio
 #   5. gl-cellular-modem-reset   full PCIe function remove + rescan
 #   6. reboot                    last resort
 #
