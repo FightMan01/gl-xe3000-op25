@@ -59,9 +59,6 @@
 
 TAG=gl-cellular-rat
 STATE=/var/run/gl-cellular-rat.state
-# Band guard (see cmd_band_guard): tmpfs marks "guard active this boot" and
-# when it started; the list to restore lives in UCI so it survives a reboot.
-GUARD=/var/run/gl-cellular-band-guard
 
 opt() {
 	local val
@@ -142,11 +139,6 @@ fallback_pref() {
 
 cmd_apply() {
 	local fb
-	# A guard left over from before a reboot has no tmpfs mark: put the
-	# bands back before dialling, the same way a stale RAT fallback is.
-	if [ ! -f "$GUARD" ] && [ -n "$(uci -q get gl-cellular.state.nsa_band_saved)" ]; then
-		cmd_band_guard off
-	fi
 	fb="$(fallback_pref)"
 	if [ -n "$fb" ]; then
 		set_pref "$fb" && return 0
@@ -174,128 +166,6 @@ cmd_fallback() {
 }
 
 
-# --- band guard --------------------------------------------------------
-# Field logs 2026-10-16: the modem's SIM re-locked (and its data plane died)
-# twice on one train journey, both times while it was on 5G NSA with the NR
-# carrier on n78; the same SIM and route on n1 NSA ran the whole trip. After
-# such a re-lock the watchdog calls `band-guard on`, which removes the bands in
-# gl-cellular.watchdog.relock_avoid_nr_bands (default 78) from the NSA NR band
-# list for a hold window, and `band-guard release` puts the list back once the
-# link has been good for that long. Everything else (LTE, other NR bands) is
-# untouched. Set relock_avoid_nr_bands to an empty string to disable.
-guard_avoid() {
-	local val
-	val="$(uci -q get gl-cellular.watchdog.relock_avoid_nr_bands)"
-	# An option that was set to '' is deleted by uci, so "off" is spelled
-	# 'none'; an absent option means the default.
-	[ -n "$val" ] || val=78
-	[ "$val" = none ] && val=""
-	echo "$val"
-}
-
-nsa_bands() {
-	at 'AT+QNWPREFCFG="nsa_nr5g_band"' | tr -d '\r' |
-		sed -n 's/^+QNWPREFCFG: *"nsa_nr5g_band", *\([0-9:]*\).*/\1/p' | head -n1
-}
-
-# list minus every avoided band, ':'-separated, order kept
-bands_without() {
-	local list="$1" avoid="$2" out="" b a skip
-	for b in $(echo "$list" | tr ':' ' '); do
-		skip=0
-		for a in $(echo "$avoid" | tr ':,' '  '); do
-			[ "$b" = "$a" ] && skip=1
-		done
-		[ "$skip" = 1 ] || out="${out:+$out:}$b"
-	done
-	echo "$out"
-}
-
-# Was the NR carrier (as last seen by gl-cellular-atd) one of the avoided bands?
-nr_band_implicated() {
-	local seen a
-	seen="$(cat /var/run/gl-cellular-nr-band 2>/dev/null)"
-	seen="${seen#n}"
-	[ -n "$seen" ] || return 1
-	for a in $(echo "$1" | tr ':,' '  '); do
-		[ "$seen" = "$a" ] && return 0
-	done
-	return 1
-}
-
-cmd_band_guard() {
-	local action="$1" avoid cur new saved guarded hold up
-	read -r up _ < /proc/uptime
-	up="${up%%.*}"
-
-	case "$action" in
-	on)
-		[ -f "$GUARD" ] && return 0
-		avoid="$(guard_avoid)"
-		[ -n "$avoid" ] || return 0
-		nr_band_implicated "$avoid" || return 0
-		cur="$(nsa_bands)"
-		[ -n "$cur" ] || return 0
-		new="$(bands_without "$cur" "$avoid")"
-		# Nothing to remove, or it would leave no NR band at all.
-		[ "$new" != "$cur" ] && [ -n "$new" ] || return 0
-		# Both lists go to flash first: the modem keeps the reduced one in
-		# its NV, so a reboot must still know what to put back.
-		uci -q set gl-cellular.state.nsa_band_saved="$cur"
-		uci -q set gl-cellular.state.nsa_band_guarded="$new"
-		uci -q commit gl-cellular
-		case "$(at "AT+QNWPREFCFG=\"nsa_nr5g_band\",$new")" in
-		*OK*)
-			echo "$up" > "$GUARD"
-			logger -p daemon.warning -t "$TAG" \
-				"SIM re-lock on NR $avoid: avoiding it for a while (nsa_nr5g_band $cur -> $new)"
-			;;
-		*)
-			uci -q delete gl-cellular.state.nsa_band_saved
-			uci -q delete gl-cellular.state.nsa_band_guarded
-			uci -q commit gl-cellular
-			;;
-		esac
-		;;
-	release)
-		[ -f "$GUARD" ] || return 0
-		hold="$(uci -q get gl-cellular.watchdog.relock_avoid_hold_sec || echo 1800)"
-		[ $((up - $(cat "$GUARD" 2>/dev/null || echo 0))) -ge "$hold" ] || return 0
-		cmd_band_guard off
-		;;
-	off)
-		saved="$(uci -q get gl-cellular.state.nsa_band_saved)"
-		guarded="$(uci -q get gl-cellular.state.nsa_band_guarded)"
-		if [ -n "$saved" ]; then
-			cur="$(nsa_bands)"
-			if [ -n "$guarded" ] && [ -n "$cur" ] && [ "$cur" != "$guarded" ]; then
-				# The user changed the band lock meanwhile; theirs wins.
-				logger -p daemon.notice -t "$TAG" \
-					"NR band list changed during the guard ($cur); not restoring"
-			else
-				case "$(at "AT+QNWPREFCFG=\"nsa_nr5g_band\",$saved")" in
-				*OK*)
-					logger -p daemon.notice -t "$TAG" \
-						"restored NR NSA band list ($saved)"
-					;;
-				*)
-					# AT port not ready: keep the saved list, retry at the
-					# next release/apply.
-					logger -p daemon.warning -t "$TAG" \
-						"could not restore NR NSA band list yet; will retry"
-					return 1
-					;;
-				esac
-			fi
-			uci -q delete gl-cellular.state.nsa_band_saved
-			uci -q delete gl-cellular.state.nsa_band_guarded
-			uci -q commit gl-cellular
-		fi
-		rm -f "$GUARD"
-		;;
-	esac
-}
-
 cmd_show() {
 	echo "configured=$(configured_pref)"
 	echo "effective=$(current_pref)"
@@ -310,9 +180,8 @@ apply)   cmd_apply ;;
 restore) cmd_restore ;;
 fallback) cmd_fallback ;;
 show)    cmd_show ;;
-band-guard) cmd_band_guard "$2" ;;
 *)
-	echo "usage: $(basename "$0") {apply|restore|fallback|show|band-guard on|release|off}" >&2
+	echo "usage: $(basename "$0") {apply|restore|fallback|show}" >&2
 	exit 1
 	;;
 esac

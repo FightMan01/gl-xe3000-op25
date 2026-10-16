@@ -647,8 +647,8 @@ local svc_lost_count = 0
 local last_nr_band = nil
 
 -- Remember which NR band the modem was on (tmpfs, written on change only):
--- the band guard in gl-cellular-rat only acts if it was an implicated one,
--- and the log line below records it for the next field report.
+-- the NR band is kept for field reports,
+-- and the log line below records it.
 local function note_nr_band(cell)
 	local band = cell and cell.nr and cell.nr.band
 	if band and band ~= last_nr_band then

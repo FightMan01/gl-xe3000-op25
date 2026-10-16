@@ -922,10 +922,6 @@ RELOCK_QUIET=120
 
 relock_reconnect() {
 	local start deadline up device
-	# The modem lost its SIM on 5G NSA: keep it off the NR band implicated in
-	# the field logs for a while (gl-cellular-rat band-guard, off switch:
-	# gl-cellular.watchdog.relock_avoid_nr_bands='').
-	/usr/sbin/gl-cellular-rat band-guard on
 	/usr/sbin/gl-cellular-wwan-reconnect
 	sim_was_locked=0
 	sim_locked_ticks=0
@@ -1202,7 +1198,6 @@ while :; do
 		# window, so lte_fallback_since survives the counter reset that
 		# traffic_state=2 causes.
 		lte_fallback_release
-		[ -f /var/run/gl-cellular-band-guard ] && /usr/sbin/gl-cellular-rat band-guard release
 		recheck_cpin=0
 		# No baseline yet (just redialed): confirm real traffic one normal
 		# tick later before relaxing to the idle period.
