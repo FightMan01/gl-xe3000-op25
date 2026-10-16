@@ -655,6 +655,15 @@ function handle_route_event(event) {
 		return;
 	}
 
+	// A default route appearing in or vanishing from an interface's own
+	// table (copied there by the ifup hotplug, not by this daemon) changes
+	// that interface's route state, so re-evaluate on it as well. Without
+	// this a fresh ifup is judged against a table the hotplug has not filled
+	// yet and stays "down" until the periodic sweep.
+
+	if (route.table != RT_TABLE_MAIN && is_default_route(route))
+		arm_route_state_refresh();
+
 	// Only handle main table routes
 
 	if (route.table != RT_TABLE_MAIN)

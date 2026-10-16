@@ -1,0 +1,21 @@
+#!/bin/sh
+# Installs that kept their wireless config across a sysupgrade never got the
+# DTIM period the first-boot defaults now set. With the mainline default of 2,
+# clients that doze between beacons (iPhones, Macs) lose downlink frames and
+# TCP throughput collapses, so give every AP interface DTIM 1 unless the user
+# already chose a value.
+
+. /lib/functions.sh
+
+_dtim_default() {
+	local section="$1" mode dtim
+	config_get mode "$section" mode
+	config_get dtim "$section" dtim_period
+	[ "$mode" = "ap" ] && [ -z "$dtim" ] && uci -q set wireless."$section".dtim_period='1'
+}
+
+config_load wireless
+config_foreach _dtim_default wifi-iface
+
+uci -q commit wireless
+exit 0
