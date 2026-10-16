@@ -99,6 +99,13 @@ config watchdog 'watchdog'
 	# /root/relock-traces (gl-cellular-relock-trace). Costs several AT
 	# commands every 10s; restart that service after changing this.
 	option relock_trace '0'
+	# After a SIM re-lock on 5G NSA, keep these NR bands (colon separated)
+	# out of AT+QNWPREFCFG="nsa_nr5g_band" for relock_avoid_hold_sec of good
+	# link, then restore the list. 'none' disables. Only acts if the last
+	# NR carrier seen was one of these bands. Field reports tie the
+	# re-locks to n78 NSA; the same route on n1 NSA was stable.
+	option relock_avoid_nr_bands '78'
+	option relock_avoid_hold_sec '1800'
 
 config apn 'apn'
 	# Service queried by the Cellular page's "update APN database" action.

@@ -379,8 +379,13 @@ end
 -- directly (different Lua runtime). LTE-only mode is one combined
 -- "+QENG:" line; 5G NSA/SA mode splits across three separate lines
 -- (state-only, LTE anchor, NR5G-* secondary).
+-- First "+QENG:" state word of the last query (NOCONN/CONNECT/SEARCH/LIMSRV),
+-- nil when the modem gave no serving-cell line at all.
+local last_cell_state = nil
+
 local function serving_cell_snapshot()
 	local lines = all_qeng_lines(send_at('AT+QENG="servingcell"', 3))
+	last_cell_state = lines[1] and lines[1][2] or nil
 	if #lines == 0 then return nil end
 
 	if #lines == 1 and lines[1][3] then
@@ -633,11 +638,46 @@ local function update_signal_leds(strength)
 	end
 end
 
+-- A SIM that falls out of the modem (re-lock after a firmware-side restart)
+-- shows up here first: the modem drops to limited service or loses its
+-- serving cell. Tell the redial watchdog once per episode so it checks the
+-- SIM now rather than at its next slow refresh. Costs nothing while service
+-- is normal; the watchdog only re-runs its own validated checks.
+local svc_lost_count = 0
+local last_nr_band = nil
+
+-- Remember which NR band the modem was on (tmpfs, written on change only):
+-- the band guard in gl-cellular-rat only acts if it was an implicated one,
+-- and the log line below records it for the next field report.
+local function note_nr_band(cell)
+	local band = cell and cell.nr and cell.nr.band
+	if band and band ~= last_nr_band then
+		last_nr_band = band
+		local fh = io.open('/var/run/gl-cellular-nr-band', 'w')
+		if fh then fh:write(band, '\n') fh:close() end
+	end
+end
+
+local function note_service_state()
+	local lost = last_cell_state == nil or last_cell_state == 'LIMSRV'
+		or last_cell_state == 'SEARCH'
+	if not lost then svc_lost_count = 0 return end
+	svc_lost_count = svc_lost_count + 1
+	if svc_lost_count ~= 2 then return end
+	log.info('gl-cellular-atd: modem reports no service (' .. tostring(last_cell_state)
+		.. ', last NR band ' .. tostring(last_nr_band) .. '); nudging the watchdog')
+	os.execute('touch /var/run/gl-cellular-svc-lost; ubus call service signal '
+		.. "'{\"name\":\"gl-cellular-boot-redial\",\"instance\":\"instance1\",\"signal\":10}'"
+		.. ' >/dev/null 2>&1')
+end
+
 local function signal_sample()
 	-- Always a fresh query here (not the shared cache): this is the one
 	-- reading recorded into history, and it doubles as the cache refresh
 	-- other callers reuse for the next CELL_CACHE_TTL_SEC.
 	local cell = refresh_serving_cell()
+	note_nr_band(cell)
+	note_service_state()
 	local strength
 	if cell and cell.nr then
 		strength = signal_level('rsrp', cell.nr.rsrp)
@@ -1140,6 +1180,13 @@ f = handle
 -- Report SIM insertion/removal as +QSIMSTAT, so a SIM that drops out
 -- (and comes back PIN-locked) leaves a trace in the log.
 send_at_unlocked('AT+QSIMSTAT=1', 2)
+-- Record the modem's own SIM-detect and crash-restart settings in the log.
+-- A SIM that re-locks without any MHI reset is a firmware-side restart or a
+-- detect-pin glitch, and these values are what tell the two apart.
+for _, q in ipairs({ 'AT+QSIMDET?', 'AT+QCFG="modemrstlevel"', 'AT+QCFG="aprstlevel"' }) do
+	local r = send_at_unlocked(q, 2) or ''
+	log.info('gl-cellular-atd: ' .. q .. ' -> ' .. r:gsub('[\r\n]+', ' '))
+end
 
 local con, err = ubus.connect(nil, true)
 if not con then
