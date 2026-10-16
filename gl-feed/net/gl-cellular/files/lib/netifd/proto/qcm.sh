@@ -283,15 +283,6 @@ local pdp="-4 -6"
 	echo 2 > "/proc/sys/net/ipv6/conf/$qmapnet/accept_ra" 2>/dev/null
 	echo 0 > "/proc/sys/net/ipv6/conf/$qmapnet/autoconf" 2>/dev/null
 
-	# Carrier-rejection cause reporting. AT+QNETRC=7 makes the modem emit a
-	# +QNETRC URC carrying the EMM/ESM/5GMM reject cause whenever the
-	# network refuses a registration or an activation. This is the only
-	# place the *network's* reason for a refusal is ever exposed - QMI's
-	# call-end-reason says "no service" (CM_NO_SERVICE, verbose 2001) or
-	# "already have this PDN" (ESM 54, verbose 55) but never why. Persisted
-	# in NVM, so it is set once here rather than on every dial.
-	_qcm_at 'AT+QNETRC=7' >/dev/null
-
 	# Same reason GL's own cellular manager issues AT+QCAINFO=1 at modem
 	# bring-up (its ensure_quectel_qcainfo_enabled, Quectel-only): it turns
 	# on the modem's carrier-aggregation parameter reporting, which is what

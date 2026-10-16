@@ -22,6 +22,15 @@ case "$DEVPATH" in
 			*) [ -z "$modem_usb_port" ] || exit 0 ;;
 		esac
 
+		# Stock (libcmutils disable_usb_autosuspend) writes "on" to the modem's
+		# USB power/control so the USB side of the composite device is never
+		# runtime-suspended under the PCIe data path. Do the same.
+		usbdev="${DEVPATH%/*}"
+		usbdev="${usbdev%/*}"
+		usbdev="${usbdev##*/}"
+		[ -w "/sys/bus/usb/devices/$usbdev/power/control" ] &&
+			echo on > "/sys/bus/usb/devices/$usbdev/power/control"
+
 		# DEVPATH looks like ".../1-1.2/1-1.2:1.2/ttyUSB2" - the segment
 		# before the final "/ttyUSBn" ends in "<config>.<interface>".
 		ifpath="${DEVPATH%/ttyUSB*}"

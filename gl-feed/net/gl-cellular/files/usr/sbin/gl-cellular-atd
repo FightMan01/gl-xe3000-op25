@@ -1180,6 +1180,9 @@ f = handle
 -- Report SIM insertion/removal as +QSIMSTAT, so a SIM that drops out
 -- (and comes back PIN-locked) leaves a trace in the log.
 send_at_unlocked('AT+QSIMSTAT=1', 2)
+-- Older builds of this port wrote AT+QNETRC=7 (reject-cause URCs) into the
+-- modem's NV on every dial. Stock only ever queries it, so put it back.
+send_at_unlocked('AT+QNETRC=0', 2)
 -- Record the modem's own SIM-detect and crash-restart settings in the log.
 -- A SIM that re-locks without any MHI reset is a firmware-side restart or a
 -- detect-pin glitch, and these values are what tell the two apart.
