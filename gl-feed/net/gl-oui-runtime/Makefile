@@ -12,7 +12,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-runtime
 PKG_VERSION:=1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_LICENSE:=GPL-2.0-or-later
 
@@ -36,6 +36,9 @@ define Package/gl-oui-runtime/description
   gl_home.html exists, letting a freshly-flashed router accept a GL UI
   backup tarball (see tools/backup-gl-ui.sh) through the browser instead
   of scp/ssh. Only usable before a root password is set.
+
+  Also keeps a copy of the GL frontend in /etc/gl-ui, which sysupgrade
+  carries over and restores on the first boot of the new image.
 endef
 
 define Build/Compile
@@ -52,6 +55,8 @@ html="$${IPKG_INSTROOT}/www/gl_home.html"
 if [ -f "$$html" ] && ! grep -q 'gl-port-runtime.js' "$$html"; then
 	sed -i 's#</body>#<script src="/js/gl-port-runtime.js"></script></body>#' "$$html"
 fi
+/etc/init.d/gl-ui-backup enable 2>/dev/null
+[ -f "$${IPKG_INSTROOT}/www/gl_home.html" ] && /usr/sbin/gl-ui-backup >/dev/null 2>&1 &
 exit 0
 endef
 

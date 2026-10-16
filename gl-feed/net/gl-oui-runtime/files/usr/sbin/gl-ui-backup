@@ -1,0 +1,35 @@
+#!/bin/sh
+# Keep a copy of the GL frontend in /etc/gl-ui so sysupgrade carries it over
+# (lib/upgrade/keep.d/gl-oui-runtime) and uci-defaults/96-gl-ui-restore puts
+# it back on the first boot of the new image.
+#
+# "The GL frontend" is whatever lives under /www and /usr/share/oui that no
+# installed package owns (apk audit reports it as added) - package-owned files
+# come with the new image and must not be shadowed by older copies.
+#
+#   gl-ui-backup        refresh the copy if the frontend changed since
+#   gl-ui-backup -f     refresh it unconditionally
+
+OUT=/etc/gl-ui/ui.tar.gz
+LIST=/tmp/gl-ui-backup.list
+
+[ -f /www/gl_home.html ] || exit 0
+if [ "$1" != "-f" ] && [ -f "$OUT" ] && [ ! /www/gl_home.html -nt "$OUT" ]; then
+	exit 0
+fi
+
+mkdir -p /etc/gl-ui
+apk audit --full 2>/dev/null |
+	sed -n 's#^[ADU] \(www/.*\|usr/share/oui/.*\)$#\1#p' |
+	sed 's#/$##' > "$LIST"
+[ -s "$LIST" ] || { rm -f "$LIST"; exit 1; }
+
+if tar -czf "$OUT.tmp" -C / -T "$LIST" 2>/dev/null; then
+	mv "$OUT.tmp" "$OUT"
+	logger -t gl-ui-backup "saved the GL frontend ($(wc -l < "$LIST") entries) to $OUT"
+else
+	rm -f "$OUT.tmp"
+	logger -p daemon.err -t gl-ui-backup "could not save the GL frontend"
+fi
+rm -f "$LIST"
+exit 0

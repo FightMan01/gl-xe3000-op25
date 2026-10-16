@@ -90,6 +90,8 @@ end
 
 os.execute("tar -xzf " .. tmp .. " -C / www usr/share/oui/menu.d")
 os.remove(tmp)
+-- keep a copy so a later sysupgrade does not wipe the frontend again
+os.execute("/usr/sbin/gl-ui-backup -f >/dev/null 2>&1 &")
 
 ngx.header["Content-Type"] = "text/plain"
 ngx.say("Restored. Reload this page.")

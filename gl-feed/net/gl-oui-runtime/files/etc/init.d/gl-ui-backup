@@ -1,0 +1,9 @@
+#!/bin/sh /etc/rc.common
+# Refresh the GL frontend copy (see /usr/sbin/gl-ui-backup) a couple of minutes
+# after boot, out of the way of everything else.
+START=99
+
+start() {
+	[ -f /www/gl_home.html ] || return 0
+	( sleep 120; nice /usr/sbin/gl-ui-backup ) >/dev/null 2>&1 &
+}

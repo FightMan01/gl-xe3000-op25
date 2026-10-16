@@ -1,0 +1,16 @@
+#!/bin/sh
+# First boot of a new image: if the GL frontend is gone but sysupgrade carried
+# its backup over, unpack it (see /usr/sbin/gl-ui-backup).
+[ -f /www/gl_home.html ] && exit 0
+[ -f /etc/gl-ui/ui.tar.gz ] || exit 0
+
+if tar -xzf /etc/gl-ui/ui.tar.gz -C /; then
+	logger -t gl-ui-restore "restored the GL frontend from /etc/gl-ui/ui.tar.gz"
+	html=/www/gl_home.html
+	if [ -f "$html" ] && ! grep -q 'gl-port-runtime.js' "$html"; then
+		sed -i 's#</body>#<script src="/js/gl-port-runtime.js"></script></body>#' "$html"
+	fi
+else
+	logger -p daemon.err -t gl-ui-restore "could not unpack /etc/gl-ui/ui.tar.gz"
+fi
+exit 0
