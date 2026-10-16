@@ -2149,10 +2149,14 @@ static int requestGetProfile(PROFILE_T *profile) {
 
 _re_check:
     pRequest = ComposeQMUXMsg(QMUX_TYPE_WDS, QMIWDS_GET_PROFILE_LIST_REQ, WdsGetProfileListReqSend, profile);
-    err = QmiThreadSendQMI(pRequest, &pResponse);s_pResponse = malloc(le16_to_cpu(pResponse->QMIHdr.Length) + 1);
+    err = QmiThreadSendQMI(pRequest, &pResponse);
     qmi_rsp_check_and_return();
     
     pProfileList = (PQMIWDS_PROFILELIST)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x01);
+    if (pProfileList == NULL) {
+        free(pResponse);
+        return -1;
+    }
     uint8 profile_indexs[42] = {0};
     uint8 profile_num = pProfileList->ProfileList[0];
     uint8 i;
@@ -2180,7 +2184,7 @@ _re_check:
         qmi_rsp_check_and_return();
         
         pPdpContext = (PQMIWDS_PDPCONTEXT)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x25);
-        if(pPdpContext->pdp_context == profile->pdp)
+        if(pPdpContext && pPdpContext->pdp_context == profile->pdp)
             break;
         else
             free(pResponse);
