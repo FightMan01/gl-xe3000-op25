@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
 #include <linux/netdevice.h>
+#include <net/gro_cells.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
@@ -432,6 +433,7 @@ struct qmap_priv {
 	unsigned char bridge_mac[ETH_ALEN];
 #endif
 	uint use_qca_nss;	
+	struct gro_cells gro_cells;
 };
 
 static struct mhi_netdev *ndev_to_mhi(struct net_device *ndev) {
@@ -1298,6 +1300,50 @@ static rx_handler_result_t qca_nss_rx_handler(struct sk_buff **pskb)
 }
 #endif
 
+
+/* Optional GRO for QMAP-demuxed packets (module parameters, writable at
+ * runtime). Off by default: measured on this router it lowers CPU use for
+ * traffic the router terminates, but costs about 10% more CPU per Mbit when
+ * forwarding to Wi-Fi, because the aggregates have to be split and
+ * checksummed again for a device without TSO or checksum offload. With
+ * rx_csum_trust the packets are marked checksum-verified (the modem has
+ * already checked them) instead of being summed again by GRO. */
+static uint rx_gro;
+module_param(rx_gro, uint, 0644);
+MODULE_PARM_DESC(rx_gro, "coalesce received QMAP packets with GRO");
+static uint rx_csum_trust = 1;
+module_param(rx_csum_trust, uint, 0644);
+MODULE_PARM_DESC(rx_csum_trust, "mark modem-delivered packets CHECKSUM_UNNECESSARY");
+
+/* Fraglist GRO keeps the original packets chained on the aggregate, so the
+ * forwarding path can hand them back out unchanged: no copy and no checksum
+ * pass when the router has to split the aggregate again for Wi-Fi. */
+static uint rx_gro_fraglist;
+module_param(rx_gro_fraglist, uint, 0644);
+MODULE_PARM_DESC(rx_gro_fraglist, "use fraglist GRO for received QMAP packets");
+
+static void qmap_rx_deliver(struct sk_buff *skb)
+{
+	struct net_device *ndev = skb->dev;
+
+	if (READ_ONCE(rx_gro) && ndev && ndev->netdev_ops == &rmnet_vnd_ops) {
+		struct qmap_priv *priv = netdev_priv(ndev);
+		bool fraglist = !!READ_ONCE(rx_gro_fraglist);
+
+		if (fraglist != !!(ndev->features & NETIF_F_GRO_FRAGLIST)) {
+			if (fraglist)
+				ndev->features |= NETIF_F_GRO_FRAGLIST;
+			else
+				ndev->features &= ~NETIF_F_GRO_FRAGLIST;
+		}
+		if (READ_ONCE(rx_csum_trust))
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		gro_cells_receive(&priv->gro_cells, skb);
+		return;
+	}
+	netif_receive_skb(skb);
+}
+
 static void rmnet_mbim_rx_handler(void *dev, struct sk_buff *skb_in)
 {
 	struct mhi_netdev *pQmapDev = (struct mhi_netdev *)dev;
@@ -1472,7 +1518,7 @@ static void rmnet_mbim_rx_handler(void *dev, struct sk_buff *skb_in)
 
 error:
 	while ((qmap_skb = __skb_dequeue (&skb_chain))) {
-		netif_receive_skb(qmap_skb);
+		qmap_rx_deliver(qmap_skb);
 	}	
 }
 
@@ -1624,7 +1670,7 @@ skip_pkt:
 
 error_pkt:
 	while ((qmap_skb = __skb_dequeue (&skb_chain))) {
-		netif_receive_skb(qmap_skb);
+		qmap_rx_deliver(qmap_skb);
 	}
 }
 
@@ -1734,6 +1780,8 @@ static struct net_device * rmnet_vnd_register_device(struct mhi_netdev *pQmapDev
 	priv->agg_hrtimer.function = rmnet_vnd_tx_agg_timer_cb;
 	#endif
 	INIT_WORK(&priv->agg_wq, rmnet_vnd_tx_agg_work);
+	if (gro_cells_init(&priv->gro_cells, qmap_net))
+		goto out_free_newdev;
 	ktime_get_ts64(&priv->agg_time);
 	spin_lock_init(&priv->agg_lock);
 	priv->use_qca_nss = 0;
@@ -1818,6 +1866,7 @@ static void  rmnet_vnd_unregister_device(struct net_device *qmap_net) {
 	free_percpu(priv->stats64);
 #endif
 	unregister_netdev (qmap_net);
+	gro_cells_destroy(&priv->gro_cells);
 	free_netdev(qmap_net);
 }
 #endif

@@ -21,7 +21,7 @@ include $(TOPDIR)/rules.mk
 # to re-audit these fixes against it, since V1.4 rewrote mhi_main.c and
 # mhi_pm.c heavily.
 PKG_VERSION:=1.3.8
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 include $(INCLUDE_DIR)/kernel.mk
 include $(INCLUDE_DIR)/package.mk
