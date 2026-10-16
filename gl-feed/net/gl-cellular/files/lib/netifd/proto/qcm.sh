@@ -265,17 +265,15 @@ _qcm_deactivate_pdp() {
 	return 0
 }
 
-# Stock never releases the modem's PDP context before dialling; doing it on
-# every dial can detach the only bearer the modem has. Do it on the first dial
-# after boot or a modem reset (the modem auto-activates CID 1 itself), and
-# after quectel-CM exited on ESM cause 55 (it leaves its marker file), not on
-# ordinary redials.
-local qcm_dialled=/var/run/gl-cellular-qcm-dialled qcm_conflict=/var/run/gl-cellular-pdn-conflict
-if [ -e "$qcm_conflict" ] || [ ! -e "$qcm_dialled" ]; then
+# Stock never releases the modem's PDP context before dialling, so neither do
+# we on an ordinary dial. The one exception is quectel-CM leaving its ESM-55
+# marker (a PDN for the APN already exists and the dial can never succeed):
+# release it once and redial.
+local qcm_conflict=/var/run/gl-cellular-pdn-conflict
+if [ -e "$qcm_conflict" ]; then
 	rm -f "$qcm_conflict"
 	_qcm_deactivate_pdp "$apn" "$pdptype" || return 1
 fi
-: > "$qcm_dialled"
 
 # QMI over PCIe requires the modem's PCIe personality, not its MBIM
 # personality. QCFG is non-volatile; repair a stale setting left by an older
@@ -387,7 +385,7 @@ local pdp="-4 -6"
 	fi
 
 	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM \
-		-i "$ifname" $pdp $qcm_apn_args
+		-i "$ifname" $pdp -n 1 $qcm_apn_args
 
 	proto_init_update "$qmapnet" 1
 	# As stock does: keep the interface when only the proto handler restarts.

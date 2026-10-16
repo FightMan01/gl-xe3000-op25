@@ -1295,9 +1295,6 @@ do
 end
 -- Same indication setup stock's modem_AT does on every (re)open.
 send_at_unlocked('AT+QINDCFG="all",1,1', 3)
--- Report SIM insertion/removal as +QSIMSTAT, so a SIM that drops out
--- (and comes back PIN-locked) leaves a trace in the log.
-send_at_unlocked('AT+QSIMSTAT=1', 2)
 -- Older builds of this port wrote AT+QNETRC=7 (reject-cause URCs) into the
 -- modem's NV on every dial. Stock only ever queries it, so put it back.
 send_at_unlocked('AT+QNETRC=0', 2)

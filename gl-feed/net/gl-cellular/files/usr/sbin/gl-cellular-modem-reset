@@ -49,10 +49,6 @@ logger -p daemon.err -t gl-cellular-wwan-watchdog \
 
 ifdown wwan >/dev/null 2>&1
 
-# The modem comes back freshly booted: the next dial releases its auto-activated
-# PDP context again (see qcm.sh).
-rm -f /var/run/gl-cellular-qcm-dialled
-
 echo 1 > "/sys/bus/pci/devices/$pci_dev/remove" 2>/dev/null
 sleep 2
 echo 1 > /sys/bus/pci/rescan 2>/dev/null
