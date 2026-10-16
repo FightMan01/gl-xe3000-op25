@@ -766,14 +766,10 @@ CFUN_LOCK=/var/run/gl-cellular-cfun.lock
 
 # gl-cellular-atd refuses every AT command except AT+CFUN while this file is
 # fresh (as stock's modem_AT does with /tmp/cfun_lock), so nothing else talks
-# to a modem that is mid power-cycle.
+# to a modem that is mid power-cycle. Held only around the CFUN=4 -> CFUN=1
+# sequence, never across the redial or hard reset that follows.
 do_cfun_cycle() {
-	local rc
-	date +%s > "$CFUN_LOCK"
 	_do_cfun_cycle
-	rc=$?
-	rm -f "$CFUN_LOCK"
-	return $rc
 }
 
 _do_cfun_cycle() {
@@ -787,6 +783,7 @@ _do_cfun_cycle() {
 	# CFUN=4 (flight mode), not 0: CFUN=0 powers the SIM down, so the card
 	# comes back PIN-locked, and stock's recovery never power-cycles the radio
 	# at all. 4 re-registers the radio and leaves the SIM alone.
+	date +%s > "$CFUN_LOCK"
 	at_query 'AT+CFUN=4' >/dev/null
 	sleep 5
 
@@ -803,6 +800,8 @@ _do_cfun_cycle() {
 		at_query 'AT+CFUN=1' >/dev/null
 		sleep 5
 	done
+
+	rm -f "$CFUN_LOCK"
 
 	if ! cfun_is_full; then
 		# The radio never came back. On a hung firmware the AT port is
@@ -953,9 +952,9 @@ relock_reconnect() {
 			ping_confirms "$device" && return 0
 		elif [ $(( $(date +%s) - start )) -ge 30 ] &&
 			[ "$(modem_attached)" = "1" ] &&
-			[ "$(ubus call network.interface.wwan status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]; then
-			# Attached, the QMI call is up, yet udhcpc has had no offer for
-			# 30s: the dead-data-plane signature of a firmware-side SIM/data
+			[ -r /var/run/gl-cellular-qmi-ipv4 ]; then
+			# Attached, the QMI call is up (quectel-CM publishes the address
+			# only once it is), yet udhcpc has had no offer for 30s: the dead-data-plane signature of a firmware-side SIM/data
 			# restart (2026-10-11 and 2026-10-16 field logs), where only the
 			# PCIe/MHI re-init helped. A modem that is still attaching (no
 			# CGATT, or the call not up) is given the full 90s instead.

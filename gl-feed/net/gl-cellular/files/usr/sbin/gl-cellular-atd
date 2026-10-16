@@ -111,8 +111,9 @@ local function probe_port(path)
 	handle:write('AT\r\n')
 	local deadline = os.time() + 3
 	while os.time() < deadline do
-		local line = handle:read('l', 1)
+		local line, err = handle:read('l', 1)
 		if line and line:match('^OK') then return handle end
+		if not line and err and err ~= 'timeout' then break end
 	end
 	handle:close()
 	return nil
@@ -149,7 +150,7 @@ local function nudge_watchdog(reason)
 	last_nudge = now
 	log.info('gl-cellular-atd: ' .. reason .. '; nudging the watchdog')
 	os.execute('touch /var/run/gl-cellular-svc-lost; ubus call service signal '
-		.. "'{\"name\":\"gl-cellular-boot-redial\",\"instance\":\"instance1\",\"signal\":10}'"
+		.. "'{\"name\":\"gl-cellular-boot-redial\",\"instance\":\"instance1\",\"signal\":12}'"
 		.. ' >/dev/null 2>&1')
 end
 
@@ -219,7 +220,7 @@ local function send_at_unlocked(cmd, timeout_s)
 			if line:match('^OK%s*$') or line:match('^ERROR') or line:match('^%+CME ERROR') then
 				break
 			end
-		elseif err and err ~= 'timeout' and err ~= 'eof' then
+		elseif err and err ~= 'timeout' then
 			read_err = true
 			break
 		end
@@ -242,7 +243,15 @@ end
 -- requests are handled by other coroutines.  Serialize the shared serial
 -- port so replies from two AT commands can never be interleaved.
 local function send_at(cmd, timeout_s)
-	while at_busy do time.sleep(0.05) end
+	-- The caller (ubus -t 5/8) gives up long before a long-running command in
+	-- front of this one finishes; running its request afterwards, with nobody
+	-- waiting, only piles up AT traffic. Drop it instead.
+	local queued = os.time()
+	local patience = math.max(timeout_s or 5, 5) + 5
+	while at_busy do
+		if os.time() - queued > patience then return nil, 'AT port busy' end
+		time.sleep(0.05)
+	end
 	at_busy = true
 	local ok, response, err = pcall(send_at_unlocked, cmd, timeout_s)
 	at_busy = false
@@ -1285,10 +1294,17 @@ reopen_port = function()
 end
 
 do
+	-- Right after boot or a PCIe reset the modem may not answer AT yet: keep
+	-- trying rather than exiting into procd's respawn limit.
 	local handle, path = choose_port()
-	if not handle then
-		log.err('gl-cellular-atd: no AT port answered (tried ' .. MHI_AT .. ', ' .. usb_dev .. ')')
-		os.exit(1)
+	local logged = false
+	while not handle do
+		if not logged then
+			log.err('gl-cellular-atd: no AT port answered yet (tried ' .. MHI_AT .. ', ' .. usb_dev .. '); retrying')
+			logged = true
+		end
+		time.sleep(5)
+		handle, path = choose_port()
 	end
 	f = handle
 	dev = path
@@ -1331,7 +1347,7 @@ local function urc_loop()
 			at_busy = true
 			pcall(function()
 				while true do
-					local line = f:read('l', 0.05)
+					local line = f:read('l', 0.3)
 					if not line then break end
 					handle_urc(line, nil)
 				end

@@ -5,7 +5,8 @@ STOP=90
 USE_PROCD=1
 
 start_service() {
-	[ -c "$(uci -q get gl-cellular.atport.dev)" ] || return 0
+	# Either AT channel will do: the PCIe one stock uses, or the USB port.
+	[ -c /dev/mhi_DUN ] || [ -c "$(uci -q get gl-cellular.atport.dev)" ] || return 0
 	procd_open_instance
 	procd_set_param command /usr/bin/eco /usr/sbin/gl-cellular-atd
 	procd_set_param respawn 3600 5 5

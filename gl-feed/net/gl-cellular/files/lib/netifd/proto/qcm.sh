@@ -48,37 +48,50 @@ _qcm_dns() {
 # Stock's qcm applies the QMI-assigned IPv4 address itself when DHCP on the
 # QMAP netdev gets no answer (udhcpc_start -> update_ip_address_by_qmi). Here
 # netifd owns IPv4, so do the equivalent through netifd: if the dhcp child is
-# still not up after 25s but the data call is, replace it with a static child
-# of the same name carrying the address quectel-CM published.
-_qcm_static_fallback() {
-	local iface="$1" zone="$2" t4="$3" waited=0 up info addr gw d1 d2
-	while [ "$waited" -lt 25 ]; do
-		sleep 5
-		waited=$((waited + 5))
-		pidof quectel-CM >/dev/null || return 0
-		up="$(ubus call "network.interface.${iface}_4" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
-		[ "$up" = "true" ] && return 0
-	done
-	[ -r /var/run/gl-cellular-qmi-ipv4 ] || return 0
+# still not up 25s after the call, replace it with a static child of the same
+# name carrying the address quectel-CM published, and re-apply when quectel-CM
+# redials and publishes a different one. Runs until quectel-CM exits; teardown
+# kills it so it can never act on a later session.
+_qcm_apply_static() {
+	local iface="$1" zone="$2" t4="$3" peerdns="$4" addr gw d1 d2
 	read -r addr gw d1 d2 < /var/run/gl-cellular-qmi-ipv4
-	[ -n "$addr" ] && [ -n "$gw" ] || return 0
+	[ -n "$addr" ] && [ -n "$gw" ] || return 1
 	logger -p daemon.warn -t gl-cellular \
-		"no DHCP answer on ${iface}_4 after ${waited}s; applying the QMI address $addr via $gw"
+		"applying the QMI address $addr via $gw on ${iface}_4"
 	json_init
 	json_add_string name "${iface}_4"
 	json_add_string ifname "@$iface"
 	json_add_string proto "static"
 	json_add_array ipaddr; json_add_string "" "$addr"; json_close_array
 	json_add_string gateway "$gw"
-	json_add_array dns
-	[ -n "$d1" ] && [ "$d1" != "0.0.0.0" ] && json_add_string "" "$d1"
-	[ -n "$d2" ] && [ "$d2" != "0.0.0.0" ] && [ "$d2" != "$d1" ] && json_add_string "" "$d2"
-	json_close_array
+	[ "$peerdns" = 0 ] || {
+		json_add_array dns
+		[ -n "$d1" ] && [ "$d1" != "0.0.0.0" ] && json_add_string "" "$d1"
+		[ -n "$d2" ] && [ "$d2" != "0.0.0.0" ] && [ "$d2" != "$d1" ] && json_add_string "" "$d2"
+		json_close_array
+	}
 	proto_add_dynamic_defaults
 	[ -n "$zone" ] && json_add_string zone "$zone"
 	[ -n "$t4" ] && json_add_string ip4table "$t4"
 	json_close_object
 	ubus call network add_dynamic "$(json_dump)"
+}
+
+_qcm_static_fallback() {
+	local iface="$1" waited=0 up applied="" cur
+	while pidof quectel-CM >/dev/null; do
+		sleep 5
+		if [ -z "$applied" ]; then
+			up="$(ubus call "network.interface.${iface}_4" status 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)"
+			[ "$up" = "true" ] && return 0
+			waited=$((waited + 5))
+			[ "$waited" -ge 25 ] || continue
+		fi
+		[ -r /var/run/gl-cellular-qmi-ipv4 ] || continue
+		cur="$(cat /var/run/gl-cellular-qmi-ipv4)"
+		[ "$cur" = "$applied" ] && continue
+		_qcm_apply_static "$@" && applied="$cur"
+	done
 }
 
 proto_qcm_setup() {
@@ -368,24 +381,28 @@ local pdp="-4 -6"
 	fi
 	rm -f "$nosvc"
 
-	# Like stock's qcm.sh, only hand the APN to quectel-CM when it has to
-	# change something: credentials are set, or the modem's profile 1 does not
-	# already hold this APN. With -s quectel-CM rewrites profile 1 on any
-	# difference and puts an APN TLV into StartNetwork, which asks the network
-	# for a second PDN on the APN the modem attached with. Without it the call
-	# is bound to the existing profile.
-	local qcm_apn_args=""
+	# Like stock's qcm.sh the APN only goes to quectel-CM when it has to change
+	# something: credentials are set, or the modem's profile 1 holds another
+	# APN or PDP type. With -s quectel-CM rewrites profile 1 and puts an APN TLV
+	# into StartNetwork; without it the call binds to the existing profile.
+	# Arguments are built as a real argument vector: an empty password must stay
+	# an empty argument, and nothing may be word-split or globbed.
+	local want_type="IPV4V6"
+	case "$pdp" in -4) want_type="IP" ;; -6) want_type="IPV6" ;; esac
+	set -- -i "$ifname" $pdp -n 1
 	if [ -n "$apn" ]; then
-		local cur_apn
-		cur_apn="$(_qcm_at 'AT+CGDCONT?' | tr -d '\r' | sed -n 's/^+CGDCONT: *1,"[^"]*","\([^"]*\)".*/\1/p' | head -n1)"
-		if [ -n "$username" ] || [ "$cur_apn" != "$apn" ]; then
-			qcm_apn_args="-s $apn"
-			[ -n "$username" ] && qcm_apn_args="$qcm_apn_args $username $password $auth"
+		local cur_line cur_type cur_apn
+		cur_line="$(_qcm_at 'AT+CGDCONT?' | tr -d '\r' | grep '^+CGDCONT: *1,' | head -n1)"
+		cur_type="$(echo "$cur_line" | cut -d'"' -f2)"
+		cur_apn="$(echo "$cur_line" | cut -d'"' -f4)"
+		if [ -n "$username" ] || [ "$cur_apn" != "$apn" ] || [ "$cur_type" != "$want_type" ]; then
+			set -- "$@" -s "$apn"
+			[ -n "$username" ] && set -- "$@" "$username" "$password" ${auth:+"$auth"}
 		fi
 	fi
+	rm -f /var/run/gl-cellular-qmi-ipv4
 
-	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM \
-		-i "$ifname" $pdp -n 1 $qcm_apn_args
+	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM "$@"
 
 	proto_init_update "$qmapnet" 1
 	# As stock does: keep the interface when only the proto handler restarts.
@@ -427,7 +444,8 @@ local pdp="-4 -6"
 		json_close_object
 		ubus call network add_dynamic "$(json_dump)"
 
-		( _qcm_static_fallback "$interface" "$zone" "$ip4table" ) &
+		( _qcm_static_fallback "$interface" "$zone" "$ip4table" "$peerdns" ) &
+		echo $! > "/var/run/gl-cellular-static-fallback.$interface.pid"
 	}
 
 	[ "$pdp" != "-4" ] && {
@@ -480,6 +498,10 @@ proto_qcm_teardown() {
 	ifname="${ifname:-rmnet_mhi0}"
 
 	proto_kill_command "$interface"
+	# A pending static-IPv4 fallback must not outlive its session.
+	[ -r "/var/run/gl-cellular-static-fallback.$interface.pid" ] &&
+		kill "$(cat "/var/run/gl-cellular-static-fallback.$interface.pid")" 2>/dev/null
+	rm -f "/var/run/gl-cellular-static-fallback.$interface.pid" /var/run/gl-cellular-qmi-ipv4
 	# Stock also drops the QMAP carrier on teardown, and it matters for the
 	# same reason it is raised on setup: rmnet_mhi0.1's carrier is derived
 	# from rmnet_mhi0's, so leaving it set across a teardown reports a live
