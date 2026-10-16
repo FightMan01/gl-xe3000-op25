@@ -12,6 +12,9 @@ case "$ACTION" in
 esac
 
 for svc in gl-wan-health gl-internet-led; do
+	# gl-internet-led is deliberately not running while gl-wan-health drives the
+	# LED; signalling a service with no instance only makes procd log an error.
+	ubus call service list "{\"name\":\"$svc\"}" 2>/dev/null | grep -q '"running": true' || continue
 	ubus call service signal \
 		"{\"name\":\"$svc\",\"instance\":\"instance1\",\"signal\":10}" \
 		>/dev/null 2>&1
