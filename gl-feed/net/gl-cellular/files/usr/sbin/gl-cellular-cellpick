@@ -1,0 +1,161 @@
+#!/bin/sh
+# 5G-first LTE cell picker, opt-in: gl-cellular.cellpick.enabled=1.
+#
+# The strongest LTE cell is often the one everybody nearby is attached to
+# (a full train, a stadium), so it is not always the fastest. While 5G is
+# attached this script does nothing. When 5G has been missing for a while and
+# the link is poor, it measures the current LTE cell, then each strongest
+# neighbour (a short locked download test), and keeps the fastest one for
+# `hold_sec`. LTE locks leave NR5G enabled, so a 5G cell is still picked up
+# while a lock is held; if 5G disappears again the lock is released.
+#
+# NSA only adds the 5G carrier once there is traffic, so an idle link looks
+# like "no 5G". Every decision is therefore taken under load: the baseline
+# download runs first and 5G is checked while it is running.
+#
+# UCI gl-cellular.cellpick: enabled, nr_grace_sec (20), hold_sec (300),
+# cooldown_sec (600), max_cells (3), min_gain_pct (30), good_mbit (100),
+# probe_url, probe_sec (6).
+
+CFG=gl-cellular.cellpick
+LOCK=/var/run/gl-cellpick.lock
+NR_ABSENT_SINCE=0
+LOCK_SINCE=0
+LAST_EVAL=0
+
+opt() { uci -q get "$CFG.$1" || echo "$2"; }
+log() { logger -t gl-cellpick "$*"; }
+now() { cut -d. -f1 /proc/uptime; }
+
+at() {
+	local c
+	c=$(printf '%s' "$1" | sed 's/"/\\"/g')
+	ubus -t 15 call cellular.at command "{\"cmd\":\"$c\",\"timeout\":${2:-10}}" 2>/dev/null |
+		jsonfilter -e '@.response' 2>/dev/null
+}
+
+wan_dev() { ifstatus wwan_4 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null; }
+
+# A user-set tower or operator lock always wins.
+user_locked() {
+	[ -n "$(uci -q get gl-cellular.tower_slot1)" ] && return 0
+	[ "$(uci -q get gl-cellular.state.operator_mode)" = "1" ] && return 0
+	return 1
+}
+
+has_nr() { at 'AT+QENG="servingcell"' | grep -q 'NR5G'; }
+
+# "<pci> <earfcn>" of the serving LTE cell
+serving_lte() {
+	at 'AT+QENG="servingcell"' | tr -d '"' | awk -F, '/LTE/ {
+		for (i = 1; i <= NF; i++) if ($i == "LTE") { print $(i+5), $(i+6); exit } }'
+}
+
+# "<earfcn> <pci> <rsrp>" for each LTE neighbour, strongest first
+neighbours() {
+	at 'AT+QENG="neighbourcell"' | tr -d '"' |
+		awk -F, '/neighbourcell/ && $2 == "LTE" { print $3, $4, $6 }' | sort -k3,3nr
+}
+
+# bytes/s of a time-boxed download on the cellular interface
+probe() {
+	local dev
+	dev=$(wan_dev); [ -n "$dev" ] || { echo 0; return; }
+	curl -s -o /dev/null --interface "$dev" -m "$(opt probe_sec 6)" \
+		-w '%{speed_download}' "$(opt probe_url 'https://speed.cloudflare.com/__down?bytes=40000000')" \
+		2>/dev/null | cut -d. -f1
+}
+
+lock_lte() {
+	uci -q set $CFG.owned=1; uci commit gl-cellular
+	at "AT+QNWLOCK=\"common/4g\",1,$1,$2" >/dev/null
+	/usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1
+	# wait for the data path to come back
+	local i=0
+	while [ $i -lt 30 ]; do
+		sleep 2; i=$((i + 1))
+		[ -n "$(wan_dev)" ] && ping -I "$(wan_dev)" -c1 -W 2 1.1.1.1 >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+unlock() {
+	at 'AT+QNWLOCK="common/4g",0' >/dev/null
+	uci -q set $CFG.owned=0; uci commit gl-cellular
+	LOCK_SINCE=0
+	[ "$1" = noreconnect ] || /usr/sbin/gl-cellular-wwan-reconnect >/dev/null 2>&1
+}
+
+evaluate() {
+	local cur base best_speed best_cell n speed e p r max min_gain
+	max=$(opt max_cells 3); min_gain=$(opt min_gain_pct 30)
+	cur=$(serving_lte)
+	# Load the link, and look for 5G while it is loaded.
+	probe > /tmp/cellpick.base &
+	sleep 3
+	if has_nr; then
+		log "5G is up under load, nothing to do"
+		wait; LAST_EVAL=$(now); return
+	fi
+	wait
+	base=$(cat /tmp/cellpick.base)
+	if [ "${base:-0}" -ge $(( $(opt good_mbit 100) * 125000 )) ]; then
+		log "current cell is fast enough ($((base / 125000)) Mbit/s)"
+		LAST_EVAL=$(now); return
+	fi
+	best_speed=$base; best_cell=""
+	log "evaluating: serving $cur, baseline $((base / 125000)) Mbit/s"
+	n=0
+	neighbours | while read -r e p r; do
+		echo "$e $p $r"
+	done > /tmp/cellpick.cands
+	while read -r e p r; do
+		[ "$e $p" = "$cur" ] && continue
+		[ "$n" -ge "$max" ] && break
+		n=$((n + 1))
+		has_nr && { log "5G appeared, abort"; unlock; return; }
+		lock_lte "$e" "$p" || { log "cell $e/$p: no data path"; continue; }
+		speed=$(probe)
+		log "cell earfcn $e pci $p rsrp $r: $((speed / 125000)) Mbit/s"
+		if [ "${speed:-0}" -gt "$best_speed" ]; then best_speed=$speed; best_cell="$e $p"; fi
+	done < /tmp/cellpick.cands
+	if [ -n "$best_cell" ] && [ "$best_speed" -ge $((base * (100 + min_gain) / 100)) ]; then
+		set -- $best_cell
+		log "keeping earfcn $1 pci $2 ($((best_speed / 125000)) Mbit/s)"
+		lock_lte "$1" "$2"
+		LOCK_SINCE=$(now)
+	else
+		log "no better cell, back to automatic"
+		unlock
+	fi
+	LAST_EVAL=$(now)
+}
+
+# Make the modem report 5G neighbours too (off by default on the RM520N).
+at 'AT+QNWCFG="nr5g_meas_info",1' >/dev/null
+
+# A lock left over from before a crash/reboot is ours to clear.
+[ "$(uci -q get $CFG.owned)" = "1" ] && unlock noreconnect
+
+while :; do
+	sleep 10
+	[ "$(opt enabled 0)" = "1" ] || { [ "$LOCK_SINCE" != 0 ] && unlock; continue; }
+	user_locked && continue
+	t=$(now)
+	if has_nr; then
+		NR_ABSENT_SINCE=0
+		[ "$LOCK_SINCE" != 0 ] && [ $((t - LOCK_SINCE)) -ge "$(opt hold_sec 300)" ] && { log "hold expired"; unlock; }
+		continue
+	fi
+	[ "$NR_ABSENT_SINCE" = 0 ] && NR_ABSENT_SINCE=$t
+	[ $((t - NR_ABSENT_SINCE)) -lt "$(opt nr_grace_sec 20)" ] && continue
+	if [ "$LOCK_SINCE" != 0 ]; then
+		# holding a cell: release when hold is over so 5G/neighbours get re-scanned
+		[ $((t - LOCK_SINCE)) -ge "$(opt hold_sec 300)" ] && { log "hold expired"; unlock; }
+		continue
+	fi
+	[ $((t - LAST_EVAL)) -lt "$(opt cooldown_sec 600)" ] && [ "$LAST_EVAL" != 0 ] && continue
+	exec 8>"$LOCK"; flock -n 8 || continue
+	evaluate
+	flock -u 8
+done

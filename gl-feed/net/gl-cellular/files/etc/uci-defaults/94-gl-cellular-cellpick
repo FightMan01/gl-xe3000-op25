@@ -1,0 +1,12 @@
+#!/bin/sh
+# Seed the 5G-first LTE cell picker (see /usr/sbin/gl-cellular-cellpick).
+# Off by default; an existing section is left alone.
+
+[ -n "$(uci -q get gl-cellular.cellpick)" ] && exit 0
+
+uci -q batch <<-EOT
+	set gl-cellular.cellpick=cellpick
+	set gl-cellular.cellpick.enabled='0'
+	commit gl-cellular
+EOT
+exit 0
