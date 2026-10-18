@@ -1925,8 +1925,14 @@ static int requestSetupDataCall(PROFILE_T *profile, int curIpFamily) {
 
             dbg_time("call_end_reason_type is %d", call_end_reason_type);
             dbg_time("call_end_reason_verbose is %d", verbose_call_end_reason);
-            if (call_end_reason_type == 6 && verbose_call_end_reason == 55)
-                g_pdn_conflict = 1;
+            /* 6/55: ESM cause 55, the network already has a PDN for this APN.
+             * 2/209, 2/211: QMI_WDS_VERBOSE_CALL_END_REASON_INTERNAL_PDN_IPV4/
+             * IPV6_CALL_THROTTLED, the modem's back-off after earlier refusals.
+             * It refuses every attempt until the timer runs out or the modem
+             * detaches, so the caller recovers it the same way. */
+            if ((call_end_reason_type == 6 && verbose_call_end_reason == 55)
+                    || (call_end_reason_type == 2 && (verbose_call_end_reason == 209 || verbose_call_end_reason == 211)))
+                g_pdn_conflict = verbose_call_end_reason;
         }
 
         err = le16_to_cpu(pMUXMsg->QMUXMsgHdrResp.QMUXError);

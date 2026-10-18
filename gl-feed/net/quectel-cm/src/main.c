@@ -411,6 +411,7 @@ static int qmi_main(PROFILE_T *profile)
     unsigned long PsAttachTime = clock_msec();
 #endif
     int qmierr = 0;
+    int pdn_conflict = 0, pdn_conflict_v4 = 0;
     const struct request_ops *request_ops = profile ->request_ops;
     pthread_t gQmiThreadID = 0;
 #ifdef USE_IPC_MSG_STATUS_IND
@@ -514,13 +515,26 @@ if(profile->usb_dev.idProduct != 0x0316)
         request_ops->requestGetProfile(profile);
 
     if (request_ops->requestSetProfile && (profile->apn || profile->user || profile->pd)) {
-        if (request_ops->requestSetProfile(profile) == 1) {
-#ifdef REBOOT_SIM_CARD_WHEN_APN_CHANGE //enable at only when customer asked 
+        int set = request_ops->requestSetProfile(profile);
+
+        if (set == 1) {
+#ifdef REBOOT_SIM_CARD_WHEN_APN_CHANGE //enable at only when customer asked
             if (request_ops->requestRadioPower) {
                 request_ops->requestRadioPower(0);
                 request_ops->requestRadioPower(1);
             }
 #endif
+        }
+
+        /* QCM_DIAL_BY_PROFILE: once the profile holds the APN, dial by profile
+         * index alone, as GL's stock qcm does when no credentials are set. An
+         * APN TLV in StartNetwork makes the modem open a PDN per IP family
+         * instead of sharing one dual-stack PDN, and the network refuses the
+         * second one for the same APN with ESM cause 55. */
+        if ((set == 0 || set == 1) && profile->profile_index && profile->apn
+                && !(profile->user && profile->user[0]) && getenv("QCM_DIAL_BY_PROFILE")) {
+            dbg_time("profile %d holds APN %s, dialling by profile", profile->profile_index, profile->apn);
+            profile->apn = NULL;
         }
     }
 }
@@ -599,6 +613,7 @@ if(profile->usb_dev.idProduct != 0x0316)
                             main_send_status_to_fifo(QCM_PREPARE_START_DAIL);
 #endif
 
+                            pdn_conflict_v4 = 0;
                             if (profile->enable_ipv4 && IPv4ConnectionStatus !=  QWDS_PKT_DATA_CONNECTED) {
                                 qmierr = request_ops->requestSetupDataCall(profile, IpFamilyV4);
 
@@ -625,6 +640,9 @@ if(profile->usb_dev.idProduct != 0x0316)
                                     qmierr = request_ops->requestSetupDataCall(profile, IpFamilyV4);
                                     profile->apn = apn;
                                 }
+
+                                if (qmierr)
+                                    pdn_conflict_v4 = g_pdn_conflict;
 
                                 if (!qmierr) {
                                     qmierr = request_ops->requestGetIPAddress(profile, IpFamilyV4);
@@ -659,17 +677,28 @@ if(profile->usb_dev.idProduct != 0x0316)
                                 }
                             }
                                 
-                            if (g_pdn_conflict && getenv("QCM_EXIT_ON_PDN_CONFLICT")
-                                    && ((profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)
-                                    || (profile->enable_ipv6 && IPv6ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED))) {
-                                /* ESM cause 55: a PDN for this APN still exists on the modem.
-                                 * Retrying here can never succeed, so exit and let the caller
-                                 * release the stale context before dialling again. */
+                            /* The family that decides the session is IPv4 when it is enabled:
+                             * an IPv6 refusal alone must not take a working IPv4 call down, it
+                             * just retries on the normal back-off ladder below. */
+                            if (profile->enable_ipv4)
+                                pdn_conflict = pdn_conflict_v4;
+                            else
+                                pdn_conflict = g_pdn_conflict;
+
+                            if (pdn_conflict && getenv("QCM_EXIT_ON_PDN_CONFLICT")
+                                    && (profile->enable_ipv4 ? IPv4ConnectionStatus : IPv6ConnectionStatus) == QWDS_PKT_DATA_DISCONNECTED) {
+                                /* A PDN for this APN still exists on the modem (ESM cause 55) or
+                                 * the modem refuses the call outright (209/211). Retrying here
+                                 * can never succeed, so exit and let the caller release the
+                                 * stale context before dialling again. */
                                 dbg_time("PDN for this APN already active, exiting so it can be released");
                                 {
                                     /* tell qcm.sh to release the stale context on the next dial */
                                     FILE *cf = fopen("/var/run/gl-cellular-pdn-conflict", "w");
-                                    if (cf) fclose(cf);
+                                    if (cf) {
+                                        fprintf(cf, "%d\n", pdn_conflict);
+                                        fclose(cf);
+                                    }
                                 }
                                 usbnet_link_change(0, profile);
 #ifdef USE_IPC_MSG_STATUS_IND

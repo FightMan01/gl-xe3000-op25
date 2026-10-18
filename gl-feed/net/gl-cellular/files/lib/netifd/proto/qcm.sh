@@ -224,7 +224,7 @@ _qcm_at_ip_type() {
 
 # _qcm_deactivate_pdp <apn> <lower-cased pdptype>
 _qcm_deactivate_pdp() {
-	local want_apn="$1" want_type cids cid active
+	local want_apn="$1" want_type cids cid active failed=0
 	want_type="$(_qcm_at_ip_type "$2")"
 	active="$(_qcm_at 'AT+CGACT?')"
 	[ -n "$active" ] || return 0
@@ -248,6 +248,7 @@ _qcm_deactivate_pdp() {
 				[ "$try" -ge 3 ] && {
 					logger -p daemon.err -t gl-cellular \
 						"could not deactivate modem PDP context CID $cid"
+					failed=1
 					break
 				}
 				sleep 3
@@ -260,7 +261,7 @@ _qcm_deactivate_pdp() {
 	# programmed into a context) still leaves the boot-time auto-activation
 	# that this whole dance started for: fall back to CID 1 alone, which
 	# is what the previous version of this always did.
-	[ -n "$cids" ] && return 0
+	[ -n "$cids" ] && return "$failed"
 	case "$active" in
 	*'+CGACT: 1,1'*)
 		logger -t gl-cellular \
@@ -269,8 +270,6 @@ _qcm_deactivate_pdp() {
 		*OK*) sleep 1 ;;
 		*) logger -p daemon.err -t gl-cellular \
 			"could not deactivate modem PDP context CID 1"
-		   proto_notify_error "$interface" MODEM_PDP
-		   proto_block_restart "$interface"
 		   return 1 ;;
 		esac
 		;;
@@ -278,14 +277,59 @@ _qcm_deactivate_pdp() {
 	return 0
 }
 
+# AT+CGACT=0 answers a plain ERROR when the context is the last PDN on the
+# attach (LTE will not drop its only default bearer). A detach/attach is the
+# one thing that clears it, and the 209/211 throttling with it.
+_qcm_reattach() {
+	local n=0
+	logger -p daemon.warn -t gl-cellular "detaching and re-attaching to clear the stale PDN"
+	_qcm_at 'AT+CGATT=0' >/dev/null
+	sleep 3
+	_qcm_at 'AT+CGATT=1' >/dev/null
+	while [ "$n" -lt 30 ]; do
+		case "$(_qcm_at 'AT+CGATT?')" in
+		*'+CGATT: 1'*) return 0 ;;
+		esac
+		n=$((n + 2))
+		sleep 2
+	done
+	logger -p daemon.err -t gl-cellular "not re-attached ${n}s after AT+CGATT=1"
+	return 1
+}
+
 # Stock never releases the modem's PDP context before dialling, so neither do
-# we on an ordinary dial. The one exception is quectel-CM leaving its ESM-55
-# marker (a PDN for the APN already exists and the dial can never succeed):
-# release it once and redial.
+# we on an ordinary dial. The exception is quectel-CM leaving its marker: the
+# call was refused for a PDN that already exists (ESM cause 55) or that the
+# modem holds as stale (209/211), and redialling as-is can never succeed.
+# First release the context; if that fails, or the refusal comes straight back,
+# detach and re-attach. A streak of refusals backs off instead of spinning; it
+# ends with the first quectel-CM exit that left no marker, or after 5 minutes
+# without a refusal (the dial that recovered may simply have held that long).
 local qcm_conflict=/var/run/gl-cellular-pdn-conflict
+local qcm_streak=/var/run/gl-cellular-pdn-streak
 if [ -e "$qcm_conflict" ]; then
+	local reason streak
+	reason="$(cat "$qcm_conflict" 2>/dev/null)"
 	rm -f "$qcm_conflict"
-	_qcm_deactivate_pdp "$apn" "$pdptype" || return 1
+	streak=0
+	[ -e "$qcm_streak" ] && [ $(($(date +%s) - $(date -r "$qcm_streak" +%s))) -lt 300 ] &&
+		streak="$(cat "$qcm_streak" 2>/dev/null)"
+	streak=$((${streak:-0} + 1))
+	echo "$streak" > "$qcm_streak"
+	logger -t gl-cellular "data call refused (${reason:-55}), recovery attempt $streak"
+	[ "$streak" -gt 4 ] && sleep $((streak > 10 ? 60 : streak * 6))
+	# The re-attach brings our APN straight back up as the attach bearer,
+	# which a fresh QMI call cannot bind to either (it earns cause 55 once
+	# more), so release that one too, on a best-effort basis.
+	# 209/211 are the modem's own throttling of the PDN request after
+	# earlier refusals: releasing the context does nothing for those,
+	# only a detach clears the back-off timer.
+	if [ "$reason" = 209 ] || [ "$reason" = 211 ] || [ $((streak % 2)) = 0 ] ||
+		! _qcm_deactivate_pdp "$apn" "$pdptype"; then
+		_qcm_reattach && _qcm_deactivate_pdp "$apn" "$pdptype"
+	fi
+else
+	rm -f "$qcm_streak"
 fi
 
 # QMI over PCIe requires the modem's PCIe personality, not its MBIM
@@ -363,6 +407,9 @@ local pdp="-4 -6"
 
 	local waited=0 attach nosvc=/var/run/gl-cellular-qcm-nosvc
 	attach="$(_qcm_at 'AT+CGATT?' | grep '^+CGATT:' | grep -oE '[0-9]+' | head -n1)"
+	# A setup killed between _qcm_reattach's CGATT=0 and CGATT=1 would leave
+	# the modem detached for good; asking for attach again is harmless.
+	[ "$attach" = "0" ] && _qcm_at 'AT+CGATT=1' >/dev/null
 	while [ "$waited" -lt 15 ] && [ "$attach" != "1" ]; do
 		sleep 3
 		waited=$((waited + 3))
@@ -402,7 +449,7 @@ local pdp="-4 -6"
 	fi
 	rm -f /var/run/gl-cellular-qmi-ipv4
 
-	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 /usr/sbin/quectel-CM "$@"
+	proto_run_command "$interface" env QCM_NO_DHCP4=1 QCM_EXIT_ON_PDN_CONFLICT=1 QCM_DIAL_BY_PROFILE=1 /usr/sbin/quectel-CM "$@"
 
 	proto_init_update "$qmapnet" 1
 	# As stock does: keep the interface when only the proto handler restarts.
