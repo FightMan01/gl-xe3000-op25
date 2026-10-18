@@ -1054,7 +1054,10 @@ void requestUIMCardStatusEvent(UCHAR cid) {
         dbg_time("%s could not compose the request", __func__);
         return;
     }
-    if (QmiThreadSendQMI(pRequest, &pResponse) == 0 && pResponse != NULL) {
+    /* Short timeout on purpose: the generic 30s is fine for a request the modem is
+     * expected to answer, but this one is only worth having, so it must not be able
+     * to stall a dial if the firmware simply ignores it. */
+    if (QmiThreadSendQMITimeout(pRequest, &pResponse, 3 * 1000, __func__) == 0 && pResponse != NULL) {
         result = le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.QMUXResult);
         error  = le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.QMUXError);
     }
