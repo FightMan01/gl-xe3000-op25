@@ -1,25 +1,7 @@
 #!/bin/sh
-# Make sure the SIM is unlocked before the modem is dialled.
-#
-# The stock firmware never starts its connection manager until the SIM
-# reports READY (cellular_manager waits for the CPIN READY URC and unlocks the
-# PIN itself first). Starting quectel-CM while the SIM is still PIN-locked
-# races the modem's SIM initialisation: the QMAP data-format request is
-# refused (QMUX error 0x46, INVALID_OPERATION) and every data call after it
-# fails too, until the modem is power-cycled with the SIM unlocked first.
-#
-# The saved PIN is only ever sent when
-#   - the SIM really is in "SIM PIN" state,
-#   - it was saved for this very SIM (ICCID), so a swapped card can't burn
-#     attempts on the wrong PIN,
-#   - more than one attempt is left (AT+QPINC?), and
-#   - an earlier attempt with it did not already fail.
-#
-# Exit status: 0 SIM ready
-#              1 PIN required but none saved / saved for another SIM
-#              2 saved PIN refused or too few attempts left
-#              3 SIM absent or PUK-locked
-#              4 modem AT interface unavailable
+# qcm and the watchdog share this gate before starting a data call.
+# Exit: 0 ready, 1 missing/mismatched PIN binding, 2 unsafe PIN retry,
+# 3 absent/PUK SIM, 4 unavailable AT, 5 unlock busy or outcome unknown.
 
 TAG=gl-cellular-sim
 . /usr/share/libubox/jshn.sh
@@ -44,17 +26,22 @@ cpin_state() {
 	esac
 }
 
-# qcm.sh and the wwan watchdog both run this; one PIN entry at a time. The
-# second caller then finds the SIM READY. BusyBox flock has no -w.
-exec 8>/var/run/gl-cellular-sim-unlock.lock
+# pin_pending holds the SIM's PIN attempt counter from just before our last
+# AT+CPIN=, until READY confirms it.
+clear_pending() {
+	[ -n "$(uci -q get network.wwan.pin_pending)" ] || return 0
+	uci -q delete network.wwan.pin_pending && uci -q commit network
+}
+
+exec 8>/var/run/gl-cellular-sim-unlock.lock || exit 5
 i=0
 until flock -n 8; do
 	i=$((i + 1))
-	[ "$i" -ge 40 ] && break
+	[ "$i" -ge 40 ] && exit 5
 	sleep 1
 done
 
-# The AT daemon starts after network; wait for it and for the modem.
+# AT starts after netifd at boot.
 state=NOAT
 i=0
 while [ "$i" -lt 60 ]; do
@@ -65,62 +52,86 @@ while [ "$i" -lt 60 ]; do
 done
 
 case "$state" in
-	READY) exit 0 ;;
+	READY) clear_pending || exit 5; exit 0 ;;
 	PUK) logger -p daemon.err -t "$TAG" "SIM is PUK-locked"; exit 3 ;;
 	NOAT) logger -p daemon.err -t "$TAG" "modem AT interface unavailable"; exit 4 ;;
 	OTHER) logger -p daemon.err -t "$TAG" "SIM absent or not ready"; exit 3 ;;
 esac
 
-# --- SIM PIN state ---
 pin=$(uci -q get network.wwan.pincode)
 saved_iccid=$(uci -q get network.wwan.pin_iccid)
-cur_iccid=$(at 'AT+QCCID' 4 | sed -n 's/.*+QCCID:[[:space:]]*\([0-9A-Za-z]*\).*/\1/p' | head -n1)
-
-if [ -z "$pin" ]; then
-	logger -t "$TAG" "SIM is PIN-locked and no PIN is saved; waiting for it to be entered in the UI"
-	exit 1
-fi
-if [ -n "$saved_iccid" ] && [ -n "$cur_iccid" ] && [ "$saved_iccid" != "$cur_iccid" ]; then
-	logger -p daemon.warn -t "$TAG" "saved PIN belongs to a different SIM; not using it"
-	exit 1
-fi
-if [ "$(uci -q get network.wwan.pin_failed)" = "1" ]; then
-	logger -p daemon.warn -t "$TAG" "saved PIN was rejected before; not retrying (enter the PIN in the UI)"
+case "$pin" in
+	""|*[!0-9]*) exit 1 ;;
+esac
+[ "${#pin}" -ge 4 ] && [ "${#pin}" -le 8 ] || exit 1
+if [ "$(uci -q get network.wwan.pin_failed)" = 1 ]; then
+	logger -p daemon.warn -t "$TAG" "saved PIN was rejected before; waiting for PIN entry in the UI"
 	exit 2
 fi
 
-left=$(at 'AT+QPINC?' 4 | sed -n 's/.*+QPINC: "SC",\([0-9]*\).*/\1/p' | head -n1)
-if [ -n "$left" ] && [ "$left" -le 1 ]; then
-	logger -p daemon.err -t "$TAG" "only $left PIN attempt(s) left; refusing to auto-enter the saved PIN"
-	exit 2
+cur_iccid=$(at 'AT+QCCID' 4 | tr -d '\r' | sed -n 's/^+QCCID:[[:space:]]*\([0-9A-Za-z]*\)[[:space:]]*$/\1/p' | head -n1)
+[ -n "$cur_iccid" ] || exit 4
+if [ -z "$saved_iccid" ] || [ "$saved_iccid" != "$cur_iccid" ]; then
+	logger -p daemon.warn -t "$TAG" "no saved PIN binding for the current SIM; waiting for PIN entry in the UI"
+	exit 1
 fi
 
-logger -t "$TAG" "SIM is PIN-locked; entering the saved PIN"
-resp=$(at "AT+CPIN=\"$pin\"" 10)
-case "$resp" in
-	*OK*) ;;
-	*)
-		logger -p daemon.err -t "$TAG" "saved PIN was rejected by the SIM"
-		uci -q set network.wwan.pin_failed=1
-		uci -q commit network
-		exit 2
-		;;
+left=$(at 'AT+QPINC?' 4 | tr -d '\r' | sed -n 's/^+QPINC:[[:space:]]*"SC",\([0-9][0-9]*\),[0-9][0-9]*[[:space:]]*$/\1/p' | head -n1)
+case "$left" in
+	"") logger -p daemon.warn -t "$TAG" "PIN attempt counter unavailable"; exit 4 ;;
+	0|1) logger -p daemon.err -t "$TAG" "too few PIN attempts left; refusing automatic PIN entry"; exit 2 ;;
+	2|3) ;;
+	*) logger -p daemon.warn -t "$TAG" "invalid PIN attempt counter"; exit 4 ;;
 esac
 
+# An earlier submission never confirmed READY (its reply can be lost while
+# the modem resets the card). The counter tells what happened: lower means
+# the SIM refused that PIN; unchanged means it never reached the card, or it
+# was accepted and the card has been reset since. Never block on it for good,
+# or a re-lock in a tunnel leaves the router offline until the UI is used.
+pending=$(uci -q get network.wwan.pin_pending)
+if [ -n "$pending" ]; then
+	case "$pending" in *[!0-9]*) pending=0 ;; esac
+	if [ "$left" -lt "$pending" ]; then
+		uci -q set network.wwan.pin_failed=1
+		uci -q delete network.wwan.pin_pending
+		uci -q commit network
+		logger -p daemon.err -t "$TAG" "an earlier PIN submission was rejected (attempts $pending -> $left); waiting for PIN entry in the UI"
+		exit 2
+	fi
+	logger -t "$TAG" "earlier PIN submission unconfirmed but no attempt was used ($left left); entering it again"
+fi
+
+# Recheck user intent after the AT queries and lock wait.
+[ "$(uci -q get network.wwan.auto)" != 0 ] || exit 5
+[ "$(uci -q get network.wwan.disabled)" != 1 ] || exit 5
+[ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] || exit 5
+[ "$(uci -q get gl-cellular.state.scan_in_progress)" != 1 ] || exit 5
+
+# Persist before submission: a killed caller must not leave another free retry.
+uci -q set network.wwan.pin_pending="$left" && uci -q commit network || exit 5
+logger -t "$TAG" "SIM is PIN-locked; entering the saved PIN"
+resp=$(at "AT+CPIN=\"$pin\"" 10 | tr -d '\r')
+if printf '%s\n' "$resp" | grep -qE '^\+CME ERROR:[[:space:]]*(16|incorrect password)[[:space:]]*$'; then
+	uci -q set network.wwan.pin_failed=1
+	uci -q commit network
+	logger -p daemon.err -t "$TAG" "saved PIN was rejected by the SIM"
+	exit 2
+fi
+
+# READY reconciles a lost final reply without resubmitting the PIN.
 i=0
 while [ "$i" -lt 20 ]; do
-	[ "$(cpin_state)" = READY ] && break
+	state=$(cpin_state)
+	if [ "$state" = READY ]; then
+		clear_pending || exit 5
+		sleep 4
+		logger -t "$TAG" "SIM unlocked"
+		exit 0
+	fi
+	[ "$state" = PUK ] && exit 3
 	i=$((i + 1))
 	sleep 1
 done
-[ "$(cpin_state)" = READY ] || { logger -p daemon.err -t "$TAG" "SIM did not become ready after PIN entry"; exit 2; }
-
-# Let the modem finish initialising the SIM before anyone talks QMI to it.
-sleep 4
-
-if [ -z "$saved_iccid" ] && [ -n "$cur_iccid" ]; then
-	uci -q set network.wwan.pin_iccid="$cur_iccid"
-	uci -q commit network
-fi
-logger -t "$TAG" "SIM unlocked"
-exit 0
+logger -p daemon.warn -t "$TAG" "PIN submission not confirmed READY; the attempt counter decides on the next try"
+exit 5

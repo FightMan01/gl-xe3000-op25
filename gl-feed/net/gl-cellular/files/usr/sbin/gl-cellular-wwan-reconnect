@@ -29,25 +29,35 @@ MAX_WAIT_SEC=20
 # block forever if the lock were ever stuck, and `flock -w` fails
 # immediately with "unrecognized option" while still returning nonzero,
 # which an unchecked call (as this used to be) silently ignored.
-exec 9>"$NET_LOCK"
+exec 9>"$NET_LOCK" || exit 1
 tries=0
 until flock -n 9; do
 	tries=$((tries + 1))
-	[ "$tries" -ge "$MAX_WAIT_SEC" ] && exit 0
+	[ "$tries" -ge "$MAX_WAIT_SEC" ] && exit 1
 	sleep 1
 done
 
-ifdown wwan >/dev/null 2>&1
+[ "$(uci -q get network.wwan.auto)" != 0 ] || exit 1
+[ "$(uci -q get network.wwan.disabled)" != 1 ] || exit 1
+[ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] || exit 1
+[ "$(uci -q get gl-cellular.state.scan_in_progress)" != 1 ] || exit 1
+ifdown wwan >/dev/null 2>&1 || exit 1
 
-tries=0
-while [ "$tries" -lt "$MAX_WAIT_SEC" ]; do
+read -r started _ < /proc/uptime
+deadline=$(( ${started%%.*} + MAX_WAIT_SEC ))
+while :; do
+	read -r current _ < /proc/uptime
+	[ "${current%%.*}" -lt "$deadline" ] || break
 	cgatt="$(ubus -t 3 call cellular.at command '{"cmd":"AT+CGATT?","timeout":3}' 2>/dev/null |
 		jsonfilter -e '@.response' 2>/dev/null | grep -oE '\+CGATT: 1')"
 	[ -n "$cgatt" ] && break
-	tries=$((tries + 1))
 	sleep 1
 done
 
-if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ]; then
+if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ] &&
+	[ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] &&
+	[ "$(uci -q get gl-cellular.state.scan_in_progress)" != 1 ]; then
 	ifup wwan >/dev/null 2>&1
+else
+	exit 1
 fi

@@ -131,6 +131,8 @@ proto_qcm_setup() {
 		   proto_block_restart "$interface"; return 1 ;;
 		3) proto_notify_error "$interface" NO_SIM
 		   proto_block_restart "$interface"; return 1 ;;
+		5) proto_notify_error "$interface" PIN_PENDING
+		   sleep 10; return 1 ;;
 	*) proto_notify_error "$interface" AT_UNAVAILABLE
 	   sleep 10; return 1 ;;
 esac

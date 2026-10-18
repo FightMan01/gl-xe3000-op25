@@ -102,6 +102,10 @@ LTE_FALLBACK_HOLD=$(opt lte_fallback_hold_sec 900)
 # Hard resets (PCIe/MHI re-init) allowed inside the window before giving up.
 MODEM_RESET_MAX=$(opt modem_reset_max 3)
 MODEM_RESET_WINDOW=$(opt modem_reset_window_sec 3600)
+# Past the budget, still reset at most this often: a dead data plane after a
+# SIM re-lock never heals by itself (2026-10-18: offline from 19:19 until a
+# manual reboot, with the budget spent by resets that had each worked).
+MODEM_RESET_BACKOFF=$(opt modem_reset_backoff_sec 900)
 # Last resort: reboot the whole router after the hard-reset budget is spent
 # (the stock firmware does this on a PCIe/MHI failure). Off by default.
 MODEM_RESET_REBOOT=$(opt modem_reset_reboot 0)
@@ -122,6 +126,8 @@ nosignal_ticks=0
 at_dead=0
 reset_count=0
 reset_window_start=0
+last_hard_reset=0
+reset_refused_logged=0
 mhi_reset_count=0
 mhi_reset_window_start=0
 lte_fallback_count=0
@@ -191,7 +197,7 @@ cpin_query() {
 	cpin_valid=1
 }
 
-enabled() {
+administratively_enabled() {
 	local net state scanning
 	# One `uci show` per config instead of a get per option.
 	net="$(uci -q show network.wwan)"
@@ -201,14 +207,6 @@ enabled() {
 	state="$(uci -q show gl-cellular.state)"
 	case "$state" in
 		*"gl-cellular.state.dial_enabled='0'"*) return 1 ;;
-	esac
-
-	# Stand down while the SIM is PIN/PUK locked: nothing can be dialled and
-	# a radio/PCIe reset would only re-lock it. The PIN is entered by
-	# gl-cellular-sim-unlock or through the UI.
-	[ "$cpin_valid" = 1 ] || cpin_query
-	case "$cpin" in
-		*"SIM PIN"*|*"SIM PUK"*) return 1 ;;
 	esac
 
 	# Stand down while the operator-scan RPC owns the modem: AT+COPS=??
@@ -232,6 +230,24 @@ enabled() {
 		uci -q commit gl-cellular
 	fi
 	return 0
+}
+
+enabled() {
+	administratively_enabled || return 1
+	[ "$cpin_valid" = 1 ] || cpin_query
+	if [ -n "$(uci -q get network.wwan.pin_pending)" ]; then
+		case "$cpin" in *"+CPIN: READY"*) ;; *) return 1 ;; esac
+	fi
+	case "$cpin" in
+		*"SIM PIN"*|*"SIM PUK"*) return 1 ;;
+	esac
+	return 0
+}
+
+uptime_sec() {
+	local seconds rest
+	read -r seconds rest < /proc/uptime
+	echo "${seconds%%.*}"
 }
 
 reset_state() {
@@ -721,16 +737,22 @@ cfun_is_full() {
 # which resets the firmware; verified to bring both AT and the data session
 # back. Rate-limited, and the last resort (router reboot) is opt-in.
 modem_hard_reset() {
+	administratively_enabled || return 1
 	local now
 	now="$(date +%s)"
 	if [ $((now - reset_window_start)) -gt "$MODEM_RESET_WINDOW" ]; then
 		reset_window_start=$now
 		reset_count=0
 	fi
-	reset_count=$((reset_count + 1))
-	if [ "$reset_count" -gt "$MODEM_RESET_MAX" ]; then
-		logger -p daemon.err -t "$TAG" \
-			"$reset_count modem hard resets in ${MODEM_RESET_WINDOW}s did not restore service"
+	# reset_count only counts resets that were not followed by a confirmed-good
+	# tick (the main loop clears it), so this is resets that did not help.
+	if [ "$reset_count" -ge "$MODEM_RESET_MAX" ] &&
+		[ $((now - last_hard_reset)) -lt "$MODEM_RESET_BACKOFF" ]; then
+		if [ "$reset_refused_logged" != 1 ]; then
+			reset_refused_logged=1
+			logger -p daemon.err -t "$TAG" \
+				"$reset_count modem hard resets in ${MODEM_RESET_WINDOW}s did not restore service; next one in $((MODEM_RESET_BACKOFF - (now - last_hard_reset)))s"
+		fi
 		if [ "$MODEM_RESET_REBOOT" = "1" ]; then
 			logger -p daemon.err -t "$TAG" \
 				"rebooting to recover the modem (modem_reset_reboot=1)"
@@ -738,10 +760,19 @@ modem_hard_reset() {
 		fi
 		return 1
 	fi
+	reset_count=$((reset_count + 1))
+	last_hard_reset=$now
+	reset_refused_logged=0
 
 	logger -p daemon.err -t "$TAG" \
 		"modem firmware hung (AT unresponsive or data path wedged); hard-resetting via PCIe/MHI (attempt $reset_count/$MODEM_RESET_MAX)"
-	/usr/sbin/gl-cellular-modem-reset
+	if ! /usr/sbin/gl-cellular-modem-reset; then
+		logger -p daemon.err -t "$TAG" "PCIe/MHI reset failed; keeping recovery backoff"
+		return 1
+	fi
+	sim_was_locked=0
+	sim_locked_ticks=0
+	cpin_valid=0
 	at_dead=0
 	consec_bad=0
 	failed_cycles=0
@@ -751,7 +782,7 @@ modem_hard_reset() {
 	redial_count=0
 	window_start=0
 	last_rx=""
-	relock_quiet_until=$(( $(date +%s) + RELOCK_QUIET ))
+	relock_quiet_until=$(( $(uptime_sec) + RELOCK_QUIET ))
 	# gl-cellular-modem-reset brings wwan back up itself; give it the same
 	# grace a redial gets before the loop judges the result.
 	redial_pending=1
@@ -922,8 +953,7 @@ escalate() {
 #   - a PIN is saved for this SIM: bounce wwan, the gate enters it and dials
 #   - the PIN was typed in the UI: the SIM turns READY with no redial, so
 #     bounce wwan once to get a clean QMAP data format + call
-# Two consecutive locked ticks are required so a boot-time gate that is just
-# entering the PIN is never raced.
+# During boot, wait for a second sighting before competing with netifd.
 #
 # Field log 2026-10-11: after such a re-lock the bounce unlocked the SIM and
 # the data call came up with an address (CGPADDR set), but udhcpc never got an
@@ -940,19 +970,25 @@ RELOCK_QUIET=120
 
 relock_reconnect() {
 	local start deadline up device
-	/usr/sbin/gl-cellular-wwan-reconnect
+	administratively_enabled || return 1
+	cpin_query
+	case "$cpin" in *"+CPIN: READY"*) ;; *) return 1 ;; esac
+	/usr/sbin/gl-cellular-wwan-reconnect || return 1
 	sim_was_locked=0
 	sim_locked_ticks=0
 	# enabled() must see the SIM state after the reconnect, not before it.
 	cpin_valid=0
-	start=$(date +%s)
+	start=$(uptime_sec)
 	deadline=$(( start + 90 ))
-	while [ "$(date +%s)" -lt "$deadline" ]; do
+	while [ "$(uptime_sec)" -lt "$deadline" ]; do
 		sleep 5
+		administratively_enabled || return 1
+		cpin_query
+		case "$cpin" in *"+CPIN: READY"*) ;; *) return 1 ;; esac
 		wwan4_status
 		if [ "$up" = "true" ] && [ -n "$device" ]; then
-			ping_confirms "$device" && return 0
-		elif [ $(( $(date +%s) - start )) -ge 30 ] &&
+			{ ping_confirms "$device" || https_confirms "$device"; } && return 0
+		elif [ $(( $(uptime_sec) - start )) -ge 30 ] &&
 			[ "$(modem_attached)" = "1" ] &&
 			[ -r /var/run/gl-cellular-qmi-ipv4 ]; then
 			# Attached, the QMI call is up (quectel-CM publishes the address
@@ -966,6 +1002,7 @@ relock_reconnect() {
 			return
 		fi
 	done
+	administratively_enabled || return 1
 	logger -p daemon.err -t "$TAG" \
 		"no working data path 90s after the SIM re-lock; hard-resetting the modem"
 	modem_hard_reset
@@ -973,6 +1010,11 @@ relock_reconnect() {
 
 sim_lock_watch() {
 	local now i=0
+	if ! administratively_enabled; then
+		sim_was_locked=0
+		sim_locked_ticks=0
+		return 0
+	fi
 	cpin_query
 	# While the modem resets the card, AT+CPIN? gets no reply for a few
 	# seconds (relock trace 2026-10-18 11:38). After an atd nudge, ask
@@ -984,18 +1026,18 @@ sim_lock_watch() {
 	done
 	case "$cpin" in
 	*"SIM PIN"*)
-		sim_was_locked=1
 		sim_locked_ticks=$((sim_locked_ticks + 1))
-		# The boot-time unlock gate is what enters the PIN in the first
-		# minutes, so only then wait for a second sighting; later on a
-		# locked SIM with the link up is a re-lock and is acted on at once.
-		# Never within RELOCK_QUIET of our own hard reset: a PCIe reset always
-		# leaves the SIM locked until qcm.sh's unlock step has run.
-		[ "$sim_locked_ticks" -ge 2 ] ||
-			{ [ "${tick_up:-0}" -ge 180 ] && [ "$(date +%s)" -ge "$relock_quiet_until" ]; } || return 0
+		# After boot or our own PCIe reset, qcm.sh's gate is entering the
+		# PIN: leave it the first sighting. A second one is a fresh re-lock
+		# (2026-10-18 19:18:45 came 49s after a reset) and is handled.
+		if [ "$sim_locked_ticks" -lt 2 ] &&
+			{ [ "${tick_up:-0}" -lt 180 ] || [ "$(uptime_sec)" -lt "$relock_quiet_until" ]; }; then
+			return 0
+		fi
+		sim_was_locked=1
 		[ -n "$(uci -q get network.wwan.pincode)" ] || return 0
 		[ "$(uci -q get network.wwan.pin_failed)" != "1" ] || return 0
-		now="$(date +%s)"
+		now="$(uptime_sec)"
 		[ $((now - last_pin_bounce)) -ge 60 ] || return 0
 		last_pin_bounce=$now
 		logger -p daemon.warning -t "$TAG" \
@@ -1003,7 +1045,11 @@ sim_lock_watch() {
 		# Unlock before the reconnect: it waits up to 20s for a PS attach
 		# that a locked SIM never gets, so qcm.sh used to enter the PIN only
 		# ~22s later. Stock's cellular_manager unlocks on the URC at once.
-		/usr/sbin/gl-cellular-sim-unlock
+		if ! /usr/sbin/gl-cellular-sim-unlock; then
+			cpin_valid=0
+			return 0
+		fi
+		administratively_enabled || return 0
 		relock_reconnect
 		;;
 	*"+CPIN: READY"*)
@@ -1224,7 +1270,7 @@ while :; do
 		# That made the radio power-cycle escalation effectively
 		# unreachable via this path - only the grace-timeout fast path in
 		# the main loop could ever trigger it.
-		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; }
+		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; reset_count=0; }
 		# Deliberately outside the guard above: a confirmed-good tick is
 		# exactly what should start (and then satisfy) the fallback hold
 		# window, so lte_fallback_since survives the counter reset that

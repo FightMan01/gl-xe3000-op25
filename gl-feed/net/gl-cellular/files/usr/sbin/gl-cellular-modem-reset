@@ -36,7 +36,7 @@ done
 	exit 1
 }
 
-exec 9>"$NET_LOCK"
+exec 9>"$NET_LOCK" || exit 1
 tries=0
 until flock -n 9; do
 	tries=$((tries + 1))
@@ -44,14 +44,33 @@ until flock -n 9; do
 	sleep 1
 done
 
+restore_wwan() {
+	[ "$(uci -q get network.wwan.auto)" != 0 ] &&
+		[ "$(uci -q get network.wwan.disabled)" != 1 ] &&
+		[ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] &&
+		[ "$(uci -q get gl-cellular.state.scan_in_progress)" != 1 ] &&
+		ifup wwan >/dev/null 2>&1
+}
+
+[ "$(uci -q get network.wwan.auto)" != 0 ] || exit 1
+[ "$(uci -q get network.wwan.disabled)" != 1 ] || exit 1
+[ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] || exit 1
+[ "$(uci -q get gl-cellular.state.scan_in_progress)" != 1 ] || exit 1
+
 logger -p daemon.err -t gl-cellular-wwan-watchdog \
 	"modem firmware hung; resetting PCIe function $pci_dev"
 
-ifdown wwan >/dev/null 2>&1
+ifdown wwan >/dev/null 2>&1 || exit 1
 
-echo 1 > "/sys/bus/pci/devices/$pci_dev/remove" 2>/dev/null
+if ! echo 1 > "/sys/bus/pci/devices/$pci_dev/remove"; then
+	restore_wwan
+	exit 1
+fi
 sleep 2
-echo 1 > /sys/bus/pci/rescan 2>/dev/null
+if ! echo 1 > /sys/bus/pci/rescan; then
+	restore_wwan
+	exit 1
+fi
 
 # Wait for the QMI control node to reappear, then give the firmware a few
 # more seconds to finish booting before netifd starts quectel-CM.  The qcm
@@ -62,14 +81,12 @@ while [ "$tries" -lt 40 ]; do
 	tries=$((tries + 1))
 	sleep 1
 done
+[ -c /dev/mhi_QMI0 ] || { restore_wwan; exit 1; }
 sleep 10
 
 # The rescan re-probes the driver, which may re-enable runtime PM; re-apply the
 # D3 override so the modem doesn't immediately start autosuspending again.
 /usr/sbin/gl-cellular-pcie-pm
 
-if [ "$(uci -q get network.wwan.auto)" != "0" ] && [ "$(uci -q get network.wwan.disabled)" != "1" ]; then
-	ifup wwan >/dev/null 2>&1
-fi
-
+restore_wwan || exit 1
 exit 0
