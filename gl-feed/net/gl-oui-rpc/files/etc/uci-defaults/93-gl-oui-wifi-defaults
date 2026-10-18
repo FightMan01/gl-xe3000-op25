@@ -21,6 +21,11 @@
 # between beacons lose downlink frames and TCP collapses to a fraction of
 # the link rate.
 #
+# 5 GHz defaults to 80 MHz as on GL's firmware; mainline's detection picks
+# 160 MHz, which keeps more of the radio busy, lands on DFS channels (radar
+# hold-offs) and is rarely needed behind a cellular uplink. Users can still
+# pick 160 MHz in the UI.
+#
 # Regulatory domain comes from the factory field at offset 0x88. If it is
 # absent or invalid, this image defaults to HU.
 
@@ -96,6 +101,7 @@ uci -q batch <<-EOF
 	set wireless.radio1=wifi-device
 	set wireless.radio1.disabled='0'
 	set wireless.radio1.country='${country}'
+	set wireless.radio1.htmode='HE80'
 
 	set wireless.gl_wifi2g=wifi-iface
 	set wireless.gl_wifi2g.device='radio0'
