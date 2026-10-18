@@ -10,7 +10,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-oui-rpc
 PKG_VERSION:=1
-PKG_RELEASE:=21
+PKG_RELEASE:=22
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=
@@ -88,6 +88,7 @@ define Package/gl-oui-rpc/postinst
 	/etc/init.d/gl-wgserver enable
 	/etc/init.d/gl-wan-health enable
 	/etc/init.d/gl-wan-health start
+	/etc/init.d/gl-ksmbd-gate enable
 	/etc/init.d/sqm enable
 	/etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable
