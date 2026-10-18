@@ -44,6 +44,16 @@ cpin_state() {
 	esac
 }
 
+# qcm.sh and the wwan watchdog both run this; one PIN entry at a time. The
+# second caller then finds the SIM READY. BusyBox flock has no -w.
+exec 8>/var/run/gl-cellular-sim-unlock.lock
+i=0
+until flock -n 8; do
+	i=$((i + 1))
+	[ "$i" -ge 40 ] && break
+	sleep 1
+done
+
 # The AT daemon starts after network; wait for it and for the modem.
 state=NOAT
 i=0

@@ -27,6 +27,8 @@ dump() {
 		cat "$RING"
 		echo "# ---- logread"
 		logread | tail -400
+		echo "# ---- mcu"
+		ubus -t 3 call mcu status 2>/dev/null
 		echo "# ---- dmesg"
 		dmesg | tail -80
 	} > "$f"
@@ -48,6 +50,11 @@ while :; do
 	line="$line eng=[$(at 'AT+QENG=\"servingcell\"')]"
 	line="$line ca=[$(at 'AT+QCAINFO')]"
 	line="$line c5=[$(at 'AT+C5GREG?')] ce=[$(at 'AT+CEREG?')]"
+	# Battery vs. charger: relocks are only seen on the move.
+	# Fields: charging_status charge_percent temperature.
+	line="$line bat=[$(ubus -t 3 call mcu status 2>/dev/null |
+		jsonfilter -e '@.charging_status' -e '@.charge_percent' -e '@.temperature' 2>/dev/null |
+		tr '\n' ' ')]"
 	if [ $((n % 6)) -eq 0 ]; then
 		line="$line temp=[$(at 'AT+QTEMP' | grep -oE '\"(mdmss-0-usr|modem-lte-sub6-pa1)\",\"[0-9-]+\"' | tr '\n' ' ')]"
 	fi

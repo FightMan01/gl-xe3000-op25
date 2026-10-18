@@ -972,8 +972,16 @@ relock_reconnect() {
 }
 
 sim_lock_watch() {
-	local now
+	local now i=0
 	cpin_query
+	# While the modem resets the card, AT+CPIN? gets no reply for a few
+	# seconds (relock trace 2026-10-18 11:38). After an atd nudge, ask
+	# again shortly instead of a whole tick later.
+	while [ -z "$cpin" ] && [ "$svc_nudged" = 1 ] && [ "$i" -lt 3 ]; do
+		sleep 3
+		cpin_query
+		i=$((i + 1))
+	done
 	case "$cpin" in
 	*"SIM PIN"*)
 		sim_was_locked=1
@@ -991,7 +999,11 @@ sim_lock_watch() {
 		[ $((now - last_pin_bounce)) -ge 60 ] || return 0
 		last_pin_bounce=$now
 		logger -p daemon.warning -t "$TAG" \
-			"SIM is PIN-locked while wwan is up; reconnecting so the saved PIN is entered"
+			"SIM is PIN-locked while wwan is up; entering the saved PIN and reconnecting"
+		# Unlock before the reconnect: it waits up to 20s for a PS attach
+		# that a locked SIM never gets, so qcm.sh used to enter the PIN only
+		# ~22s later. Stock's cellular_manager unlocks on the URC at once.
+		/usr/sbin/gl-cellular-sim-unlock
 		relock_reconnect
 		;;
 	*"+CPIN: READY"*)
@@ -1015,9 +1027,11 @@ while :; do
 	# gl-cellular-atd drops this when the modem reports limited service or
 	# no serving cell (what a SIM that fell out of the modem looks like), so
 	# the SIM is checked within seconds instead of at the next 60s refresh.
+	svc_nudged=0
 	if [ -e "$SVC_LOST" ]; then
 		rm -f "$SVC_LOST"
 		cpin_at=0
+		svc_nudged=1
 	fi
 	if [ "$recheck_cpin" = 1 ] || [ "$sim_was_locked" -eq 1 ] ||
 		[ "$sim_locked_ticks" -gt 0 ] || [ $((tick_up - cpin_at)) -ge "$CPIN_EVERY" ]; then
