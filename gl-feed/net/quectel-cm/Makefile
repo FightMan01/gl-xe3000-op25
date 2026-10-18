@@ -3,8 +3,11 @@
 # manager. Drives the RM520N-GL's PCIe/MHI QMI data path (paired with the
 # kmod-pcie_mhi kernel driver) instead of mainline MBIM, which wedges under
 # sustained load on this modem. Vendored from QuectelWB/q_drivers with two
-# changes: QCM_NO_DHCP4 env var (skip CM's own IPv4 config so netifd's dhcp
-# proto owns it) and Makefile.am listed the nonexistent MPQMUX.c instead of QCQMUX.c (the
+# changes: (1) QCM_NO_DHCP4 env var (skip CM's own IPv4 config so netifd's dhcp
+# proto owns it), (2) card-status detail - card_state, card_error, PIN states and
+# retry counters, plus the raw TLV head - logged on every UIM Get Card Status, so a
+# field log records why the card went away rather than only that it did,
+# (3) Makefile.am listed the nonexistent MPQMUX.c instead of QCQMUX.c (the
 # OpenWrt package below doesn't use the autotools build, but the fix keeps
 # ./src buildable standalone too).
 #
@@ -13,7 +16,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=quectel-cm
 PKG_VERSION:=1.6.8
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 
 PKG_LICENSE:=Quectel-Software-License
 PKG_LICENSE_FILES:=src/NOTICE

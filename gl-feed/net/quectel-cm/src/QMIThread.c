@@ -967,6 +967,17 @@ static int requestGetSIMStatus(SIM_Status *pSIMStatus) { //RIL_REQUEST_GET_SIM_S
         "SIM_PUK",
         "SIM_NETWORK_PERSONALIZATION"
     };
+    /* Card-status detail kept for the log line below. The modem's own card-error
+     * byte (the QMI UIM card_status ErrorCode field: no-ATR, voltage mismatch,
+     * parity, poll ...) was parsed out of every response here and then thrown
+     * away, so the only record of why a card stopped answering was the AT port
+     * going quiet. Keep the decoded fields and the raw head of the TLV so a
+     * field log is self-describing even without the QMI IDL to hand. */
+    UCHAR csCardState = 0xff, csErrorCode = 0xff, csUPINState = 0xff;
+    UCHAR csUPINRetries = 0xff, csUPUKRetries = 0xff, csPIN1State = 0xff;
+    UCHAR csPIN1Retries = 0xff, csNumApp = 0xff;
+    char csRaw[96];
+    int csRawLen = 0;
 
     if (s_9x07)
         pRequest = ComposeQMUXMsg(QMUX_TYPE_UIM, QMIUIM_GET_CARD_STATUS_REQ, NULL, NULL);
@@ -1021,6 +1032,34 @@ static int requestGetSIMStatus(SIM_Status *pSIMStatus) { //RIL_REQUEST_GET_SIM_S
                 //PIN2Retries = pPINState->PIN2Retries;
                 //PUK2Retries = pPINState->PUK2Retries;
             }
+
+            /* Keep the detail the log below reports. Nothing here changes any
+             * decision: these are the same bytes the code above already read,
+             * kept because the card-error byte is the only thing in the whole
+             * QMI surface that says *why* a card went away. The retry counters
+             * were commented out upstream because nothing consumed them; the
+             * modem is free to return 0 when the card does not report them,
+             * so 0xff means "not present in this reply" and 0 means zero. */
+            csCardState = CardState;
+            csErrorCode = pCardStatus->ErrorCode;
+            csUPINState = pCardStatus->UPINState;
+            csUPINRetries = pCardStatus->UPINRetries;
+            csUPUKRetries = pCardStatus->UPUKRetries;
+            csNumApp = pCardStatus->NumApp;
+            if (pPINState != NULL) {
+                csPIN1State = pPINState->PIN1State;
+                csPIN1Retries = pPINState->PIN1Retries;
+            }
+            {
+                const UCHAR *raw = (const UCHAR *)pCardStatus;
+                int avail = pCardStatus->TLVLength;
+                if (avail > (int)sizeof(csRaw))
+                    avail = sizeof(csRaw);
+                if (avail < 0)
+                    avail = 0;
+                for (int i = 0; i < avail; i++)
+                    csRawLen += snprintf(csRaw + csRawLen, sizeof(csRaw) - csRawLen, "%02x", raw[i]);
+            }
         }
 
         *pSIMStatus = SIM_ABSENT;
@@ -1074,7 +1113,16 @@ static int requestGetSIMStatus(SIM_Status *pSIMStatus) { //RIL_REQUEST_GET_SIM_S
             *pSIMStatus = SIM_ABSENT;
         }
     }
-    dbg_time("%s SIMStatus: %s", __func__, SIM_Status_String[*pSIMStatus]);
+    /* One line per data call. The card-error byte is the only place the modem
+     * records *why* a card stopped answering - the AT port just goes silent -
+     * and this is the same read quectel-CM already made and threw the field
+     * away. */
+    dbg_time("%s SIMStatus: %s card=%s card_state=0x%02x card_error=0x%02x pin1_state=0x%02x pin1_retries=0x%02x upin_state=0x%02x upin_retries=0x%02x upuk_retries=0x%02x apps=0x%02x raw=[%s]",
+             __func__, SIM_Status_String[*pSIMStatus],
+             (s_9x07) ? "uim" : "dms",
+             csCardState, csErrorCode, csPIN1State, csPIN1Retries,
+             csUPINState, csUPINRetries, csUPUKRetries, csNumApp,
+             (csRawLen > 0) ? csRaw : "-");
 
     free(pResponse);
 
