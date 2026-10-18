@@ -154,19 +154,21 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(self.run_unlock(),5)
         self.assertFalse((self.root/'at.log').exists())
 
-    def watchdog(self, body, extra=''):
+    def watchdog(self, body, extra='', funcs=('administratively_enabled','sim_lock_watch')):
         self.write_state()
         s=(S/'gl-cellular-boot-redial').read_text()
-        funcs='\n'.join(function(s,n) for n in ('administratively_enabled','sim_lock_watch'))
+        funcs='\n'.join(function(s,n) for n in funcs)
         funcs=funcs.replace('/usr/sbin/gl-cellular-sim-unlock','mock_unlock')
-        setup='''
-logger() { :; }
-uptime_sec() { echo 1000; }
-cpin_query() { cpin="${TEST_CPIN:-+CPIN: SIM PIN}"; cpin_valid=1; }
-mock_unlock() { echo UNLOCK; return "${UNLOCK_STATUS:-0}"; }
-relock_reconnect() { echo RECONNECT; }
+        setup=f'''
+logger() {{ :; }}
+uptime_sec() {{ echo 1000; }}
+cpin_query() {{ cpin="${{TEST_CPIN:-+CPIN: SIM PIN}}"; cpin_valid=1; }}
+mock_unlock() {{ echo UNLOCK; return "${{UNLOCK_STATUS:-0}}"; }}
+relock_reconnect() {{ echo RECONNECT; }}
 sim_locked_ticks=0; sim_was_locked=0; last_pin_bounce=0
 relock_quiet_until=0; tick_up=1000; svc_nudged=0
+cpin_valid=0; cpin=""; RELOCK_MIN_GAP=45; SIM_REINIT={self.root}/sim-reinit
+relock_handled=0
 '''
         r=subprocess.run(['/bin/sh','-c',setup+funcs+'\n'+extra+'\n'+body],env=self.env,capture_output=True,text=True,timeout=5)
         self.assertEqual(r.returncode,0,r.stderr)
@@ -191,6 +193,61 @@ relock_quiet_until=0; tick_up=1000; svc_nudged=0
 
     def test_watchdog_success(self):
         self.assertEqual(self.watchdog('sim_lock_watch'),['UNLOCK','RECONNECT'])
+
+    def test_watchdog_reuses_cached_cpin_between_ticks(self):
+        # CPIN_EVERY exists so a healthy link is not asked about its SIM on
+        # every single tick; sim_lock_watch must actually honour the cache or
+        # the rate-limiting in the main loop buys nothing.
+        body='\ncpin="+CPIN: READY"; cpin_valid=1; cpin_query() { echo QUERIED; }; sim_lock_watch; echo "cached=$cpin"'
+        self.assertEqual(self.watchdog(body),['cached=+CPIN: READY'])
+
+    def test_burst_sighting_inside_the_gap_is_still_counted(self):
+        # A second re-lock inside the rate-limit window is counted as a
+        # sighting and acted on by the next tick that is far enough past the
+        # last attempt - it must not be swallowed.
+        self.assertEqual(self.watchdog('last_pin_bounce=990; sim_lock_watch'),[])
+        body='\nlast_pin_bounce=900; sim_lock_watch; echo "ticks=$sim_locked_ticks gap_after=$last_pin_bounce"'
+        self.assertEqual(self.watchdog(body),['UNLOCK','RECONNECT','ticks=1 gap_after=1000'])
+
+    def test_refused_unlock_keeps_the_gap_open_for_the_retry(self):
+        body='\nUNLOCK_STATUS=5; sim_lock_watch; echo "ticks=$sim_locked_ticks gap=$last_pin_bounce"'
+        self.assertEqual(self.watchdog(body),['UNLOCK','ticks=1 gap=0'])
+
+    def test_sim_reinit_without_pin_reconnects(self):
+        # The card came back READY (no PIN, or the user typed it in): nothing
+        # on the +CPIN path fires, so the re-init indication itself has to be
+        # what bounces wwan.
+        marker=self.root/'sim-reinit'
+        marker.write_text('"pb done"\n')
+        body='\nsim_reinit_watch; echo "marker_left=$([ -e "$SIM_REINIT" ] && echo yes || echo no)"'
+        out=self.watchdog(body, extra='TEST_CPIN="+CPIN: READY"',
+                          funcs=('administratively_enabled','sim_lock_watch','sim_reinit_watch'))
+        self.assertEqual(out,['RECONNECT','marker_left=no'])
+
+    def test_sim_reinit_defers_to_the_pin_path_and_to_boot(self):
+        # The marker is an edge trigger and is always consumed; what matters is
+        # that neither a PIN-locked card (sim_lock_watch owns it) nor the
+        # just-after-boot window bounces wwan a second time.
+        for extra in ('TEST_CPIN="+CPIN: SIM PIN"', 'relock_quiet_until=999999'):
+            with self.subTest(extra=extra):
+                (self.root/'sim-reinit').write_text('"sms done"\n')
+                body='\nsim_reinit_watch; echo "marker_left=$([ -e "$SIM_REINIT" ] && echo yes || echo no)"'
+                out=self.watchdog(body, extra=extra,
+                                  funcs=('administratively_enabled','sim_lock_watch','sim_reinit_watch'))
+                self.assertEqual(out,['marker_left=no'])
+
+    def test_sim_reinit_marker_is_consumed_without_a_reconnect_path(self):
+        (self.root/'sim-reinit').unlink(missing_ok=True)
+        body='\nsim_reinit_watch; echo "done"'
+        self.assertEqual(self.watchdog(body, funcs=('administratively_enabled','sim_reinit_watch')),['done'])
+
+    def test_pin_relock_does_not_bounce_twice(self):
+        # With a PIN enabled the modem reports the re-init as well, seconds
+        # after the unlock. One tick must produce one bounce, not two.
+        (self.root/'sim-reinit').write_text('"pb done"\n')
+        body='\nTEST_CPIN="+CPIN: SIM PIN"; sim_lock_watch; echo "handled=$relock_handled"; TEST_CPIN="+CPIN: READY"; sim_reinit_watch'
+        self.assertEqual(self.watchdog(body, funcs=('administratively_enabled','sim_lock_watch','sim_reinit_watch')),
+                         ['UNLOCK','RECONNECT','handled=1'])
 
     def test_reset_result_and_quiet_state(self):
         source=(S/'gl-cellular-boot-redial').read_text()

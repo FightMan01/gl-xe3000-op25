@@ -8,6 +8,15 @@ RING=/tmp/relock-trace.log
 OUT=/root/relock-traces
 # 10s keeps three samples inside TAIL_SEC and halves the AT traffic of 5s.
 INTERVAL=10
+# A full sample is eight serialized AT round-trips on the one AT port, and the
+# moment that port matters most is the moment it has stopped answering: each
+# command then costs its own full timeout and pushes every other caller - the
+# watchdog's AT+CPIN?, the PIN entry itself - further down the queue. So while
+# the modem is unhealthy the sample is cut down to the three reads that say
+# whether the card and the bearer are alive at all (CPIN, attach, and the card
+# identity/ATR), at the normal interval, and the four cosmetic reads are skipped.
+# They answer nothing useful in that state anyway - during a card
+# re-initialisation QENG returns SEARCH and QCAINFO returns a bare OK.
 RING_LINES=1500
 TAIL_SEC=30
 MAX_DUMPS=6
@@ -40,6 +49,7 @@ prev_att=""
 dump_at=0
 dump_reason=""
 last_dump=0
+unhealthy=0
 n=0
 
 while :; do
@@ -47,15 +57,32 @@ while :; do
 	cpin=$(at 'AT+CPIN?')
 	att=$(at 'AT+CGATT?' | grep -oE 'CGATT: [01]' | tail -n1)
 	line="$(date +%H:%M:%S) cpin=[$cpin] att=[$att]"
-	line="$line eng=[$(at 'AT+QENG=\"servingcell\"')]"
-	line="$line ca=[$(at 'AT+QCAINFO')]"
-	line="$line c5=[$(at 'AT+C5GREG?')] ce=[$(at 'AT+CEREG?')]"
+	# The card itself, not just the modem's opinion of it. QSIMCFG's
+	# dual_slot_status returns the slot state, the card's ATR and its ICCID in
+	# a single read, so samples either side of a re-initialisation say whether
+	# the card is the same one and came back with the same electrical
+	# characteristics - an ATR whose TA2 byte changed would be a voltage-class
+	# switch, a different fault entirely. It is also the cheapest way to tell
+	# "the card is gone" apart from "the modem lost track of it": a missing
+	# card drops the ICCID out of the reply instead of the whole command
+	# hanging the way AT+CPIN? does.
+	card=$(at 'AT+QSIMCFG=\"dual_slot_status\"')
+	line="$line card=[$card]"
+	case "$cpin" in *"+CPIN: READY"*) ;; *) unhealthy=1 ;; esac
+	printf '%s' "$card" | grep -qE '[0-9A-Fa-f]{30,}' || unhealthy=1
+	if [ "$unhealthy" -eq 0 ]; then
+		line="$line eng=[$(at 'AT+QENG=\"servingcell\"')]"
+		line="$line ca=[$(at 'AT+QCAINFO')]"
+		line="$line c5=[$(at 'AT+C5GREG?')] ce=[$(at 'AT+CEREG?')]"
+	else
+		line="$line eng=[skipped] ca=[skipped] c5=[skipped] ce=[skipped]"
+	fi
 	# Battery vs. charger: relocks are only seen on the move.
 	# Fields: charging_status charge_percent temperature.
 	line="$line bat=[$(ubus -t 3 call mcu status 2>/dev/null |
 		jsonfilter -e '@.charging_status' -e '@.charge_percent' -e '@.temperature' 2>/dev/null |
 		tr '\n' ' ')]"
-	if [ $((n % 6)) -eq 0 ]; then
+	if [ $((n % 6)) -eq 0 ] && [ "$unhealthy" -eq 0 ]; then
 		line="$line temp=[$(at 'AT+QTEMP' | grep -oE '\"(mdmss-0-usr|modem-lte-sub6-pa1)\",\"[0-9-]+\"' | tr '\n' ' ')]"
 	fi
 	echo "$line" >> "$RING"
@@ -76,10 +103,13 @@ while :; do
 	prev_pin=$pin
 	[ -n "$att" ] && prev_att=$att
 
+	# Dump before sleeping, so a bad sample never delays the capture of the
+	# episode that triggered it.
 	if [ "$dump_at" -ne 0 ] && [ "$now" -ge "$dump_at" ]; then
 		dump "$dump_reason"
 		last_dump=$now
 		dump_at=0
 	fi
+	unhealthy=0
 	sleep "$INTERVAL"
 done

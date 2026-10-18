@@ -161,16 +161,47 @@ end
 -- only record of why the SIM dropped (detect-pin glitch, SIM refresh, card
 -- error); a SIM that is no longer ready also wakes the watchdog at once, which
 -- is what stock's cellular_manager does with its +CPIN URC handlers.
+-- The modem re-initialises the SIM card on its own from time to time while the
+-- router is moving (docs/research/09-sim-relock-root-cause.md): AT+CPIN? stops
+-- answering for 10-20s, then the card comes back freshly initialised and, with a
+-- PIN enabled, asks for the PIN again. It announces every one of those. A
+-- +CPIN that is not READY is the obvious one, but it only arrives on a PIN-
+-- enabled SIM - with the PIN disabled the card just returns to READY and
+-- nothing on our side reacts until the slow traffic-stall path notices. The
+-- phonebook "done" indication is the one that comes back on every card
+-- re-initialisation, PIN or not: it is the modem finishing the SIM refresh it
+-- runs after powering the card up, so pair it with the matching +QSIMSTAT and
+-- treat the pair as "the card was just re-initialised".
+SIM_REINIT = '/var/run/gl-cellular-sim-reinit'
+
+local function note_sim_reinit(why)
+	local fh = io.open(SIM_REINIT, 'w')
+	if fh then fh:write(why, '\n') fh:close() end
+	nudge_watchdog('SIM re-initialised by the modem (' .. why .. ')')
+end
+
 local function handle_urc(line, cmd)
 	if line:match('^%+CPIN:') then
 		if cmd and cmd:match('CPIN') then return end
 		log.info('gl-cellular-atd: modem report: ' .. line)
-		if not line:match('READY') then nudge_watchdog('SIM not ready (' .. line .. ')') end
+		if not line:match('READY') then
+			note_sim_reinit('CPIN ' .. line)
+		end
 	elseif line:match('^%+QSIMSTAT:') then
+		-- Asking for it can make the modem re-send the indication, so never
+		-- read our own query back as the card having just changed.
+		if cmd and cmd:match('QSIMSTAT') then return end
 		log.info('gl-cellular-atd: modem report: ' .. line)
 		if line:match(',%s*0%s*$') then nudge_watchdog('SIM removed (' .. line .. ')') end
 	elseif line:match('^%+QIND:') and not line:match('^%+QIND:%s*"csq"') then
 		log.info('gl-cellular-atd: modem report: ' .. line)
+		-- "pb done" only, not "sms done": both are sent after the card comes
+		-- back up, but only the phonebook read is something a card
+		-- initialisation does and nothing else does, so it is the half that
+		-- cannot fire on an ordinary event and bounce the data path for it.
+		if line:match('"pb%s+done"') then
+			note_sim_reinit(line:match('^%+QIND:%s*(.*)$') or line)
+		end
 	end
 end
 
@@ -233,13 +264,49 @@ local function send_at_unlocked(cmd, timeout_s)
 	-- A port that never answers (modem USB re-enumerated after a PCIe reset,
 	-- device node replaced) keeps a dead descriptor open forever: reopen it
 	-- after repeated silence or a hard read error.
-	if #buf == 0 then empty_replies = empty_replies + 1 else empty_replies = 0 end
+	--
+	-- The first silent reply is also the earliest host-side sign of a card
+	-- re-initialisation: in the field logs the AT port goes quiet 10-20s before
+	-- the modem re-inits the card and demands the PIN again, and the only
+	-- other nudge (the modem going to SEARCH) arrives several seconds later
+	-- still - by which time the card has usually already been re-initialised.
+	-- Waking the watchdog here rather than after the third empty reply is
+	-- what shortens the outage; it just re-reads AT+CPIN?, and nudge_watchdog
+	-- rate-limits itself to one nudge per 10s.
+	if #buf == 0 then
+		empty_replies = empty_replies + 1
+		if empty_replies == 1 then
+			nudge_watchdog('no reply from ' .. dev .. ' (modem AT port went silent)')
+		end
+	else
+		empty_replies = 0
+	end
 	if read_err or empty_replies >= 3 then
 		empty_replies = 0
 		log.err('gl-cellular-atd: no usable reply from ' .. dev .. '; reopening the AT port')
 		reopen_port()
 	end
 	return table.concat(buf, '\n')
+end
+
+-- Read and act on anything still queued in the port before throwing the
+-- descriptor away. The one report that explains a card re-initialisation is the
+-- +CPIN / +QSIMSTAT / phonebook indication the modem emitted while the port was
+-- silent, and closing the descriptor discards exactly that: in the 2026-10-18
+-- evening logs the three events with a healthy AT port show "+CPIN: SIM PIN"
+-- twice and "+QSIMSTAT: 1,1", while every event during a wedged port shows no
+-- CPIN indication at all. Called with at_busy already held (every caller runs
+-- from send_at or urc_loop).
+local function drain_port()
+	if not f then return end
+	local saved = f
+	pcall(function()
+		for _ = 1, 64 do
+			local line = saved:read('l', 0.1)
+			if not line then break end
+			handle_urc(line, nil)
+		end
+	end)
 end
 
 -- The history/LED sampler runs as a background eco coroutine while ubus
@@ -1307,6 +1374,10 @@ local cellular_methods = {
 }
 
 reopen_port = function()
+	-- Anything the modem queued while we were not reading it - the +CPIN /
+	-- +QSIMSTAT report of a card that re-initialised during the silence - is
+	-- still in the port buffer. Act on it before closing.
+	drain_port()
 	if f then pcall(function() f:close() end) f = nil end
 	local handle, path = choose_port()
 	if handle then
@@ -1334,6 +1405,10 @@ do
 end
 -- Same indication setup stock's modem_AT does on every (re)open.
 send_at_unlocked('AT+QINDCFG="all",1,1', 3)
+-- Only card re-initialisations from now on count: the boot sequence itself
+-- finishes with the same phonebook/SMS indications, and a marker left behind by
+-- a previous boot would bounce wwan for no reason.
+os.remove(SIM_REINIT)
 -- Older builds of this port wrote AT+QNETRC=7 (reject-cause URCs) into the
 -- modem's NV on every dial. Stock only ever queries it, so put it back.
 send_at_unlocked('AT+QNETRC=0', 2)
