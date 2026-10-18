@@ -14,7 +14,7 @@
 # download runs first and 5G is checked while it is running.
 #
 # UCI gl-cellular.cellpick: enabled, nr_grace_sec (20), hold_sec (300),
-# cooldown_sec (600), max_cells (3), min_gain_pct (30), good_mbit (100),
+# cooldown_sec (600), max_cells (3), min_gain_pct (30), good_mbit (40),
 # probe_url, probe_sec (6).
 
 CFG=gl-cellular.cellpick
@@ -103,7 +103,7 @@ evaluate() {
 	wait
 	base=$(cat /tmp/cellpick.base)
 	[ "${base:-0}" -gt 0 ] || { log "no data path, leaving it alone"; LAST_EVAL=$(now); return; }
-	if [ "${base:-0}" -ge $(( $(opt good_mbit 100) * 125000 )) ]; then
+	if [ "${base:-0}" -ge $(( $(opt good_mbit 40) * 125000 )) ]; then
 		log "current cell is fast enough ($((base / 125000)) Mbit/s)"
 		LAST_EVAL=$(now); return
 	fi
