@@ -9,7 +9,7 @@
 -- get_sms_list, get_traffic_config, remove_profile, remove_sms,
 -- scan_cell_tower, scan_operator_list, send_at_command, send_sms,
 -- set_apn_db_update, set_cell_tower, set_connect, set_operator_config,
--- set_profile, set_sim_config, set_sim_pin_code, set_slot_failover_config,
+-- apply_profile, set_profile, set_sim_config, set_sim_pin_code, set_slot_failover_config,
 -- set_sms, set_traffic_config.
 --
 -- See get_serving_cell()'s own comment below for the 5G NSA field mapping
@@ -1392,6 +1392,33 @@ methods = {
 			end
 		end
 		return { active_slots = as_array(slots), custom_profiles = as_array(profiles) }
+	end,
+
+	-- "Select profile" on the cellular card. The UI sends the SIM's
+	-- bus/slot/iccid plus the chosen profile's fields (an `id` of a saved
+	-- profile is enough too); applying one is the same as saving those
+	-- values as the SIM settings, so reuse set_sim_config for APN, auth,
+	-- PDP type, mode, bands and the reconnect.
+	apply_profile = function(args)
+		local data = {}
+		if args.id then
+			local cursor = uci.cursor()
+			cursor:foreach("gl-cellular", "apn_profile", function(s)
+				if s[".name"] == args.id then
+					for k, v in pairs(profile_entry(s)) do data[k] = v end
+				end
+			end)
+		end
+		for k, v in pairs(args) do
+			if k ~= "bus" and k ~= "slot" and k ~= "iccid" and k ~= "id" and k ~= "name"
+				and data[k] == nil then
+				data[k] = v
+			end
+		end
+		if not data.apn then
+			return { code = 1, message = "profile has no APN" }
+		end
+		return methods.set_sim_config(data)
 	end,
 
 	-- action 1 = add, 2 = modify (args.id). The UI also passes the SIM's
