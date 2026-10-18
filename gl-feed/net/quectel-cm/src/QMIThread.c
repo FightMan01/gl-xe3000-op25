@@ -1006,6 +1006,48 @@ static int requestGetPINStatus(SIM_Status *pSIMStatus) {
  * upstream because nothing consumed them: the modem is free to report 0 when the
  * card does not, so 0xff below means "not in this reply" and 0 means zero.
  */
+/* libqmi's QmiUimCardError / QmiUimPinState / QmiUimCardState, by value. Named in
+ * the log because these are the only values that separate the open hypotheses:
+ * POWER_DOWN means the modem powered the card down on purpose, VOLTAGE_MISMATCH is
+ * a voltage-class problem and settles that question outright, NO_ATR_RECEIVED and
+ * PARITY and POLL point at the electrical interface or the card, POSSIBLY_REMOVED
+ * at the detect pin or a marginal contact, TECHNICAL at the card itself. A bare
+ * hex byte in a field log six weeks from now is worth nothing. */
+static const char *uimCardErrorName(UCHAR e) {
+    switch (e) {
+        case 0: return "none";
+        case 1: return "POWER_DOWN";
+        case 2: return "POLL";
+        case 3: return "NO_ATR_RECEIVED";
+        case 4: return "VOLTAGE_MISMATCH";
+        case 5: return "PARITY";
+        case 6: return "POSSIBLY_REMOVED";
+        case 7: return "TECHNICAL";
+        default: return "unmapped";
+    }
+}
+
+static const char *uimCardStateName(UCHAR s) {
+    switch (s) {
+        case 0: return "ABSENT";
+        case 1: return "PRESENT";
+        case 2: return "ERROR";
+        default: return "unmapped";
+    }
+}
+
+static const char *uimPinStateName(UCHAR s) {
+    switch (s) {
+        case 0: return "NOT_INITIALIZED";
+        case 1: return "ENABLED_NOT_VERIFIED";
+        case 2: return "ENABLED_VERIFIED";
+        case 3: return "DISABLED";
+        case 4: return "BLOCKED";
+        case 5: return "PERMANENTLY_BLOCKED";
+        default: return "unmapped";
+    }
+}
+
 static void QmiUimLogCardStatus(const char *tag, const PQMIUIM_CARD_STATUS pCardStatus,
                                 const PQMIUIM_PIN_STATE pPINState)
 {
@@ -1021,13 +1063,17 @@ static void QmiUimLogCardStatus(const char *tag, const PQMIUIM_CARD_STATUS pCard
     for (avail = 0; avail < (int)sizeof(rawhex) / 2 && avail < pCardStatus->TLVLength; avail++)
         rawlen += snprintf(rawhex + rawlen, sizeof(rawhex) - rawlen, "%02x", raw[avail]);
 
-    dbg_time("UIM card status (%s): card_state=0x%02x card_error=0x%02x apps=0x%02x "
-             "upin_state=0x%02x upin_retries=0x%02x upuk_retries=0x%02x "
-             "pin1_state=0x%02x pin1_retries=0x%02x raw=[%s]",
-             tag, pCardStatus->CardState, pCardStatus->ErrorCode, pCardStatus->NumApp,
-             pCardStatus->UPINState, pCardStatus->UPINRetries, pCardStatus->UPUKRetries,
+    dbg_time("UIM card status (%s): card_state=%s(0x%02x) card_error=%s(0x%02x) "
+             "pin1_state=%s(0x%02x) pin1_retries=0x%02x apps=0x%02x "
+             "upin_state=0x%02x upin_retries=0x%02x upuk_retries=0x%02x raw=[%s]",
+             tag,
+             uimCardStateName(pCardStatus->CardState), pCardStatus->CardState,
+             uimCardErrorName(pCardStatus->ErrorCode), pCardStatus->ErrorCode,
+             uimPinStateName((pPINState != NULL) ? pPINState->PIN1State : (UCHAR)0xff),
              (pPINState != NULL) ? pPINState->PIN1State : (UCHAR)0xff,
              (pPINState != NULL) ? pPINState->PIN1Retries : (UCHAR)0xff,
+             pCardStatus->NumApp,
+             pCardStatus->UPINState, pCardStatus->UPINRetries, pCardStatus->UPUKRetries,
              (rawlen > 0) ? rawhex : "-");
 }
 

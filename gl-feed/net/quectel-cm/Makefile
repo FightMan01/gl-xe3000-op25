@@ -16,7 +16,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=quectel-cm
 PKG_VERSION:=1.6.8
-PKG_RELEASE:=7
+PKG_RELEASE:=8
 
 PKG_LICENSE:=Quectel-Software-License
 PKG_LICENSE_FILES:=src/NOTICE

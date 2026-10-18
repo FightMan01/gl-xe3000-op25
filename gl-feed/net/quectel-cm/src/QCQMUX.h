@@ -4029,10 +4029,13 @@ typedef struct _QMIUIM_VERIFY_PIN_REQ_MSG
  * re-lock, by which time the modem has very probably already cleared the
  * error; the indication carries it as it was.
  *
- * The mask bit is the one thing here that cannot be checked from the source,
- * so the modem's own result is logged: a wrong bit shows up as a non-zero
- * result on the first data call rather than as silence. */
-#define QMI_UIM_EVENT_CARD_STATUS    0x00000010
+ * From libqmi's qmi-enums-uim.h, QmiUimEventRegistrationFlag:
+ *   CARD_STATUS = 1<<0 (0x01), SAP_CONNECTION = 1<<1,
+ *   EXTENDED_CARD_STATUS = 1<<2, PHYSICAL_SLOT_STATUS = 1<<4 (0x10).
+ * An earlier build used 0x10 and the modem still answered result=0 - it registers
+ * physical slot status and pushes Slot Status instead. A successful registration
+ * proves the mask was accepted, never that the bit meant card status. */
+#define QMI_UIM_EVENT_CARD_STATUS    0x00000001
 
 typedef struct _QMIUIM_EVENT_REG_REQ_MSG
 {
