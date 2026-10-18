@@ -56,8 +56,11 @@ end
 -- (integer + 0.0) makes lua_isinteger() false, taking the
 -- blobmsg_add_double() branch instead, which handles negative values
 -- correctly.
+-- The modem prints some negative readings (NR SINR/RSRQ below zero) as an
+-- unsigned 32-bit value, e.g. -2 as 4294967294; undo that wrap.
 local function tofloat(n)
 	if n == nil then return nil end
+	if n > 2147483647 and n < 4294967296 then n = n - 4294967296 end
 	return n + 0.0
 end
 

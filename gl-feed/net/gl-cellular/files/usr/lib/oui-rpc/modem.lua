@@ -181,6 +181,10 @@ local function get_serving_cell()
 			local pci, rsrp, sinr, rsrq, arfcn, band, bw_code =
 				fields[4], fields[5], fields[6], fields[7], fields[8], fields[9], fields[10]
 			rsrp, sinr, rsrq = tonumber(rsrp), tonumber(sinr), tonumber(rsrq)
+			-- Negative readings can arrive as unsigned 32-bit (-2 -> 4294967294).
+			if rsrp and rsrp > 2147483647 then rsrp = rsrp - 4294967296 end
+			if sinr and sinr > 2147483647 then sinr = sinr - 4294967296 end
+			if rsrq and rsrq > 2147483647 then rsrq = rsrq - 4294967296 end
 			result = result or {}
 			if fields[1] == "NR5G-SA" then result.mode = "5G SA" end
 			result.nr = {
@@ -1037,7 +1041,10 @@ methods = {
 			-- or somebody unlocked it with an AT command outside this UI.
 			tower = {}
 		end
-		return { slot1 = tower, slot2 = {} }
+		-- The Lock Tower drawer reads a single `slot` object (and throws on
+		-- `slot.cellid` when it is missing); slot1/slot2 are kept for any
+		-- caller that asks per slot.
+		return { slot = tower, slot1 = tower, slot2 = {} }
 	end,
 
 	get_signals = function(args)
