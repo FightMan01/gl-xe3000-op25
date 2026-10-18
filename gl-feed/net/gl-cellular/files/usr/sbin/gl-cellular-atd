@@ -630,6 +630,16 @@ local function cached_serving_cell()
 	return shallow_copy(cell_cache)
 end
 
+-- LTE E-UTRAN Cell Identity is 28 bits: eNB ID (20 bits) << 8 | local cell
+-- ID. Quectel reports it as hex. Network analyser apps and cellmapper list
+-- towers by the decimal eNB ID, which is not visible in the raw value, so
+-- append it to the label the UI already shows as "Cell ID".
+local function enb_label(hex)
+	local n = hex and tonumber(tostring(hex), 16)
+	if not n or n < 256 then return hex end
+	return string.format("%s (eNB %d-%d)", hex, n // 256, n % 256)
+end
+
 -- Per-carrier rows for the Cellular > Details page (Band Information table
 -- and Signal History). The frontend wants numeric network_type codes
 -- (4 = 4G, 41 = 4G+/carrier aggregation, 5 = 5G SA, 51 = 5G NSA) and one
@@ -1146,6 +1156,7 @@ local cellular_methods = {
 			-- cell_info fields. For NSA, present the NR secondary cell
 			-- there and retain the LTE cell under lte_anchor; otherwise
 			-- the drawer misleadingly labels a 5G session with LTE band 7.
+			local lte_label = cell and enb_label(cell.cell_id)
 			if cell and cell.nr then
 				local anchor = {
 					band = cell.band, cell_id = cell.cell_id,
@@ -1168,7 +1179,16 @@ local cellular_methods = {
 			-- (cellInfoKeys, includes ["id","ID"]) keyed off `cellInfo.id`,
 			-- not `cell_id` - without this the Cell ID row silently never
 			-- renders even though the value was computed all along.
-			if cell then cell.id = cell.cell_id end
+			if cell then
+				cell.id = cell.cell_id
+				-- NSA: the NR cell id slot only holds the PCI, so show the LTE
+				-- anchor's eNB next to it; plain LTE shows it directly.
+				if cell.lte_anchor then
+					cell.id = tostring(cell.cell_id) .. " / LTE " .. tostring(lte_label)
+				else
+					cell.id = lte_label
+				end
+			end
 			add_signal_levels(cell)
 			-- The Details page builds its Network Information panel as
 			-- {...networks_info_entry, iccid} (see its networkInfo computed):
@@ -1276,7 +1296,7 @@ local cellular_methods = {
 			con:reply(req, {
 				network_type = network_type,
 				tac = cell.tac,
-				cell_id = cell.cell_id,
+				cell_id = enb_label(cell.cell_id),
 				signal = as_array(rows),
 			})
 		end, {}
