@@ -1,0 +1,9 @@
+#!/bin/sh /etc/rc.common
+# ksmbd (START=98) starts unconditionally; stop it again when no shared disk
+# is mounted.
+
+START=99
+
+start() {
+	/usr/libexec/gl-ksmbd-gate
+}

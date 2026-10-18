@@ -1,0 +1,29 @@
+#!/bin/sh
+# Run ksmbd only while the disk behind a shared folder is mounted. "Enable
+# Samba" stays the init script's enable flag; with no disk there is nothing to
+# serve. A stopped procd service also drops its reload triggers, so config
+# reloads do not bring it back until a disk appears.
+
+/etc/init.d/ksmbd enabled || exit 0
+
+shared_mounted() {
+	local mounts
+	mounts=$(awk '$2 ~ "^/mnt/" { print $2 }' /proc/mounts)
+	[ -n "$mounts" ] || return 1
+	{ uci -q show ksmbd; uci -q -c /var/run/config show ksmbd; } |
+		sed -n "s/^ksmbd\.[^.]*\.path='\(.*\)'$/\1/p" | {
+		while read -r p; do
+			for m in $mounts; do
+				case "$p/" in "$m"/*) exit 0 ;; esac
+			done
+		done
+		exit 1
+	}
+}
+
+if shared_mounted; then
+	/etc/init.d/ksmbd running || /etc/init.d/ksmbd start
+else
+	/etc/init.d/ksmbd running && /etc/init.d/ksmbd stop
+fi
+exit 0

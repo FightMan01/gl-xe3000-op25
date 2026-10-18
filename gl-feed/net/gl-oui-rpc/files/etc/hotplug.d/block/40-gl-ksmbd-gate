@@ -1,0 +1,4 @@
+#!/bin/sh
+# 10-mount has already mounted or unmounted the disk.
+[ "$ACTION" = "add" -o "$ACTION" = "remove" ] || exit 0
+/usr/libexec/gl-ksmbd-gate

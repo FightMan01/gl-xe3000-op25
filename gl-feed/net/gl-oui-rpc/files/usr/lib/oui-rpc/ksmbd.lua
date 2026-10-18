@@ -145,9 +145,17 @@ local function normalize_proto(proto)
 	return tostring(proto)
 end
 
+-- ksmbd only runs while a shared disk is mounted (gl-ksmbd-gate); a restart
+-- with no disk is stopped again right away.
+local function restart_service()
+	local ok = command_ok("/etc/init.d/ksmbd restart")
+	command_ok("/usr/libexec/gl-ksmbd-gate")
+	return ok
+end
+
 local function reload_service()
 	if service_enabled() then
-		return command_ok("/etc/init.d/ksmbd restart")
+		return restart_service()
 	end
 	return true
 end
@@ -302,7 +310,7 @@ return {
 		local enable = not (args and (args.enable == false or tonumber(args.enable) == 0))
 		if enable then
 			command_ok("/etc/init.d/ksmbd enable")
-			if not command_ok("/etc/init.d/ksmbd restart") then
+			if not restart_service() then
 				return { err_code = 2, err_msg = "ksmbd failed to start" }
 			end
 		else
@@ -343,7 +351,7 @@ return {
 		end
 		if args.enable == true or tonumber(args.enable) == 1 then
 			command_ok("/etc/init.d/ksmbd enable")
-			if not command_ok("/etc/init.d/ksmbd restart") then
+			if not restart_service() then
 				return { err_code = 2, err_msg = "ksmbd failed to start" }
 			end
 		else
