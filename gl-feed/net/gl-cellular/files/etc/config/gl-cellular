@@ -86,8 +86,9 @@ config watchdog 'watchdog'
 	# whole bearer goes with it. LTE-only is slower at the top end and much
 	# harder to lose, and for a backup uplink that is the right trade. The
 	# restore is automatic, so a location with good 5G is not stuck on LTE.
-	# Set lte_fallback to 0 to pin it off.
-	option lte_fallback '1'
+	# Off by default: stock never leaves AUTO, and both the switch and the
+	# restore cost a re-registration, i.e. two extra drops.
+	option lte_fallback '0'
 	option lte_fallback_after '2'
 	option lte_fallback_hold_sec '900'
 	# Seconds between watchdog checks while the link is healthy (traffic

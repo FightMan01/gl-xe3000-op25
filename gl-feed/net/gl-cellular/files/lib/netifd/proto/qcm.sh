@@ -222,9 +222,9 @@ _qcm_at_ip_type() {
 	esac
 }
 
-# _qcm_deactivate_pdp <apn> <lower-cased pdptype>
+# _qcm_deactivate_pdp <apn> <lower-cased pdptype> [tries]
 _qcm_deactivate_pdp() {
-	local want_apn="$1" want_type cids cid active failed=0
+	local want_apn="$1" want_type cids cid active failed=0 tries="${3:-3}"
 	want_type="$(_qcm_at_ip_type "$2")"
 	active="$(_qcm_at 'AT+CGACT?')"
 	[ -n "$active" ] || return 0
@@ -245,7 +245,7 @@ _qcm_deactivate_pdp() {
 				*OK*) sleep 1; break ;;
 				esac
 				try=$((try + 1))
-				[ "$try" -ge 3 ] && {
+				[ "$try" -ge "$tries" ] && {
 					logger -p daemon.err -t gl-cellular \
 						"could not deactivate modem PDP context CID $cid"
 					failed=1
@@ -297,10 +297,9 @@ _qcm_reattach() {
 	return 1
 }
 
-# Stock never releases the modem's PDP context before dialling, so neither do
-# we on an ordinary dial. The exception is quectel-CM leaving its marker: the
-# call was refused for a PDN that already exists (ESM cause 55) or that the
-# modem holds as stale (209/211), and redialling as-is can never succeed.
+# quectel-CM leaves its marker when the call was refused for a PDN that
+# already exists (ESM cause 55) or the modem throttles the request (209/211);
+# redialling as-is can never succeed.
 # First release the context; if that fails, or the refusal comes straight back,
 # detach and re-attach. A streak of refusals backs off instead of spinning; it
 # ends with the first quectel-CM exit that left no marker, or after 5 minutes
@@ -330,6 +329,14 @@ if [ -e "$qcm_conflict" ]; then
 	fi
 else
 	rm -f "$qcm_streak"
+	# Unlike stock, release our APN's context before an ordinary dial too.
+	# On this modem a fresh QMI call cannot bind to the attach bearer (it
+	# only re-binds within a second or so of our own call stopping), so
+	# dialling with it up always earns cause 55, and every refusal arms the
+	# modem's PDN throttling (209/211) that then blocks the retries, IPv6
+	# first. The link is already down here, so this costs no extra drop;
+	# one try only, a failure just leaves it to the refusal path above.
+	_qcm_deactivate_pdp "$apn" "$pdptype" 1
 fi
 
 # QMI over PCIe requires the modem's PCIe personality, not its MBIM

@@ -87,14 +87,16 @@ MHI_RESET_WINDOW=$(opt mhi_reset_window_sec 1800)
 # channel start under load turns into a timed-out one. 0 disables.
 MHI_TIMEOUT_MS=$(opt mhi_timeout_ms 10000)
 # Drop to LTE-only after this many data-path failures that needed more than a
-# plain redial, and stay there for LTE_FALLBACK_HOLD seconds. On by default:
+# plain redial, and stay there for LTE_FALLBACK_HOLD seconds. Off by default
+# (stock never leaves AUTO, and switching and restoring each cost a
+# re-registration); the case for turning it on:
 # under NSA the modem camps LTE and adds a 5G secondary node, and in a
 # congested cell the secondary leg is the fragile one - when it drops, the whole
 # bearer goes with it, which is the failure this watchdog keeps rediscovering.
 # LTE-only is slower at the top end and much harder to lose. Restored
 # automatically once the link has been good for the hold window, so a genuinely
 # 5G-capable location is not stuck on LTE. Set lte_fallback=0 to pin it off.
-LTE_FALLBACK=$(opt lte_fallback 1)
+LTE_FALLBACK=$(opt lte_fallback 0)
 LTE_FALLBACK_AFTER=$(opt lte_fallback_after 2)
 LTE_FALLBACK_HOLD=$(opt lte_fallback_hold_sec 900)
 # Hard resets (PCIe/MHI re-init) allowed inside the window before giving up.
