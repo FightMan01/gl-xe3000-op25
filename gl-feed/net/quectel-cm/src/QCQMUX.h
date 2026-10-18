@@ -4021,6 +4021,28 @@ typedef struct _QMIUIM_VERIFY_PIN_REQ_MSG
    UCHAR  PINValue;
 } __attribute__ ((packed)) QMIUIM_VERIFY_PIN_REQ_MSG, *PQMIUIM_VERIFY_PIN_REQ_MSG;
 
+/* QMI UIM Event Registration (UIM_EVENT_REG, 0x2E). Registering for
+ * CARD_STATUS is what makes the modem push UIM_STATUS_CHANGE_IND (0x32) every
+ * time the card's state changes - and that indication is the only place the
+ * card_error byte appears without being asked for. Asked for on demand (Get
+ * Card Status) it only reports the card as it is *now*, which is 20-30s after a
+ * re-lock, by which time the modem has very probably already cleared the
+ * error; the indication carries it as it was.
+ *
+ * The mask bit is the one thing here that cannot be checked from the source,
+ * so the modem's own result is logged: a wrong bit shows up as a non-zero
+ * result on the first data call rather than as silence. */
+#define QMI_UIM_EVENT_CARD_STATUS    0x00000010
+
+typedef struct _QMIUIM_EVENT_REG_REQ_MSG
+{
+   USHORT Type;
+   USHORT Length;
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  event_mask[4];      /* little-endian 32-bit mask */
+} __attribute__ ((packed)) QMIUIM_EVENT_REG_REQ_MSG, *PQMIUIM_EVENT_REG_REQ_MSG;
+
 typedef struct _QMIUIM_VERIFY_PIN_RESP_MSG
 {
    USHORT Type;
@@ -4300,6 +4322,7 @@ typedef struct _QMUX_MSG
       QMIUIM_GET_CARD_STATUS_RESP_MSG           UIMGetCardStatus;
       QMIUIM_VERIFY_PIN_REQ_MSG                 UIMUIMVerifyPinReq;
       QMIUIM_VERIFY_PIN_RESP_MSG                UIMUIMVerifyPinResp;
+      QMIUIM_EVENT_REG_REQ_MSG                  UIMUIMEventRegReq;
 #if 0
       QMIUIM_SET_PIN_PROTECTION_REQ_MSG         UIMUIMSetPinProtectionReq;
       QMIUIM_SET_PIN_PROTECTION_RESP_MSG        UIMUIMSetPinProtectionResp;

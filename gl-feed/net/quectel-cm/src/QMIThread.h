@@ -318,6 +318,9 @@ extern int pthread_cond_timeout_np(pthread_cond_t *cond, pthread_mutex_t * mutex
 extern int QmiThreadSendQMITimeout(PQCQMIMSG pRequest, PQCQMIMSG *ppResponse, unsigned msecs, const char *funcname);
 #define QmiThreadSendQMI(pRequest, ppResponse) QmiThreadSendQMITimeout(pRequest, ppResponse, 30 * 1000, __func__)
 extern void QmiThreadRecvQMI(PQCQMIMSG pResponse);
+
+/* Subscribe to the UIM card-status indication. Log-only; see QMIThread.c. */
+void requestUIMCardStatusEvent(UCHAR uimClientId);
 extern void udhcpc_start(PROFILE_T *profile);
 extern void udhcpc_stop(PROFILE_T *profile);
 extern void ql_set_driver_link_state(PROFILE_T *profile, int link_state);

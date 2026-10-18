@@ -241,6 +241,11 @@ static int QmiWwanInit(PROFILE_T *profile) {
     qmiclientId[QMUX_TYPE_DMS] = QmiWwanGetClientID(QMUX_TYPE_DMS);
     qmiclientId[QMUX_TYPE_NAS] = QmiWwanGetClientID(QMUX_TYPE_NAS);
     qmiclientId[QMUX_TYPE_UIM] = QmiWwanGetClientID(QMUX_TYPE_UIM);
+    /* Ask the modem to push card-status changes instead of polling for them:
+     * Get Card Status is a SIM-bound request, so it hangs while the card is
+     * wedged, and reading it after the fact only shows the card as it is by
+     * then. Log-only and passive - a refusal changes nothing. */
+    requestUIMCardStatusEvent(qmiclientId[QMUX_TYPE_UIM]);
     qmiclientId[QMUX_TYPE_WDS_ADMIN] = QmiWwanGetClientID(QMUX_TYPE_WDS_ADMIN);
 #ifdef CONFIG_COEX_WWAN_STATE
     qmiclientId[QMUX_TYPE_COEX] = QmiWwanGetClientID(QMUX_TYPE_COEX);

@@ -450,6 +450,20 @@ static USHORT DmsUIMVerifyPinReqSend(PQMUX_MSG pMUXMsg, void *arg) {
     return sizeof(QMIDMS_UIM_VERIFY_PIN_REQ_MSG) + (strlen((const char *)arg) - 1);
 }
 
+static USHORT UimEventRegReqSend(PQMUX_MSG pMUXMsg, void *arg)
+{
+    PQMIUIM_EVENT_REG_REQ_MSG p = (PQMIUIM_EVENT_REG_REQ_MSG)&pMUXMsg->UIMUIMEventRegReq;
+
+    (void)arg;
+    p->TLVType = 0x01;
+    p->TLVLength = cpu_to_le16(0x04);
+    p->event_mask[0] = (UCHAR)(QMI_UIM_EVENT_CARD_STATUS & 0xff);
+    p->event_mask[1] = (UCHAR)((QMI_UIM_EVENT_CARD_STATUS >> 8) & 0xff);
+    p->event_mask[2] = (UCHAR)((QMI_UIM_EVENT_CARD_STATUS >> 16) & 0xff);
+    p->event_mask[3] = (UCHAR)((QMI_UIM_EVENT_CARD_STATUS >> 24) & 0xff);
+    return sizeof(QMIUIM_EVENT_REG_REQ_MSG);
+}
+
 static USHORT UimVerifyPinReqSend(PQMUX_MSG pMUXMsg, void *arg)
 {
     pMUXMsg->UIMUIMVerifyPinReq.TLVType = 0x01;
@@ -674,6 +688,9 @@ int QmiThreadSendQMITimeout(PQCQMIMSG pRequest, PQCQMIMSG *ppResponse, unsigned 
     return ret;
 }
 
+static void QmiUimLogCardStatus(const char *tag, const PQMIUIM_CARD_STATUS pCardStatus,
+                                const PQMIUIM_PIN_STATE pPINState);
+
 void QmiThreadRecvQMI(PQCQMIMSG pResponse) {
     pthread_mutex_lock(&cm_command_mutex);
     if (pResponse == NULL) {
@@ -698,6 +715,29 @@ void QmiThreadRecvQMI(PQCQMIMSG pResponse) {
     } else if ((pResponse->QMIHdr.QMIType == QMUX_TYPE_CTL)
                     && (le16_to_cpu(pResponse->CTLMsg.QMICTLMsgHdrRsp.QMICTLType == QMICTL_REVOKE_CLIENT_ID_IND))) {
         qmidevice_send_event_to_main(MODEM_REPORT_RESET_EVENT);
+    } else if ((pResponse->QMIHdr.QMIType == QMUX_TYPE_UIM)
+                    && (le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.Type) == QMIUIM_STATUS_CHANGE_IND)) {
+        /* Log only. No state is changed and no request is sent back, so this
+         * cannot affect the data path - it just records the modem's own
+         * card_error while the card is actually misbehaving, which is the one
+         * thing the AT side never sees. */
+        PQMIUIM_CARD_STATUS pCardStatus =
+            (PQMIUIM_CARD_STATUS)GetTLV(&pResponse->MUXMsg.QMUXMsgHdr, 0x10);
+        PQMIUIM_PIN_STATE pPINState = NULL;
+
+        if (pCardStatus != NULL) {
+            pPINState = (PQMIUIM_PIN_STATE)((PUCHAR)pCardStatus + sizeof(QMIUIM_CARD_STATUS) +
+                                            pCardStatus->APP_INFO.AIDLength);
+            for (int app_index = 0; app_index < pCardStatus->NumApp - 1; app_index++) {
+                if (pCardStatus->APP_INFO.AppType != UIM_APP_TYPE_USIM) {
+                    QMIUI_APP_INFO *appinfo =
+                        (QMIUI_APP_INFO *)((PUCHAR)pPINState + sizeof(QMIUIM_PIN_STATE));
+                    pPINState = (PQMIUIM_PIN_STATE)((PUCHAR)appinfo + sizeof(QMIUI_APP_INFO) +
+                                                     appinfo->AIDLength);
+                }
+            }
+        }
+        QmiUimLogCardStatus("ind", pCardStatus, pPINState);
     } else if ((pResponse->QMIHdr.QMIType == QMUX_TYPE_NAS)
                     && (le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.Type) == QMINAS_SERVING_SYSTEM_IND)) {
         qmidevice_send_event_to_main(RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED);
@@ -952,6 +992,75 @@ static int requestGetPINStatus(SIM_Status *pSIMStatus) {
 
     free(pResponse);
     return 0;
+}
+
+/* Card-status detail, shared by the Get Card Status response and the
+ * UIM_STATUS_CHANGE_IND indication that follows a card-status event
+ * registration. card_error is the modem's own account of why the card stopped
+ * answering (no ATR, voltage mismatch, parity, poll, possibly-removed, powered
+ * down deliberately, ...) - the AT port only ever goes silent, so this is the
+ * one place the reason exists.
+ *
+ * `pPINState` may be NULL when the caller could not walk to it; the card-status
+ * fields are still valid on their own. Retry counters were left commented out
+ * upstream because nothing consumed them: the modem is free to report 0 when the
+ * card does not, so 0xff below means "not in this reply" and 0 means zero.
+ */
+static void QmiUimLogCardStatus(const char *tag, const PQMIUIM_CARD_STATUS pCardStatus,
+                                const PQMIUIM_PIN_STATE pPINState)
+{
+    const UCHAR *raw = (const UCHAR *)pCardStatus;
+    char rawhex[96];
+    int rawlen = 0;
+    int avail;
+
+    if (pCardStatus == NULL) {
+        dbg_time("UIM card status (%s): no card-status TLV in the message", tag);
+        return;
+    }
+    for (avail = 0; avail < (int)sizeof(rawhex) / 2 && avail < pCardStatus->TLVLength; avail++)
+        rawlen += snprintf(rawhex + rawlen, sizeof(rawhex) - rawlen, "%02x", raw[avail]);
+
+    dbg_time("UIM card status (%s): card_state=0x%02x card_error=0x%02x apps=0x%02x "
+             "upin_state=0x%02x upin_retries=0x%02x upuk_retries=0x%02x "
+             "pin1_state=0x%02x pin1_retries=0x%02x raw=[%s]",
+             tag, pCardStatus->CardState, pCardStatus->ErrorCode, pCardStatus->NumApp,
+             pCardStatus->UPINState, pCardStatus->UPINRetries, pCardStatus->UPUKRetries,
+             (pPINState != NULL) ? pPINState->PIN1State : (UCHAR)0xff,
+             (pPINState != NULL) ? pPINState->PIN1Retries : (UCHAR)0xff,
+             (rawlen > 0) ? rawhex : "-");
+}
+
+/* Subscribe to UIM_STATUS_CHANGE_IND. Purely passive and log-only: if the modem
+ * refuses - wrong mask bit, older firmware - the result is logged and nothing
+ * else changes, because those indications would have been dropped anyway.
+ *
+ * Deliberately done once, after the UIM client id exists, rather than polled
+ * during a fault: Get Card Status is a SIM-bound request, so asking for it
+ * while the card is wedged hangs exactly like AT+CPIN? does, and it would stall
+ * the same QMI channel the dial runs on.
+ */
+void requestUIMCardStatusEvent(UCHAR cid) {
+    PQCQMIMSG pRequest;
+    PQCQMIMSG pResponse = NULL;
+    USHORT result = 0xffff, error = 0xffff;
+
+    if (!s_9x07 || cid == 0) {
+        dbg_time("%s skipped (9x07=%d uim_client=%d)", __func__, s_9x07, cid);
+        return;
+    }
+    pRequest = ComposeQMUXMsg(QMUX_TYPE_UIM, QMIUIM_EVENT_REG_REQ, UimEventRegReqSend, NULL);
+    if (pRequest == NULL) {
+        dbg_time("%s could not compose the request", __func__);
+        return;
+    }
+    if (QmiThreadSendQMI(pRequest, &pResponse) == 0 && pResponse != NULL) {
+        result = le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.QMUXResult);
+        error  = le16_to_cpu(pResponse->MUXMsg.QMUXMsgHdrResp.QMUXError);
+    }
+    dbg_time("%s card-status mask 0x%08x: result=%d error=%d",
+             __func__, (unsigned)QMI_UIM_EVENT_CARD_STATUS, result, error);
+    if (pResponse) free(pResponse);
 }
 
 static int requestGetSIMStatus(SIM_Status *pSIMStatus) { //RIL_REQUEST_GET_SIM_STATUS
