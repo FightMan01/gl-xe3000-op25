@@ -29,10 +29,10 @@
 --                          wanted IP list is still stored under
 --                          kmwan_track_ipv4/6 so re-enabling restores it.
 --   track_mode          -> scales the sensitivity interval and picks the
---                          up/down thresholds (low data checks rarely and is
---                          forgiving, strict checks often and is quick to
---                          flip). mwan3 has no event-driven mode, so low
---                          data is approximated by a long interval.
+--                          up/down thresholds (strict checks often and is
+--                          quick to flip). Low data is GL's passive mode:
+--                          mwan3track's track_mode=passive skips the probe
+--                          while real traffic is arriving on the interface.
 --   metered members     -> cellular and tethering run every preset at
 --                          METERED_SCALE times the interval (Normal/medium
 --                          = 30s, matching 94-gl-oui-kmwan). A custom
@@ -81,7 +81,7 @@ local SENSITIVITY_PRESETS = {
 -- multiplier applied to the sensitivity interval, minimum interval, and the
 -- up/down consecutive-check thresholds.
 local TRACK_MODES = {
-	[0] = { multiplier = 6, min_interval = 60, down = 5, up = 5 }, -- low data
+	[0] = { multiplier = 1, min_interval = 1, down = 3, up = 3, passive = true }, -- low data
 	[1] = { multiplier = 1, min_interval = 1, down = 3, up = 3 }, -- normal
 	[2] = { multiplier = 0.5, min_interval = 1, down = 2, up = 2 }, -- strict
 }
@@ -210,6 +210,7 @@ local function apply_member_tracking(cursor, m)
 	local interval = math.max(mode.min_interval,
 		math.floor(base * mode.multiplier + 0.5))
 	cursor:set("mwan3", m.real, "interval", tostring(interval))
+	cursor:set("mwan3", m.real, "track_mode", mode.passive and "passive" or "force")
 	cursor:set("mwan3", m.real, "down", tostring(mode.down))
 	cursor:set("mwan3", m.real, "up", tostring(mode.up))
 	if not cursor:get("mwan3", m.real, "count") then

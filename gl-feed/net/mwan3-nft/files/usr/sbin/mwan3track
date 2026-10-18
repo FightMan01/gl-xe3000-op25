@@ -252,6 +252,8 @@ load_tracking_config() {
 	config_get recovery_latency $INTERFACE recovery_latency 500
 	config_get failure_loss $INTERFACE failure_loss 40
 	config_get recovery_loss $INTERFACE recovery_loss 10
+	config_get track_mode $INTERFACE track_mode force
+	config_get passive_min_rx $INTERFACE passive_min_rx 5
 	# arping/nslookup/nping don't produce latency/loss samples;
 	# check_quality would trigger arithmetic errors on the empty values.
 	case "$track_method" in
@@ -300,6 +302,7 @@ main() {
 
 	load_tracking_config
 	local sleep_time result ping_status loss latency route_state route_state_prev probe_ips
+	local rx_now rx_mark=""
 	mwan3_list_track_ips()
 	{
 		track_ips="$track_ips $1"
@@ -376,6 +379,7 @@ main() {
 			config_load mwan3
 			mwan3_load_track_ips
 			firstconnect
+			rx_mark=""
 			IFUP_EVENT=0
 			continue
 		fi
@@ -411,6 +415,19 @@ main() {
 			LOG notice "Interface $INTERFACE ($DEVICE) default route restored"
 		fi
 		route_state_prev=$route_state
+
+		# track_mode passive, like GL's kmwan for modem members: packets that
+		# arrived on the device since the end of the last round prove the path
+		# works, so count the round as good without probing. rx_mark is taken
+		# after each round, so the replies to our own probes never count. Idle
+		# (or a link that only transmits) is probed exactly as in force mode.
+		rx_now=$(cat "/sys/class/net/$DEVICE/statistics/rx_packets" 2>/dev/null)
+		if [ "$track_mode" = "passive" ] && [ -n "$probe_ips" ] && [ -n "$rx_now" ] && [ -n "$rx_mark" ] &&
+			[ $((rx_now - rx_mark)) -gt "$passive_min_rx" ]; then
+			host_up_count=$reliability
+			probe_ips=""
+		fi
+
 		for track_ip in $probe_ips; do
 			if [ $host_up_count -lt $reliability ]; then
 				case "$track_method" in
@@ -577,6 +594,7 @@ main() {
 
 		host_up_count=0
 		failed_hosts=""
+		rx_mark=$(cat "/sys/class/net/$DEVICE/statistics/rx_packets" 2>/dev/null)
 		if [ "${IFDOWN_EVENT}" -eq 0 ] && [ "${IFUP_EVENT}" -eq 0 ]; then
 			sleep "${sleep_time}" &
 			wait $!
@@ -593,6 +611,7 @@ main() {
 			config_load mwan3
 			mwan3_load_track_ips
 			firstconnect
+			rx_mark=""
 			IFUP_EVENT=0
 		fi
 		if [ "${RELOAD_EVENT}" -eq 1 ]; then

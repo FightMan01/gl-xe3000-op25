@@ -60,6 +60,8 @@ uci -q batch <<-EOF
 	set mwan3.wwan_4.failure_loss='40'
 	set mwan3.wwan_4.recovery_latency='500'
 	set mwan3.wwan_4.recovery_loss='10'
+	set mwan3.wwan_4.track_mode='passive'
+	set mwan3.wwan_4.kmwan_track_mode='0'
 	set mwan3.wwan_4.flush_conntrack='ifup'
 	add_list mwan3.wwan_4.flush_conntrack='ifdown'
 
