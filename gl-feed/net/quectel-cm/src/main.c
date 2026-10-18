@@ -411,7 +411,7 @@ static int qmi_main(PROFILE_T *profile)
     unsigned long PsAttachTime = clock_msec();
 #endif
     int qmierr = 0;
-    int pdn_conflict = 0, pdn_conflict_v4 = 0;
+    int pdn_conflict = 0, pdn_conflict_v4 = 0, v6_first, pass;
     const struct request_ops *request_ops = profile ->request_ops;
     pthread_t gQmiThreadID = 0;
 #ifdef USE_IPC_MSG_STATUS_IND
@@ -614,6 +614,12 @@ if(profile->usb_dev.idProduct != 0x0316)
 #endif
 
                             pdn_conflict_v4 = 0;
+                            /* QCM_V6_FIRST: with both families on QMI, start the IPv6 call
+                             * before the IPv4 one. */
+                            v6_first = profile->enable_ipv4 && profile->enable_ipv6
+                                    && profile->request_ops == &qmi_request_ops && getenv("QCM_V6_FIRST");
+                            for (pass = 0; pass < 2; pass++) {
+                            if ((pass == 0) != v6_first) {
                             if (profile->enable_ipv4 && IPv4ConnectionStatus !=  QWDS_PKT_DATA_CONNECTED) {
                                 qmierr = request_ops->requestSetupDataCall(profile, IpFamilyV4);
 
@@ -654,15 +660,27 @@ if(profile->usb_dev.idProduct != 0x0316)
 #endif
                                     }
                                 }
-                                        
-                            }
 
+                            }
+                            } else {
                             if (profile->enable_ipv6 && IPv6ConnectionStatus !=  QWDS_PKT_DATA_CONNECTED) {
                                 if (profile->enable_ipv4 && profile->request_ops != &qmi_request_ops) {
                                     IPv6ConnectionStatus = IPv4ConnectionStatus;
                                 }
                                 else {
                                     qmierr = request_ops->requestSetupDataCall(profile, IpFamilyV6);
+
+                                    /* Refused as a second PDN for the APN (or throttled for it)
+                                     * while IPv4 is up: every further attempt re-arms the modem's
+                                     * PDN throttling, which then blocks the IPv4 call on the next
+                                     * reconnect too. Stop asking for IPv6 in this session. */
+                                    if (qmierr && g_pdn_conflict && profile->enable_ipv4
+                                            && IPv4ConnectionStatus == QWDS_PKT_DATA_CONNECTED
+                                            && getenv("QCM_EXIT_ON_PDN_CONFLICT")) {
+                                        dbg_time("IPv6 refused (%d) while IPv4 is up, not retrying IPv6 in this session", g_pdn_conflict);
+                                        profile->enable_ipv6 = 0;
+                                        g_pdn_conflict = 0;
+                                    }
 
                                     if (!qmierr) {
                                         qmierr = request_ops->requestGetIPAddress(profile, IpFamilyV6);
@@ -675,6 +693,8 @@ if(profile->usb_dev.idProduct != 0x0316)
                                         }
                                     }
                                 }
+                            }
+                            }
                             }
                                 
                             /* The family that decides the session is IPv4 when it is enabled:
