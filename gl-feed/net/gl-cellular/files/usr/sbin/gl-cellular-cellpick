@@ -90,6 +90,9 @@ evaluate() {
 	local cur base best_speed best_cell n speed e p r max min_gain
 	max=$(opt max_cells 3); min_gain=$(opt min_gain_pct 30)
 	cur=$(serving_lte)
+	# Never act on a link that is already down or re-registering: the
+	# reconnect below would only make it worse.
+	[ -n "$cur" ] && at 'AT+CPIN?' | grep -q READY && at 'AT+CGATT?' | grep -q ': 1' || { LAST_EVAL=$(now); return; }
 	# Load the link, and look for 5G while it is loaded.
 	probe > /tmp/cellpick.base &
 	sleep 3
@@ -99,6 +102,7 @@ evaluate() {
 	fi
 	wait
 	base=$(cat /tmp/cellpick.base)
+	[ "${base:-0}" -gt 0 ] || { log "no data path, leaving it alone"; LAST_EVAL=$(now); return; }
 	if [ "${base:-0}" -ge $(( $(opt good_mbit 100) * 125000 )) ]; then
 		log "current cell is fast enough ($((base / 125000)) Mbit/s)"
 		LAST_EVAL=$(now); return
@@ -130,9 +134,6 @@ evaluate() {
 	fi
 	LAST_EVAL=$(now)
 }
-
-# Make the modem report 5G neighbours too (off by default on the RM520N).
-at 'AT+QNWCFG="nr5g_meas_info",1' >/dev/null
 
 # A lock left over from before a crash/reboot is ours to clear.
 [ "$(uci -q get $CFG.owned)" = "1" ] && unlock noreconnect
