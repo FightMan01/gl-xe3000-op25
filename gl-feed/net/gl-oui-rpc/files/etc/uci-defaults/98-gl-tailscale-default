@@ -3,12 +3,24 @@
 # Tailscale is opt-in.  Keep both the GL page's persisted state and procd's
 # boot enablement in sync so a previously attempted bind cannot make a fresh
 # installation start tailscaled before the user explicitly enables it.
+#
+# uci-defaults also run on the first boot after every sysupgrade that keeps
+# settings, so a user's choice must survive: if Tailscale was enabled, only
+# re-enable the init script and leave the settings alone. Defaults are filled
+# in only where nothing is set.
+
+if [ "$(uci -q get tailscale.settings.enabled)" = "1" ]; then
+	/etc/init.d/tailscale enable >/dev/null 2>&1
+	exit 0
+fi
+
 uci -q set tailscale.settings.enabled='0'
-uci -q set tailscale.settings.lan_enabled='0'
-uci -q set tailscale.settings.wan_enabled='0'
-uci -q set tailscale.settings.run_exit_node='0'
-uci -q set tailscale.settings.masq='0'
-uci -q set tailscale.settings.exit_node_ip=''
+for opt in lan_enabled wan_enabled run_exit_node masq; do
+	[ -n "$(uci -q get tailscale.settings.$opt)" ] ||
+		uci -q set tailscale.settings.$opt='0'
+done
+uci -q get tailscale.settings.exit_node_ip >/dev/null ||
+	uci -q set tailscale.settings.exit_node_ip=''
 uci -q commit tailscale
 
 /etc/init.d/tailscale stop >/dev/null 2>&1

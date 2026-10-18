@@ -90,7 +90,7 @@ define Package/gl-oui-rpc/postinst
 	/etc/init.d/gl-wan-health start
 	/etc/init.d/gl-ksmbd-gate enable
 	/etc/init.d/sqm enable
-	/etc/init.d/tailscale disable
+	[ "$$(uci -q get tailscale.settings.enabled)" = "1" ] || /etc/init.d/tailscale disable
 	/etc/init.d/adguardhome disable
 }
 exit 0
