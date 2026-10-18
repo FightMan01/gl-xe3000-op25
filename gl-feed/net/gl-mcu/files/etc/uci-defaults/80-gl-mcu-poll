@@ -1,0 +1,6 @@
+#!/bin/sh
+# Battery status was polled every 5 s; stock asks at most once a minute.
+[ "$(uci -q get mcu.global.poll_interval)" = "5" ] || exit 0
+uci set mcu.global.poll_interval='30'
+uci commit mcu
+exit 0

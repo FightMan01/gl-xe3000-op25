@@ -35,7 +35,7 @@ local cjson = require 'cjson'
 local cursor = uci.cursor()
 local dev = cursor:get('mcu', 'global', 'dev') or '/dev/ttyS1'
 local baudrate = tonumber(cursor:get('mcu', 'global', 'baudrate') or '9600')
-local poll_interval = tonumber(cursor:get('mcu', 'global', 'poll_interval') or '5')
+local poll_interval = tonumber(cursor:get('mcu', 'global', 'poll_interval') or '30')
 
 -- speed constant lookup, e.g. 9600 -> termios.B9600
 local speed_const = termios['B' .. tostring(baudrate)]
@@ -167,6 +167,55 @@ local function apply_state(fields)
 	end
 end
 
+-- The MCU asks for a clean shutdown before it cuts power (battery empty or
+-- power button held). Stock unmounts the filesystems and lets the MCU pull
+-- the plug; it does not call poweroff itself.
+local function system_shutdown()
+	log.info('gl-mcu: MCU requested shutdown, unmounting filesystems')
+	os.execute('sync; /etc/init.d/umount stop')
+end
+
+-- Stock's standby mode: the MCU switches it on and off, and the router
+-- turns both Wi-Fi radios and the modem interface off meanwhile. The
+-- previous states are kept so that standby never turns on something the
+-- user had switched off.
+local SAVED = {
+	{ 'wireless', 'radio0', 'disabled', 'ps_radio0' },
+	{ 'wireless', 'radio1', 'disabled', 'ps_radio1' },
+	{ 'network', 'wwan', 'disabled', 'ps_wwan' },
+}
+
+local function power_saving_mode(on)
+	local c = uci.cursor()
+	local active = c:get('mcu', 'global', 'power_saveing') == '1'
+	if on == active then
+		return
+	end
+
+	for _, s in ipairs(SAVED) do
+		local config, section, option, key = s[1], s[2], s[3], s[4]
+		if on then
+			c:set('mcu', 'global', key, c:get(config, section, option) or '0')
+			c:set(config, section, option, '1')
+		else
+			local prev = c:get('mcu', 'global', key)
+			if prev == '1' then
+				c:set(config, section, option, '1')
+			else
+				c:delete(config, section, option)
+			end
+			c:delete('mcu', 'global', key)
+		end
+	end
+	c:set('mcu', 'global', 'power_saveing', on and '1' or '0')
+
+	c:commit('wireless')
+	c:commit('network')
+	c:commit('mcu')
+	log.info('gl-mcu: power saving ' .. (on and 'on' or 'off'))
+	os.execute('/etc/init.d/network reload')
+end
+
 local function handle_data(line)
 	local capacity, temp, chg, cycles = line:match('{OK},(%d+),(%-?[%d%.]+),(%d+),*(%d*)')
 	if capacity then
@@ -185,7 +234,9 @@ local function handle_data(line)
 	end
 
 	local ok, decoded = pcall(cjson.decode, line)
-	if ok and type(decoded) == 'table' then
+	if ok and type(decoded) == 'table' and tostring(decoded.shut_down) == '1' then
+		system_shutdown()
+	elseif ok and type(decoded) == 'table' then
 		apply_state({
 			temperature = tonumber(decoded.temp or decoded.temperature),
 			charge_percent = tonumber(decoded.capacity or decoded.charge_percent),
@@ -202,15 +253,27 @@ end
 
 local receive_buffer = ''
 
+local function handle_markers()
+	if receive_buffer:find('Power_Saving_on', 1, true) then
+		receive_buffer = receive_buffer:gsub('Power_Saving_on', '')
+		power_saving_mode(true)
+	elseif receive_buffer:find('Power_Saving_off', 1, true) then
+		receive_buffer = receive_buffer:gsub('Power_Saving_off', '')
+		power_saving_mode(false)
+	end
+end
+
 local function handle_chunk(chunk)
 	receive_buffer = receive_buffer .. chunk
+	handle_markers()
 	-- eco.reader may return only a few UART bytes per read.  Reassemble a
 	-- complete JSON object before decoding it; the MCU currently delivers
 	-- its 70-byte status response as a series of six-byte fragments.
 	while true do
 		local start_pos = receive_buffer:find('{', 1, true)
 		if not start_pos then
-			receive_buffer = ''
+			-- keep a tail in case a Power_Saving marker is split across reads
+			receive_buffer = receive_buffer:sub(-16)
 			return
 		end
 		if start_pos > 1 then
@@ -239,12 +302,19 @@ local function read_loop()
 		if not reader then
 			time.sleep(1)
 		else
-			-- MCU replies are not newline framed. Match the stock daemon's
-			-- bufio 1024-byte reads and treat timeout as end-of-message.
-			local data, err = reader:read(1024, 1)
+			-- MCU replies are not newline framed; handle_chunk reassembles
+			-- them, so block until bytes arrive instead of waking every second.
+			local data, err = reader:read(1024)
 			if data then
+				-- A 70-byte reply takes ~75 ms at 9600 baud and arrives in
+				-- 6-byte pieces; let it finish instead of waking per piece.
+				if not data:find('}', 1, true) then
+					time.sleep(0.1)
+					local more = reader:read(1024, 0.01)
+					if more then data = data .. more end
+				end
 				handle_chunk(data)
-			elseif err and err ~= 'timeout' then
+			elseif err then
 				log.err('gl-mcu: serial read error: ' .. tostring(err))
 				time.sleep(1)
 			end
@@ -411,6 +481,9 @@ local obj, add_err = con:add('mcu', methods)
 if not obj then
 	error('gl-mcu: ubus add failed: ' .. tostring(add_err))
 end
+
+-- Like stock, a reboot ends standby.
+power_saving_mode(false)
 
 eco.run(read_loop)
 eco.run(poll_loop)

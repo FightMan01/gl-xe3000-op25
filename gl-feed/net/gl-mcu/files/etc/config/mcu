@@ -3,7 +3,7 @@ config global 'global'
 	# hardcoded here rather than auto-detected since the UART path is fixed.
 	option dev '/dev/ttyS1'
 	option baudrate '9600'
-	option poll_interval '5'
+	option poll_interval '30'
 
 config warning 'temp_high'
 	option enable '0'
