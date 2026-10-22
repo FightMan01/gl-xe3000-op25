@@ -4,6 +4,9 @@
 # 3 absent/PUK SIM, 4 unavailable AT, 5 unlock busy or outcome unknown.
 
 TAG=gl-cellular-sim
+
+# Not while upgrade_cellular flashes the modem; 5 = busy, retried later.
+[ -e /var/run/gl-cellular-flashing ] && exit 5
 . /usr/share/libubox/jshn.sh
 
 at() {

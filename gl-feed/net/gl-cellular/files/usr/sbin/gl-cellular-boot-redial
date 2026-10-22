@@ -55,6 +55,8 @@ SYNC_MTU=$(opt sync_mtu 0)
 # modem_hard_reset()). A silent AT port is decisive: no AT-based recovery
 # (AT+CFUN, etc.) can work, and ifdown/ifup cannot reach the firmware.
 AT_DEAD_TICKS=$(opt at_dead_ticks 3)
+# The QMI control node pcie_mhi creates once the modem reaches mission mode.
+QMI_NODE=/dev/mhi_QMI0
 # AT+CFUN power-cycles allowed before falling back to the PCIe/MHI hard
 # reset when the AT port is still answering but the data path never comes
 # back. A modem can wedge its data plane (attached, an address on the
@@ -137,6 +139,7 @@ last_rx=""
 nosignal_logged=0
 nosignal_ticks=0
 at_dead=0
+qmi_missing=0
 reset_count=0
 reset_window_start=0
 last_hard_reset=0
@@ -300,7 +303,14 @@ modem_attached() {
 # a live modem, so an empty reply means the firmware (not just the data
 # session) is unresponsive. This is the signal that AT-based recovery cannot
 # work and the modem needs the PCIe/MHI hard reset.
+#
+# gl-cellular-atd closes and reprobes its port after a silent reply, so a
+# query that lands in that window comes back empty although the modem is
+# fine. One bounded retry keeps a single miss from counting as a hung
+# firmware on this tick; a real hang fails both queries.
 at_alive() {
+	[ -n "$(at_query 'AT')" ] && return 0
+	sleep 2
 	[ -n "$(at_query 'AT')" ]
 }
 
@@ -1144,6 +1154,12 @@ sleep 25
 check_sim_swap
 sync_mtu
 while :; do
+	# upgrade_cellular stops this service before flashing, but a stray
+	# restart must still keep its hands off: no AT, no CFUN, no resets.
+	if [ -e /var/run/gl-cellular-flashing ]; then
+		do_sleep "$CHECK_PERIOD"
+		continue
+	fi
 	# Every tick that was not a confirmed-good one, and every tick of a
 	# re-lock in progress, checks the SIM as before.
 	read -r tick_up _ < /proc/uptime
@@ -1264,6 +1280,24 @@ while :; do
 					do_sleep "$CHECK_PERIOD"
 					continue
 				fi
+			fi
+		fi
+
+		# AT can come back over USB while the PCIe/MHI side stays dead: on
+		# 2026-10-22 the module rebooted itself in the middle of a hard reset
+		# and the MHI probe never left "waiting for READY". quectel-CM then
+		# has no QMI node to open, so redials and CFUN cycles can't help;
+		# only another PCIe reset (budgeted like any other) reaches it.
+		if [ -c "$QMI_NODE" ]; then
+			qmi_missing=0
+		else
+			qmi_missing=$((qmi_missing + 1))
+			logger -p daemon.warning -t "$TAG" \
+				"modem QMI node $QMI_NODE missing ($qmi_missing/$AT_DEAD_TICKS)"
+			if [ "$qmi_missing" -ge "$AT_DEAD_TICKS" ] && modem_hard_reset; then
+				qmi_missing=0
+				do_sleep "$CHECK_PERIOD"
+				continue
 			fi
 		fi
 

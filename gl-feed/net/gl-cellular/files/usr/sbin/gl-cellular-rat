@@ -60,6 +60,9 @@
 TAG=gl-cellular-rat
 STATE=/var/run/gl-cellular-rat.state
 
+# Not while upgrade_cellular flashes the modem.
+[ -e /var/run/gl-cellular-flashing ] && exit 1
+
 opt() {
 	local val
 	val="$(uci -q get gl-cellular.rat.$1)"

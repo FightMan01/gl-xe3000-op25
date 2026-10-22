@@ -17,21 +17,30 @@
 # with a redial or a settings-driven reconnect.
 
 NET_LOCK=/var/run/gl-net-reconfig.lock
+PCI=/sys/bus/pci
+QMI_NODE=/dev/mhi_QMI0
 MODEM_VENDOR=0x17cb
 # RM520N-GL / RM551E-GL MHI functions.
 MODEM_DEVICES="0x0308 0x0309"
 
-pci_dev=""
-for d in /sys/bus/pci/devices/*; do
-	[ -r "$d/vendor" ] || continue
-	[ "$(cat "$d/vendor")" = "$MODEM_VENDOR" ] || continue
-	for dev in $MODEM_DEVICES; do
-		[ "$(cat "$d/device")" = "$dev" ] && pci_dev="${d##*/}"
+find_modem() {
+	pci_dev=""
+	for d in "$PCI"/devices/*; do
+		[ -r "$d/vendor" ] || continue
+		[ "$(cat "$d/vendor")" = "$MODEM_VENDOR" ] || continue
+		for dev in $MODEM_DEVICES; do
+			[ "$(cat "$d/device")" = "$dev" ] && pci_dev="${d##*/}"
+		done
+		[ -n "$pci_dev" ] && break
 	done
-	[ -n "$pci_dev" ] && break
-done
+	[ -n "$pci_dev" ]
+}
 
-[ -n "$pci_dev" ] || {
+# Never while upgrade_cellular is flashing the modem: pulling the PCIe
+# function in the middle of a firmware write is how a modem gets bricked.
+[ -e /var/run/gl-cellular-flashing ] && exit 1
+
+find_modem || {
 	echo "gl-cellular-modem-reset: modem PCI function not found" >&2
 	exit 1
 }
@@ -52,6 +61,32 @@ restore_wwan() {
 		ifup wwan >/dev/null 2>&1
 }
 
+# One remove/rescan, then wait for the QMI control node to reappear.  The
+# remove runs in a child that does not hold the network lock: if the probe it
+# has to tear down is itself stuck, the write can block in the kernel, and that
+# must cost this script a timeout rather than hang the watchdog and every
+# redial queued behind the lock.
+cycle_function() {
+	( exec 9>&-; echo 1 > "$PCI/devices/$pci_dev/remove" ) &
+	rm_pid=$!
+	t=0
+	while kill -0 "$rm_pid" 2>/dev/null; do
+		t=$((t + 1))
+		[ "$t" -ge 20 ] && return 2
+		sleep 1
+	done
+	wait "$rm_pid" || return 2
+	sleep 2
+	echo 1 > "$PCI/rescan" || return 2
+	t=0
+	while [ "$t" -lt 40 ]; do
+		[ -c "$QMI_NODE" ] && return 0
+		t=$((t + 1))
+		sleep 1
+	done
+	return 1
+}
+
 [ "$(uci -q get network.wwan.auto)" != 0 ] || exit 1
 [ "$(uci -q get network.wwan.disabled)" != 1 ] || exit 1
 [ "$(uci -q get gl-cellular.state.dial_enabled)" != 0 ] || exit 1
@@ -62,26 +97,21 @@ logger -p daemon.err -t gl-cellular-wwan-watchdog \
 
 ifdown wwan >/dev/null 2>&1 || exit 1
 
-if ! echo 1 > "/sys/bus/pci/devices/$pci_dev/remove"; then
-	restore_wwan
-	exit 1
+cycle_function
+rc=$?
+if [ "$rc" -eq 1 ] && find_modem; then
+	# The function came back but the modem never reached mission mode.  On
+	# 2026-10-22 the module rebooted itself seconds into the reset (it dropped
+	# off USB and re-enumerated) and the new MHI probe waited for READY from a
+	# device that had restarted underneath it.  By now that reboot is over, and
+	# a second remove/rescan of an idle module is the reset that has always
+	# worked.
+	logger -p daemon.err -t gl-cellular-wwan-watchdog \
+		"modem did not come back on PCIe/MHI; resetting $pci_dev once more"
+	cycle_function
+	rc=$?
 fi
-sleep 2
-if ! echo 1 > /sys/bus/pci/rescan; then
-	restore_wwan
-	exit 1
-fi
-
-# Wait for the QMI control node to reappear, then give the firmware a few
-# more seconds to finish booting before netifd starts quectel-CM.  The qcm
-# proto and quectel-CM retry on their own if we are still early.
-tries=0
-while [ "$tries" -lt 40 ]; do
-	[ -c /dev/mhi_QMI0 ] && break
-	tries=$((tries + 1))
-	sleep 1
-done
-[ -c /dev/mhi_QMI0 ] || { restore_wwan; exit 1; }
+[ "$rc" -eq 0 ] || { restore_wwan; exit 1; }
 sleep 10
 
 # The rescan re-probes the driver, which may re-enable runtime PM; re-apply the

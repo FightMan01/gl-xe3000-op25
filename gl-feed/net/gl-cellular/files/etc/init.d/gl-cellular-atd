@@ -5,6 +5,9 @@ STOP=90
 USE_PROCD=1
 
 start_service() {
+	# Not while upgrade_cellular flashes the modem (the tty hotplug restarts us
+	# whenever the modem re-enumerates, which it does mid-flash).
+	[ -e /var/run/gl-cellular-flashing ] && return 0
 	# Either AT channel will do: the PCIe one stock uses, or the USB port.
 	[ -c /dev/mhi_DUN ] || [ -c "$(uci -q get gl-cellular.atport.dev)" ] || return 0
 	procd_open_instance

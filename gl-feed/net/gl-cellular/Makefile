@@ -15,7 +15,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=gl-cellular
 PKG_VERSION:=1
-PKG_RELEASE:=35
+PKG_RELEASE:=36
 
 PKG_LICENSE:=GPL-2.0-or-later
 

@@ -286,6 +286,78 @@ MODEM_RESET_REBOOT=0; RELOCK_QUIET=120; GRACE_SEC=30
             r=subprocess.run(['/bin/sh','-c',setup+f+body],capture_output=True,text=True,timeout=5)
             self.assertEqual(r.stdout.strip(),expected,r.stderr)
 
+    def modem_reset(self, ok_after, remove='echo 1 > "$PCI/devices/$pci_dev/remove"'):
+        # Fake sysfs; the QMI node appears after the ok_after-th rescan (0 = never).
+        pci=self.root/'pci'; dev=pci/'devices/0000:01:00.0'; dev.mkdir(parents=True)
+        (dev/'vendor').write_text('0x17cb\n'); (dev/'device').write_text('0x0308\n')
+        self.write_state()
+        s=(S/'gl-cellular-modem-reset').read_text()
+        s=s.replace('PCI=/sys/bus/pci',f'PCI={pci}').replace('/dev/mhi_QMI0',str(self.root/'qmi'))
+        s=s.replace('/var/run/gl-net-reconfig.lock',str(self.root/'net.lock'))
+        s=s.replace('[ -c "$QMI_NODE" ]','[ -e "$QMI_NODE" ]').replace('/usr/sbin/gl-cellular-pcie-pm',':')
+        s=s.replace('echo 1 > "$PCI/devices/$pci_dev/remove"',remove)
+        s=s.replace('echo 1 > "$PCI/rescan"','rescan')
+        prefix=f"""
+ifdown() {{ echo IFDOWN >> {self.root}/ops; }}
+ifup() {{ echo IFUP >> {self.root}/ops; }}
+rescan() {{ echo RESCAN >> {self.root}/ops; n=$(grep -c RESCAN {self.root}/ops); [ {ok_after} -gt 0 ] && [ "$n" -ge {ok_after} ] && : > "$QMI_NODE"; return 0; }}
+"""
+        s=s.replace('\nfind_modem() {',prefix+'\nfind_modem() {',1)
+        (self.root/'reset').write_text(s)
+        r=subprocess.run(['/bin/sh',str(self.root/'reset')],env=self.env,capture_output=True,text=True,timeout=30)
+        ops=(self.root/'ops').read_text().split() if (self.root/'ops').exists() else []
+        return r.returncode, ops
+
+    def test_modem_reset_first_round(self):
+        self.assertEqual(self.modem_reset(1),(0,['IFDOWN','RESCAN','IFUP']))
+
+    def test_modem_reset_retries_once_when_mhi_stays_down(self):
+        self.assertEqual(self.modem_reset(2),(0,['IFDOWN','RESCAN','RESCAN','IFUP']))
+
+    def test_modem_reset_gives_up_after_two_rounds(self):
+        self.assertEqual(self.modem_reset(0),(1,['IFDOWN','RESCAN','RESCAN','IFUP']))
+
+    def test_modem_reset_stuck_remove_times_out(self):
+        rc,ops=self.modem_reset(1,remove='/bin/sleep 2')
+        self.assertEqual((rc,ops),(1,['IFDOWN','IFUP']))
+
+    def test_watchdog_resets_when_qmi_node_missing(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        start=s.index('\t\t# AT can come back over USB')
+        block=s[start:s.index('\n\t\tfi\n',s.index('qmi_missing=$((qmi_missing + 1))'))+5].replace('-c "$QMI_NODE"','-e "$QMI_NODE"')
+        code=f"""
+logger() {{ :; }}; do_sleep() {{ :; }}
+modem_hard_reset() {{ echo RESET; : > "$QMI_NODE"; return 0; }}
+QMI_NODE={self.root}/qmi; AT_DEAD_TICKS=3; CHECK_PERIOD=10; qmi_missing=0
+for tick in 1 2 3 4; do
+{block}
+echo "tick $tick $qmi_missing"
+done
+"""
+        r=subprocess.run(['/bin/sh','-c',code],capture_output=True,text=True,timeout=5)
+        self.assertEqual([l for l in r.stdout.splitlines()],['tick 1 1','tick 2 2','RESET','tick 4 0'],r.stderr)
+
+    def test_flashing_flag_blocks_every_modem_entry_point(self):
+        flag=self.root/'flashing'; flag.write_text('1\n')
+        # Any of these reaching the modem would show up as a call to a mocked tool.
+        trap='\n'.join(f'{t}() {{ echo CALLED-{t}; }}' for t in ('ifdown','ifup','ubus','logger','flock','uci'))
+        cases={'gl-cellular-modem-reset':1,'gl-cellular-wwan-reconnect':1,'gl-cellular-sim-unlock':5,'gl-cellular-rat':1}
+        for name,rc in cases.items():
+            s=(S/name).read_text().replace('/var/run/gl-cellular-flashing',str(flag)).replace('. /usr/share/libubox/jshn.sh','')
+            r=subprocess.run(['/bin/sh','-c',trap+'\n'+s],capture_output=True,text=True,timeout=10)
+            self.assertEqual((r.returncode,'CALLED' in r.stdout),(rc,False),name+r.stdout+r.stderr)
+        s=(S/'gl-cellular-mhi-reset').read_text().replace('/var/run/gl-cellular-flashing',str(flag))
+        s=s.replace('reset) cmd_reset ;;','x) ;;').replace('cmd_reset ;;','echo RESET ;;').replace('tune)  cmd_tune ;;','tune) echo TUNE ;;')
+        for arg,out,rc in (('reset','',1),('tune','TUNE',0)):
+            r=subprocess.run(['/bin/sh','-c',s,'mhi',arg],capture_output=True,text=True,timeout=10)
+            self.assertEqual((r.stdout.strip(),r.returncode),(out,rc),arg+r.stderr)
+        q=(PACKAGE/'files/lib/netifd/proto/qcm.sh').read_text()
+        guard=q[q.index('\tif [ -e /var/run/gl-cellular-flashing ]'):q.index('\tdevice="${device:-/dev/mhi_QMI0}"')]
+        code=('proto_notify_error() { echo "$2"; }; proto_block_restart() { echo BLOCK; }; setup() {\n'
+              +guard.replace('/var/run/gl-cellular-flashing',str(flag))+'\necho STARTED\n}; setup')
+        r=subprocess.run(['/bin/sh','-c',code],capture_output=True,text=True,timeout=5)
+        self.assertEqual((r.stdout.split(),r.returncode),(['MODEM_FLASHING','BLOCK'],1))
+
     def test_unknown_pending_blocks_normal_reset_ladder(self):
         self.state['network.wwan.pin_pending']='1'
         self.write_state()
@@ -324,6 +396,84 @@ modem_hard_reset() { echo RESET; }
         r=subprocess.run(['/bin/sh','-c',code],capture_output=True,text=True,timeout=5)
         self.assertEqual(r.stdout.strip(),'PIN_PENDING')
         self.assertEqual(r.returncode,1)
+
+    def test_qcm_syncs_initial_attach_profile_only_when_different(self):
+        s=(PACKAGE/'files/lib/netifd/proto/qcm.sh').read_text()
+        fns=function(s,'_qcm_at_ip_type')+'\n'+function(s,'_qcm_sync_attach_profile')
+        # The gate that blocked A03: profile 1 held the MBN's DT APN, so the
+        # attach failed before quectel-CM could ever rewrite it.
+        diff='+CGDCONT: 1,"IPV4V6","internet.v6.telekom","0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0",0'
+        same='+CGDCONT: 1,"IP","internet.telekom","0.0.0.0",0'
+        cases=[(same,'internet.telekom','ipv4',[]),
+               (diff,'internet.telekom','ipv4',['AT+CGDCONT=1,"IP","internet.telekom"']),
+               (same,'internet.telekom','ipv4v6',['AT+CGDCONT=1,"IPV4V6","internet.telekom"']),
+               (diff,'internet.telekom','ipv6',['AT+CGDCONT=1,"IPV6","internet.telekom"']),
+               (diff,'internet.telekom','',['AT+CGDCONT=1,"IPV4V6","internet.telekom"']),
+               (diff,'data.example.com','ipv4v6',['AT+CGDCONT=1,"IPV4V6","data.example.com"']),
+               ('+CGDCONT: 2,"IPV4V6","ims",0','internet.telekom','ipv4',['AT+CGDCONT=1,"IP","internet.telekom"']),
+               (diff,'','ipv4',[]),
+               ('','internet.telekom','ipv4',[])]
+        mock='''_qcm_at() { case "$1" in
+'AT+CGDCONT?') cat "$CASE_DIR/cgdcont" ;;
+'AT+CGDCONT='*) printf '%s\\n' "$1" >> "$CASE_DIR/writes"; echo OK ;;
+esac; }
+logger() { :; }
+'''
+        for line,apn,pdp,want in cases:
+            with self.subTest(apn=apn,pdp=pdp,line=line):
+                (self.root/'cgdcont').write_text(line+'\n' if line else '')
+                (self.root/'writes').unlink(missing_ok=True)
+                code=mock+fns+'\n_qcm_sync_attach_profile "$1" "$2"'
+                r=subprocess.run(['/bin/sh','-c',code,'sh',apn,pdp],env=self.env,capture_output=True,text=True,timeout=5)
+                self.assertEqual(r.returncode,0,r.stderr)
+                got=(self.root/'writes').read_text().splitlines() if (self.root/'writes').exists() else []
+                self.assertEqual(got,want)
+
+    def test_qcm_sync_failure_is_reported_not_fatal(self):
+        s=(PACKAGE/'files/lib/netifd/proto/qcm.sh').read_text()
+        fns=function(s,'_qcm_at_ip_type')+'\n'+function(s,'_qcm_sync_attach_profile')
+        code='''_qcm_at() { case "$1" in
+'AT+CGDCONT?') echo '+CGDCONT: 1,"IPV4V6","internet.v6.telekom",0' ;;
+*) echo ERROR ;;
+esac; }
+logger() { :; }
+'''+fns+'\n_qcm_sync_attach_profile internet.telekom ipv4'
+        r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=5)
+        self.assertEqual(r.returncode,1)
+
+    def test_qcm_sync_rejects_an_apn_that_would_break_the_at_command(self):
+        s=(PACKAGE/'files/lib/netifd/proto/qcm.sh').read_text()
+        fns=function(s,'_qcm_at_ip_type')+'\n'+function(s,'_qcm_sync_attach_profile')
+        code='''_qcm_at() { echo CALLED >> "$CASE_DIR/writes"; }
+logger() { :; }
+'''+fns+'\n_qcm_sync_attach_profile "$1" "$2"; echo "rc=$?"'
+        for apn in ('bad"apn','bad,apn','bad apn'):
+            with self.subTest(apn=apn):
+                (self.root/'writes').unlink(missing_ok=True)
+                r=subprocess.run(['/bin/sh','-c',code,'sh',apn,'ipv4'],env=self.env,capture_output=True,text=True,timeout=5)
+                self.assertEqual(r.returncode,0,r.stderr)
+                self.assertEqual(r.stdout.strip(),'rc=1',r.stderr)
+                self.assertFalse((self.root/'writes').exists())
+
+    def test_qcm_sync_runs_before_attach_gate_and_pdp_sweep(self):
+        s=(PACKAGE/'files/lib/netifd/proto/qcm.sh').read_text()
+        sync=s.index('_qcm_sync_attach_profile "$apn" "$pdptype"')
+        self.assertLess(sync,s.index('not attached after'))
+        self.assertLess(sync,s.index('_qcm_deactivate_pdp "$apn" "$pdptype"'))
+
+    def test_watchdog_at_alive_retries_once_but_still_detects_a_hang(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        f=function(s,'at_alive')
+        code='''at_query() { [ -e "$CASE_DIR/second" ] && echo OK; : > "$CASE_DIR/second"; }
+sleep() { :; }
+'''+f+'''
+rm -f "$CASE_DIR/second"
+at_alive; echo "retry=$?"
+at_query() { :; }
+at_alive; echo "dead=$?"
+'''
+        r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=5)
+        self.assertEqual(r.stdout.split(),['retry=0','dead=1'],r.stderr)
 
 
 if __name__ == '__main__':

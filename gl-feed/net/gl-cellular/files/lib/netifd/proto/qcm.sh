@@ -100,6 +100,15 @@ proto_qcm_setup() {
 	local $PROTO_DEFAULT_OPTIONS
 	json_get_vars device ifname apn pincode auth username password pdptype ipv6 mtu $PROTO_DEFAULT_OPTIONS
 
+	# upgrade_cellular is flashing the modem: an ifup from a network reload,
+	# the UI or gl-wan-health must not start QMI and AT traffic (or a SIM
+	# unlock) against a modem in the middle of a firmware write.
+	if [ -e /var/run/gl-cellular-flashing ]; then
+		proto_notify_error "$interface" MODEM_FLASHING
+		proto_block_restart "$interface"
+		return 1
+	fi
+
 	device="${device:-/dev/mhi_QMI0}"
 	ifname="${ifname:-rmnet_mhi0}"
 	local qmapnet="${ifname}.1"
@@ -224,6 +233,49 @@ _qcm_at_ip_type() {
 	esac
 }
 
+# The initial EPS attach always uses context 1, whatever APN quectel-CM later
+# passes to StartNetwork. An MBN auto-selection can rewrite profile 1 to an
+# operator-variant APN (A03: Commercial-DT-VOLTE sets internet.v6.telekom on a
+# Telekom HU SIM), the network rejects the attach with ESM cause 27, and the
+# attach gate below never lets quectel-CM run - so the one place that would
+# have corrected the profile is never reached. Sync it here first, and only
+# when it differs: an ordinary dial must not write NV.
+#
+# Everything comes from network.wwan.apn / pdptype, so this is not tied to one
+# operator. An empty pdptype means "both" on the dial path (no -4/-6 choice);
+# the profile must follow that too, not stay on a stale IPV4V6 value. If the
+# modem has no context 1 at all, create it; the initial attach needs one.
+# _qcm_sync_attach_profile <apn> <pdptype>
+_qcm_sync_attach_profile() {
+	local want_apn="$1" want_type resp cur_line cur_type cur_apn
+	[ -n "$want_apn" ] || return 0
+	case "$want_apn" in
+	*'"'*|*,*|*' '*)
+		logger -p daemon.err -t gl-cellular \
+			"APN '$want_apn' contains characters that cannot be written to the modem profile"
+		return 1
+		;;
+	esac
+	want_type="$(_qcm_at_ip_type "$2")"
+	[ -n "$want_type" ] || want_type="IPV4V6"
+	resp="$(_qcm_at 'AT+CGDCONT?')"
+	case "$resp" in
+	""|*ERROR*) return 0 ;;
+	esac
+	cur_line="$(printf '%s\n' "$resp" | tr -d '\r' | grep '^+CGDCONT: *1,' | head -n1)"
+	cur_type="$(printf '%s' "$cur_line" | cut -d'"' -f2)"
+	cur_apn="$(printf '%s' "$cur_line" | cut -d'"' -f4)"
+	[ "$cur_apn" = "$want_apn" ] && [ "$cur_type" = "$want_type" ] && return 0
+	logger -p daemon.warn -t gl-cellular \
+		"initial attach profile 1 is ${cur_type:-none}/${cur_apn:-none}; setting $want_type/$want_apn"
+	case "$(_qcm_at "AT+CGDCONT=1,\"$want_type\",\"$want_apn\"")" in
+	*OK*) return 0 ;;
+	esac
+	logger -p daemon.err -t gl-cellular \
+		"could not set the initial attach profile to $want_type/$want_apn"
+	return 1
+}
+
 # _qcm_deactivate_pdp <apn> <lower-cased pdptype> [tries]
 _qcm_deactivate_pdp() {
 	local want_apn="$1" want_type cids cid active failed=0 tries="${3:-3}"
@@ -299,6 +351,21 @@ _qcm_reattach() {
 	return 1
 }
 
+# Effective PDP type for this setup. The dial path and the attach-profile sync
+# must agree, or the modem would attach with one type and dial with another.
+local pdp="-4 -6"
+[ ! -e /proc/sys/net/ipv6 ] && ipv6=0
+pdptype=$(echo "$pdptype" | awk '{print tolower($0)}')
+[ "$ipv6" = 0 ] && pdptype="ipv4"
+case "$pdptype" in
+	ipv4|ip) pdp="-4" ;;
+	ipv6) pdp="-6" ;;
+esac
+
+# Correct the initial-attach profile before the attach gate (and before the
+# stale-PDP sweep, so a context 1 that now matches our APN is found by it).
+_qcm_sync_attach_profile "$apn" "$pdptype"
+
 # quectel-CM leaves its marker when the call was refused for a PDN that
 # already exists (ESM cause 55) or the modem throttles the request (209/211);
 # redialling as-is can never succeed.
@@ -361,15 +428,6 @@ case "$pcie_mbim" in
 		esac
 		;;
 esac
-
-local pdp="-4 -6"
-	[ ! -e /proc/sys/net/ipv6 ] && ipv6=0
-	pdptype=$(echo "$pdptype" | awk '{print tolower($0)}')
-	[ "$ipv6" = 0 ] && pdptype="ipv4"
-	case "$pdptype" in
-		ipv4) pdp="-4" ;;
-		ipv6) pdp="-6" ;;
-	esac
 
 	case "$auth" in
 		pap|PAP) auth=1 ;;

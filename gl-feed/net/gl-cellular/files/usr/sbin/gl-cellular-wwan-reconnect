@@ -21,6 +21,9 @@
 # working traffic happened.
 
 NET_LOCK=/var/run/gl-net-reconfig.lock
+
+# Not while upgrade_cellular flashes the modem.
+[ -e /var/run/gl-cellular-flashing ] && exit 1
 MAX_WAIT_SEC=20
 
 # This BusyBox's flock has no -w (timeout): only -s/-x/-u/-n. Poll -n in

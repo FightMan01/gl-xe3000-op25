@@ -46,14 +46,27 @@ status_upgrade_ok=9       # 9:upgrade_ok
 [ -e $upgrade_cellular_tmp ] || mkdir $upgrade_cellular_tmp
 exec > $upgrade_log 2>&1 ;set -x
 
+# Raised before anything is stopped and kept for the whole write. Every
+# gl-cellular entry point that could reach the modem (watchdog, PCIe/MHI
+# resets, the qcm proto on any ifup or network reload, the AT daemon and
+# its hotplug restart, the tracer, sim-unlock, RAT changes) refuses while it
+# exists. It lives in /var/run, so only a reboot - which ends any flash
+# anyway - clears it without us; if this script dies mid-flash the modem
+# stays left alone rather than reset under QFirehose.
+FLASHING=/var/run/gl-cellular-flashing
+
 cellular_stack_stop() {
+    echo $$ > $FLASHING
     /etc/init.d/gl-cellular-boot-redial stop
+    /etc/init.d/gl-cellular-relock-trace stop
     ifdown wwan
     /etc/init.d/gl-cellular-atd stop
     sleep 2
 }
 
 cellular_stack_start() {
+    rm -f $FLASHING
+    /etc/init.d/gl-cellular-relock-trace start
     /etc/init.d/gl-cellular-atd start
     /etc/init.d/gl-cellular-boot-redial start
     ifup wwan
@@ -77,6 +90,16 @@ check_timeout() {
             break
         fi
     done
+}
+
+# A flash that loses power half-way leaves the modem in EDL at best. Refuse
+# on a low battery; when the MCU reports no level, don't block.
+battery_ok() {
+    pct=$(ubus call mcu status 2>/dev/null | jsonfilter -e '@.charge_percent' 2>/dev/null)
+    case "$pct" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    [ "$pct" -ge 50 ]
 }
 
 firmware_url=$1
@@ -131,6 +154,12 @@ if [[ $firmware_url != "local" ]]; then
         rm -f $firmware_zip_path
         sync
     fi
+fi
+
+if ! battery_ok; then
+    echo "battery below 50%; connect the charger before flashing the modem"
+    echo $status_upgrade_failed >$upgrade_status_path
+    exit 1
 fi
 
 if [[ "$upgrade_type" = "diff" ]]; then
