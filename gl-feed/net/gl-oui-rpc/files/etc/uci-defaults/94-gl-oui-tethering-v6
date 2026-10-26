@@ -50,8 +50,6 @@ fi
 		set mwan3.tethering6.recovery_interval='10'
 		set mwan3.tethering6.down='3'
 		set mwan3.tethering6.up='3'
-		set mwan3.tethering6.flush_conntrack='ifup'
-		add_list mwan3.tethering6.flush_conntrack='ifdown'
 	EOT
 }
 

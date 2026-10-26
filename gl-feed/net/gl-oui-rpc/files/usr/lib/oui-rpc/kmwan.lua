@@ -193,11 +193,11 @@ local function apply_member_tracking(cursor, m)
 	cursor:set("mwan3", m.real, "family", (t.track_proto == 1) and "ipv6" or "ipv4")
 	set_list(cursor, "mwan3", m.real, "track_ip", active)
 
-	-- mwan3 only flushes conntrack on an interface transition if the
-	-- interface has a flush_conntrack list containing that action. Without
-	-- it, failover leaves every established flow bound to the old (dead)
-	-- WAN forever. Keep it configured on every managed interface.
-	cursor:set("mwan3", m.real, "flush_conntrack", { "ifup", "ifdown" })
+	-- No flush_conntrack here: in mwan3 that list flushes the whole table on
+	-- the listed transitions, cutting every flow on the healthy uplinks too.
+	-- mwan3 already drops only the failed member's flows (by mark) on ifdown
+	-- and on a tracker disconnect, which is all failover needs.
+	-- 94-gl-oui-kmwan-conntrack removes the list older builds set here.
 
 	if not t.enable_check then
 		return

@@ -1,0 +1,38 @@
+#!/bin/sh
+# Older builds seeded flush_conntrack ifup+ifdown on every multi-WAN member
+# (94-gl-oui-kmwan, 94-gl-oui-kmwan-v6, 94-gl-oui-tethering-v6), and kmwan.lua
+# wrote it again on every Multi-WAN save. In mwan3 that list means
+# `echo f > /proc/net/nf_conntrack`: the whole table, every flow on every
+# uplink and the LAN. A cellular redial or a repeater drop therefore also cut
+# every established connection running over a healthy wan. mwan3 already
+# flushes only the failed member's flows (by its mark) on ifdown and on a
+# tracker disconnect, which is what failover needs.
+#
+# Remove the list only where it is still exactly that old default; a member
+# the user set up differently keeps its value. Idempotent.
+
+. /lib/functions.sh
+
+gl_kmwan_conntrack_default() {
+	local iface="$1" value v ifup=0 ifdown=0 other=0
+
+	config_get value "$iface" flush_conntrack
+	[ -n "$value" ] || return 0
+	for v in $value; do
+		case "$v" in
+			ifup) ifup=$((ifup + 1)) ;;
+			ifdown) ifdown=$((ifdown + 1)) ;;
+			*) other=1 ;;
+		esac
+	done
+	[ "$ifup" = 1 ] && [ "$ifdown" = 1 ] && [ "$other" = 0 ] || return 0
+	uci -q delete "mwan3.$iface.flush_conntrack"
+}
+
+config_load mwan3
+for iface in wan wwan_4 wwan_6 repeater tethering tethering6; do
+	gl_kmwan_conntrack_default "$iface"
+done
+uci -q commit mwan3
+
+exit 0
