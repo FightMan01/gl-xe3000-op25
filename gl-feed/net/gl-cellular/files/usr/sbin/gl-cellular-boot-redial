@@ -121,6 +121,14 @@ MODEM_RESET_BACKOFF=$(opt modem_reset_backoff_sec 900)
 # happen. 0 restores the plain ladder.
 DEAD_PLANE_TICKS=$(opt dead_plane_ticks 3)
 dead_plane_ticks=0
+# One AT+CFUN=4/1 before that reset, when the CFUN cooldown allows: it costs
+# about half a minute and keeps the PCIe function up, and the forums report it
+# clearing a stuck stack in 10-15 s. Not yet seen to fix this signature here
+# (the 2026-10-11 and 2026-10-18 events only ever cleared with the reset), so
+# if the plane is still dead DEAD_PLANE_TICKS later, the reset follows. Once
+# per episode; a confirmed-good tick re-arms it. 0 = straight to the reset.
+DEAD_PLANE_CFUN=$(opt dead_plane_cfun 1)
+dead_plane_cfun=0
 # Attach lost while the SIM reads READY and the radio is on (AT+CGATT: 0,
 # +CPIN: READY, +CFUN: 1) for this long: power-cycle the radio once. The radio
 # stack can stay stuck in that state with CSQ 99,99 and CEREG 0,0 until
@@ -291,6 +299,7 @@ reset_state() {
 	last_rx=""
 	nosignal_ticks=0
 	dead_plane_ticks=0
+	dead_plane_cfun=0
 	attach_lost_since=0
 }
 
@@ -985,6 +994,25 @@ escalate() {
 	fi
 }
 
+# DEAD_PLANE_TICKS reached: the radio power-cycle once per episode, if the
+# CFUN cooldown allows, otherwise (and on the next episode tick) the hard reset.
+# Returns modem_hard_reset's status, or 0 after a CFUN cycle.
+dead_plane_recover() {
+	local now
+	now="$(date +%s)"
+	if [ "$DEAD_PLANE_CFUN" = 1 ] && [ "$dead_plane_cfun" -eq 0 ] &&
+		[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ]; then
+		dead_plane_cfun=1
+		logger -p daemon.err -t "$TAG" \
+			"dead data plane for $DEAD_PLANE_TICKS ticks; power-cycling the radio before a hard reset"
+		do_cfun_cycle "dead data plane for $DEAD_PLANE_TICKS ticks"
+		return 0
+	fi
+	logger -p daemon.err -t "$TAG" \
+		"dead data plane for $DEAD_PLANE_TICKS ticks; skipping the ladder and hard-resetting the modem"
+	modem_hard_reset
+}
+
 # Runs on every no-attach tick; see ATTACH_LOST_CFUN. The clock starts at the
 # first such tick with the SIM READY and restarts whenever the SIM is not, so a
 # re-lock or a PIN entry never counts towards it. AT+CFUN? is only asked once
@@ -1437,9 +1465,7 @@ while :; do
 						"dead data plane: attached, call up, lease held, no traffic ($dead_plane_ticks/$DEAD_PLANE_TICKS)"
 					if [ "$dead_plane_ticks" -ge "$DEAD_PLANE_TICKS" ]; then
 						dead_plane_ticks=0
-						logger -p daemon.err -t "$TAG" \
-							"dead data plane for $DEAD_PLANE_TICKS ticks; skipping the ladder and hard-resetting the modem"
-						if modem_hard_reset; then
+						if dead_plane_recover; then
 							do_sleep "$CHECK_PERIOD"
 							continue
 						fi
@@ -1463,7 +1489,7 @@ while :; do
 		# That made the radio power-cycle escalation effectively
 		# unreachable via this path - only the grace-timeout fast path in
 		# the main loop could ever trigger it.
-		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; reset_count=0; dead_plane_ticks=0; attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0; }
+		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; reset_count=0; dead_plane_ticks=0; dead_plane_cfun=0; attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0; }
 		# Deliberately outside the guard above: a confirmed-good tick is
 		# exactly what should start (and then satisfy) the fallback hold
 		# window, so lte_fallback_since survives the counter reset that

@@ -51,6 +51,10 @@ config watchdog 'watchdog'
 	# tick. A stuck radio stack and a dead zone look the same otherwise.
 	# 0 = off.
 	option attach_lost_cfun_sec '600'
+	# Dead data plane (attached, call up, lease held, nothing passes): one
+	# AT+CFUN=4 -> 1 before the PCIe/MHI reset, once per episode. 0 = go
+	# straight to the reset.
+	option dead_plane_cfun '1'
 	# Recover a hung modem firmware: after this many consecutive bad ticks
 	# with a silent AT port, reset the modem through its PCIe/MHI function
 	# (gl-cellular-modem-reset). A silent AT port means no AT-based recovery

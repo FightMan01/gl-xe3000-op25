@@ -572,5 +572,47 @@ echo "wait $attach_lost_wait cycles $attach_lost_cycles"
         self.assertNotIn('attach_lost_wait',function(s,'reset_state'))
 
 
+    def dead_plane(self, calls, cfun_on='1', last_cfun='0', cooldown='1800'):
+        # dead_plane_recover called `calls` times on a fixed clock, with the
+        # CFUN cycle and the hard reset stubbed; prints what each call did.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        code=f"""
+logger() {{ :; }}
+date() {{ echo 100000; }}
+do_cfun_cycle() {{ echo "CFUN $1"; last_cfun=100000; }}
+modem_hard_reset() {{ echo RESET; return 0; }}
+DEAD_PLANE_TICKS=3; DEAD_PLANE_CFUN={cfun_on}; dead_plane_cfun=0
+CFUN_COOLDOWN={cooldown}; last_cfun={last_cfun}
+{function(s,'dead_plane_recover')}
+for i in $(seq 1 {calls}); do dead_plane_recover; echo "rc=$?"; done
+"""
+        r=subprocess.run(['/bin/sh','-c',code],capture_output=True,text=True,timeout=5)
+        self.assertEqual(r.returncode,0,r.stderr)
+        return r.stdout.splitlines()
+
+    def test_dead_plane_tries_one_cfun_cycle_before_the_hard_reset(self):
+        # No cooldown at all: it is the once-per-episode flag that moves on.
+        self.assertEqual(self.dead_plane(3,cooldown='0'),
+            ['CFUN dead data plane for 3 ticks','rc=0','RESET','rc=0','RESET','rc=0'])
+
+    def test_dead_plane_goes_straight_to_the_reset_inside_the_cfun_cooldown(self):
+        self.assertEqual(self.dead_plane(1,last_cfun='99000'),['RESET','rc=0'])
+
+    def test_dead_plane_cfun_rung_can_be_switched_off(self):
+        self.assertEqual(self.dead_plane(1,cfun_on='0'),['RESET','rc=0'])
+
+    def test_dead_plane_rung_is_wired_and_rearmed_on_a_good_tick_only(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        block=s[s.index('if [ "$dead_plane_ticks" -ge "$DEAD_PLANE_TICKS" ]; then'):]
+        block=block[:block.index('\t\t\t\t\tfi\n')]
+        self.assertIn('if dead_plane_recover; then',block)
+        self.assertNotIn('modem_hard_reset',block)
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('dead_plane_cfun=0;',good)
+        # A successful hard reset or redial does not re-arm it.
+        self.assertNotIn('dead_plane_cfun',function(s,'modem_hard_reset'))
+        self.assertNotIn('dead_plane_cfun',function(s,'do_redial'))
+
+
 if __name__ == '__main__':
     unittest.main()
