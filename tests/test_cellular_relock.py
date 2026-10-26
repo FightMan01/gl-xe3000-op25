@@ -614,5 +614,56 @@ for i in $(seq 1 {calls}); do dead_plane_recover; echo "rc=$?"; done
         self.assertNotIn('dead_plane_cfun',function(s,'do_redial'))
 
 
+    def detach_log(self, events, shell='/bin/sh'):
+        # events: ("lost"|"back", t). Runs the real detach_note and
+        # attach_returned on a fake clock; returns the lines detach_note logs.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        body=''.join(f'echo {t} > {self.root}/now; ' + ('detach_note; nosignal_logged=1\n' if e=='lost' else 'attach_returned\n')
+                     for e,t in events)
+        code=f"""
+logger() {{ shift 2; echo "$*"; }}
+date() {{ cat {self.root}/now; }}
+TAG=t; detach_times=""; detach_gaps=""; attached_at=0; nosignal_logged=0
+{function(s,'detach_note')}
+{function(s,'attach_returned')}
+{body}"""
+        r=subprocess.run([shell,'-c',code],capture_output=True,text=True,timeout=10)
+        self.assertEqual(r.returncode,0,r.stderr)
+        return r.stdout.splitlines()
+
+    def test_detach_note_shows_a_periodic_cycle(self):
+        # A modem that detaches 30 min after every re-attach, as in GL forum 69888.
+        ev=[('lost',1000)]
+        for k in range(1,5):
+            ev+= [('back',1000+k*1860-1800),('lost',1000+k*1860)]
+        out=self.detach_log(ev)
+        self.assertEqual(out[0],'attach lost: 1 in the last hour; attached ?s before this one; median attach time ?s over the last 0')
+        self.assertEqual(out[-1],'attach lost: 2 in the last hour; attached 1800s before this one; median attach time 1800s over the last 4')
+
+    def test_detach_note_median_and_hour_window(self):
+        out=self.detach_log([('lost',0),('back',10),('lost',70),('back',80),('lost',580),('back',600),('lost',4200)])
+        # gaps 60, 500, 3600 (an even count takes the lower middle); at t=4200
+        # only 4200 itself is inside the hour
+        self.assertEqual(out[1],'attach lost: 2 in the last hour; attached 60s before this one; median attach time 60s over the last 1')
+        self.assertEqual(out[2],'attach lost: 3 in the last hour; attached 500s before this one; median attach time 60s over the last 2')
+        self.assertEqual(out[3],'attach lost: 1 in the last hour; attached 3600s before this one; median attach time 500s over the last 3')
+
+    def test_detach_note_keeps_the_last_ten_gaps(self):
+        ev=[('lost',0)]; t=0
+        for k in range(12):
+            ev+=[('back',t+1),('lost',t+1+(k+1)*10)]; t=t+1+(k+1)*10
+        out=self.detach_log(ev)
+        self.assertTrue(out[-1].endswith('over the last 10'),out[-1])
+
+    def test_attach_return_is_noticed_on_a_good_tick_too(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('attach_returned',good)
+        nosig=s[s.index('if [ "$nosignal_logged" -eq 0 ]; then'):]
+        self.assertLess(nosig.index('detach_note'),nosig.index('nosignal_logged=1'))
+        # attach_returned is the only thing that clears the episode flag now.
+        self.assertEqual(s.count('nosignal_logged=0'),2)  # initial value + attach_returned
+
+
 if __name__ == '__main__':
     unittest.main()

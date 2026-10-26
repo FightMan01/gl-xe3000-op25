@@ -142,6 +142,14 @@ ATTACH_LOST_CFUN_MAX=3600
 attach_lost_since=0
 attach_lost_wait=$ATTACH_LOST_CFUN
 attach_lost_cycles=0
+# Passive record of attach losses, for the one log line detach_note writes
+# per loss: how many in the last hour and how long attach had held before
+# each. A modem that detaches on a timer (GL forum 69888: every 30-33 min;
+# Quectel forum 56201: every 2 min) shows up there as a steady median.
+# Changes nothing else.
+detach_times=""
+detach_gaps=""
+attached_at=0
 # Last resort: reboot the whole router after the hard-reset budget is spent
 # (the stock firmware does this on a PCIe/MHI failure). Off by default.
 MODEM_RESET_REBOOT=$(opt modem_reset_reboot 0)
@@ -1013,6 +1021,39 @@ dead_plane_recover() {
 	modem_hard_reset
 }
 
+# First no-attach tick of an episode: one log line with the losses in the last
+# hour and the median attach time before them (the last 10 that followed an
+# observed re-attach; the first loss after start-up has none).
+detach_note() {
+	local now t times="" n=0 gap="" median="" count
+	now="$(date +%s)"
+	for t in $detach_times $now; do
+		[ $((now - t)) -lt 3600 ] || continue
+		times="$times $t"
+		n=$((n + 1))
+	done
+	detach_times="${times# }"
+	if [ "$attached_at" -gt 0 ]; then
+		gap=$((now - attached_at))
+		detach_gaps="$(echo $detach_gaps $gap | tr ' ' '\n' | tail -n 10 | tr '\n' ' ')"
+		detach_gaps="${detach_gaps% }"
+	fi
+	attached_at=0
+	set -- $detach_gaps
+	count=$#
+	if [ "$count" -gt 0 ]; then
+		median="$(echo $detach_gaps | tr ' ' '\n' | sort -n | sed -n "$(( (count + 1) / 2 ))p")"
+	fi
+	logger -t "$TAG" "attach lost: $n in the last hour; attached ${gap:-?}s before this one; median attach time ${median:-?}s over the last $count"
+}
+
+# Attach is back after an episode that detach_note counted.
+attach_returned() {
+	[ "$nosignal_logged" -eq 1 ] || return 0
+	nosignal_logged=0
+	attached_at="$(date +%s)"
+}
+
 # Runs on every no-attach tick; see ATTACH_LOST_CFUN. The clock starts at the
 # first such tick with the SIM READY and restarts whenever the SIM is not, so a
 # re-lock or a PIN entry never counts towards it. AT+CFUN? is only asked once
@@ -1388,6 +1429,7 @@ while :; do
 		if [ "$attach" = "0" ]; then
 			if [ "$nosignal_logged" -eq 0 ]; then
 				logger -t "$TAG" "no cellular signal/attach; waiting for it to return"
+				detach_note
 				nosignal_logged=1
 			fi
 			# CGATT=0 is also what a modem reports when its own radio is
@@ -1416,7 +1458,7 @@ while :; do
 			do_sleep "$CHECK_PERIOD"
 			continue
 		fi
-		nosignal_logged=0
+		attach_returned
 		nosignal_ticks=0
 		attach_lost_since=0
 
@@ -1477,6 +1519,9 @@ while :; do
 
 	if [ "$good" -eq 1 ]; then
 		consec_bad=0
+		# A confirmed-good tick means attach is back too; without this an
+		# outage that ended in good ticks left the next one unlogged.
+		attach_returned
 		# Only a *confirmed* good tick (real traffic growth, or a
 		# ping/HTTP probe that actually verified reachability) clears the
 		# CFUN-escalation counter. traffic_state=2 ("no baseline yet") is
