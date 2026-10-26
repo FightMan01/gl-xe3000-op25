@@ -165,6 +165,51 @@ local function restore_portal_dns()
 	return true
 end
 
+-- dnsmasq keeps rebind protection on (91-gl-repeater-dns-rebind), so a portal
+-- whose login host resolves to a private address (MAVSTART-WiFi does) would
+-- have that answer stripped for LAN clients. While a portal is pending, allow
+-- private answers for that one host only, as travelmate does, and drop the
+-- exception once the portal is passed or the uplink is gone. Like the DNS
+-- include above: a tmpfs file, rewritten and reloaded only when it changes.
+local function portal_rebind_host(url)
+	local host = tostring(url or ""):match("^[Hh][Tt][Tt][Pp][Ss]?://([^/:%?#]+)")
+	if not host or host:match("^[%d%.]+$") then return nil end
+	-- The URL comes from the portal: only a plain DNS name reaches dnsmasq.
+	if #host > 253 or not host:match("^[%w][%w%.%-]*$") then return nil end
+	return host:lower()
+end
+
+local function set_portal_rebind(url)
+	local cursor = uci.cursor()
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal-rebind.conf"
+	local host = portal_rebind_host(url)
+	local existing = io.open(path, "r")
+	local current = existing and existing:read("*a")
+	if existing then existing:close() end
+	if not host then
+		if not current then return false end
+		os.remove(path)
+	else
+		local content = "rebind-domain-ok=/" .. host .. "/\n"
+		if current == content then return true end
+		os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
+		local temp = path .. ".new"
+		local file = io.open(temp, "w")
+		if not file then return false end
+		file:write(content)
+		file:close()
+		os.rename(temp, path)
+	end
+	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	return true
+end
+
+local function clear_portal_rebind()
+	return set_portal_rebind(nil)
+end
+
 local function set_bare_mode(enabled, automatic)
 	-- The mainline port does not yet repopulate the vendor allow-list.  Never
 	-- enable wifidog-ng with an empty set: that would block every LAN client
@@ -280,6 +325,7 @@ local function detect(settings)
 				-- authentication completed.  Exit both automatically entered and
 				-- manually entered bare mode so the LAN gate cannot remain open.
 				restore_portal_dns()
+				clear_portal_rebind()
 				if old.bare_mode then set_bare_mode(false, false) end
 				update_state({
 					detected = false, detecting = false, portal_url = "",
@@ -298,6 +344,7 @@ local function detect(settings)
 			-- Only repoint LAN DNS at the STA while the portal flow is
 			-- engaged; otherwise a detected portal on an idle repeater would
 			-- take DNS away from a healthy cellular uplink.
+			set_portal_rebind(url)
 			if settings.auto_portal or load_state().bare_mode then set_portal_dns(settings.dns) end
 			if settings.auto_portal then set_bare_mode(true, true) end
 			update_state({
@@ -311,6 +358,7 @@ local function detect(settings)
 		::next_probe::
 	end
 
+	clear_portal_rebind()
 	update_state({
 		detected = false, detecting = false, portal_url = "",
 		status = "not found portal", last_error = last_error,
@@ -327,6 +375,7 @@ local function tick()
 	else
 		local old = load_state()
 		restore_portal_dns()
+		clear_portal_rebind()
 		if old.auto_bare_mode then set_bare_mode(false, false) end
 		update_state({
 			detected = false, detecting = false, portal_url = "",

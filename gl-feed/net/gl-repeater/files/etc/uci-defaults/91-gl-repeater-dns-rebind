@@ -1,8 +1,20 @@
 #!/bin/sh
-# Stock GL turns dnsmasq rebind protection off (network_gl uci-defaults).
-# Captive portals such as MAVSTART-WiFi resolve their login host to a private
-# address, which rebind protection silently strips, so the portal never loads.
+# Keep dnsmasq's rebind protection on. Stock GL turns it off for every name
+# (network_gl uci-defaults), and older builds of this port did the same,
+# because captive portals such as MAVSTART-WiFi resolve their login host to a
+# private address and rebind protection strips that answer, so the portal
+# never loads. gl-repeater-portal now allows private answers for the pending
+# portal's login host only (rebind-domain-ok in a tmpfs dnsmasq include) and
+# removes the exception when the portal is passed.
+#
+# Turn it back on once where an older build switched it off, and mark the
+# router; a later explicit rebind_protection=0 then stays. Idempotent.
 
-uci -q set dhcp.@dnsmasq[0].rebind_protection='0'
+[ "$(uci -q get dhcp.@dnsmasq[0])" = dnsmasq ] || exit 0
+[ "$(uci -q get dhcp.@dnsmasq[0].gl_rebind_portal)" = 1 ] && exit 0
+
+[ "$(uci -q get dhcp.@dnsmasq[0].rebind_protection)" = 0 ] &&
+	uci -q set dhcp.@dnsmasq[0].rebind_protection='1'
+uci -q set dhcp.@dnsmasq[0].gl_rebind_portal='1'
 uci -q commit dhcp
 exit 0
