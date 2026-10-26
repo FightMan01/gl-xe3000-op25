@@ -1,0 +1,25 @@
+#!/bin/sh
+# Older builds of the SQM page stored its upload in sqm-scripts' `upload` and
+# its download in `download` on the br-lan queue. On br-lan sqm's upload is
+# the egress towards the LAN, i.e. what clients download, so the page's
+# upload limit capped downloads and the other way round. sqm.lua now swaps
+# them as stock does and marks the queue gl_lan_swap=1. Swap an unmarked
+# br-lan queue once, so the page keeps showing the values the user entered,
+# and they now shape the direction they name. Idempotent.
+
+q="$(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p" | head -n1)"
+[ -n "$q" ] || exit 0
+[ "$(uci -q get "sqm.$q.interface")" = br-lan ] || exit 0
+[ "$(uci -q get "sqm.$q.gl_lan_swap")" = 1 ] && exit 0
+
+up="$(uci -q get "sqm.$q.upload")"
+down="$(uci -q get "sqm.$q.download")"
+uci -q batch <<-EOT
+	set sqm.$q.upload='${down:-0}'
+	set sqm.$q.download='${up:-0}'
+	set sqm.$q.gl_lan_swap='1'
+EOT
+uci -q commit sqm
+logger -t gl-sqm "swapped the br-lan queue's upload/download to match the page (now egress ${down:-0}, ingress ${up:-0} kbit/s)"
+
+exit 0
