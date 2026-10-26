@@ -475,6 +475,102 @@ at_alive; echo "dead=$?"
         r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=5)
         self.assertEqual(r.stdout.split(),['retry=0','dead=1'],r.stderr)
 
+    def attach_lost(self, ticks, cpin='+CPIN: READY', flag=False, cooldown=0, cfun='1', prelude='', per_tick=''):
+        # No-attach ticks on a fake clock (100000 + t) against a stub AT port:
+        # CGATT 0, the given CPIN, and CFUN as given until the real
+        # _do_cfun_cycle switches it. Prints every AT+CFUN=x it sends with the
+        # time, then the final backoff state.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        funcs='\n'.join(function(s,n) for n in ('cfun_is_full','do_cfun_cycle','_do_cfun_cycle','attach_lost_watch'))
+        flagfile=self.root/'flashing'
+        for f in ('ops','log','flashing'): (self.root/f).unlink(missing_ok=True)
+        if flag: flagfile.write_text('1\n')
+        funcs=funcs.replace('/var/run/gl-cellular-flashing',str(flagfile)).replace('"$CFUN_LOCK"',str(self.root/'cfun.lock'))
+        code=f'''
+logger() {{ echo "LOG $*" >> {self.root}/log; }}
+sleep() {{ :; }}
+date() {{ cat {self.root}/now; }}
+do_redial() {{ echo "$(date) REDIAL" >> {self.root}/ops; }}
+modem_hard_reset() {{ echo "$(date) RESET" >> {self.root}/ops; }}
+at_query() {{
+	case "$1" in
+	'AT+CGATT?') echo '+CGATT: 0' ;;
+	'AT+CPIN?') echo '{cpin}' ;;
+	'AT+CFUN?') echo "+CFUN: $(cat {self.root}/cfun)"; echo OK ;;
+	AT+CFUN=*) echo "$(date) $1" >> {self.root}/ops; echo "${{1#AT+CFUN=}}" > {self.root}/cfun ;;
+	esac
+}}
+echo {cfun} > {self.root}/cfun
+ATTACH_LOST_CFUN=600; ATTACH_LOST_CFUN_MAX=3600; CFUN_COOLDOWN={cooldown}
+attach_lost_since=0; attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0
+last_cfun=0; failed_cycles=0
+{funcs}
+{prelude}
+for t in {' '.join(str(t) for t in ticks)}; do
+	echo $((t + 100000)) > {self.root}/now
+	cpin="$(at_query 'AT+CPIN?')"
+	{per_tick}
+	attach_lost_watch
+done
+[ -e {self.root}/ops ] && cat {self.root}/ops
+echo "wait $attach_lost_wait cycles $attach_lost_cycles"
+'''
+        r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(r.returncode,0,r.stderr)
+        log=(self.root/'log').read_text() if (self.root/'log').exists() else ''
+        return r.stdout.splitlines(), log
+
+    @staticmethod
+    def cfun4_times(out):
+        return [int(l.split()[0])-100000 for l in out if l.endswith('AT+CFUN=4')]
+
+    def test_attach_lost_cycles_the_radio_once_after_the_wait(self):
+        # Ticks every 10s for 15 min: nothing before 600s, then one CFUN=4 and
+        # CFUN=1 (and the redial) at 600s, then nothing during the longer wait.
+        out,log=self.attach_lost(range(0,910,10))
+        self.assertEqual(out,['100600 AT+CFUN=4','100600 AT+CFUN=1','100600 REDIAL','wait 1800 cycles 1'])
+        self.assertIn('attach lost 600s with SIM ready; CFUN cycle 1',log)
+        self.assertIn('attach lost 600s with SIM ready; power-cycling modem radio',log)
+        out,_=self.attach_lost(range(0,600,10))
+        self.assertEqual(out,['wait 600 cycles 0'])
+
+    def test_attach_lost_waits_grow_and_cap(self):
+        # 3 h without attach: 600s, then 1800s, then 3600s (the cap) twice.
+        out,_=self.attach_lost(range(0,10810,10))
+        self.assertEqual(self.cfun4_times(out),[600,2400,6000,9600])
+        self.assertEqual(out[-1],'wait 3600 cycles 4')
+
+    def test_attach_lost_respects_cfun_cooldown(self):
+        # A CFUN cycle 5 min before the loss began: the first attempt waits
+        # out the 30-minute cooldown, and nothing is logged before it.
+        out,log=self.attach_lost(range(0,1600,10),cooldown=1800,prelude='last_cfun=$((100000 - 300))')
+        self.assertEqual(self.cfun4_times(out),[1500])
+        self.assertEqual(log.count('CFUN cycle'),1)
+
+    def test_attach_lost_never_fires_without_a_ready_sim_or_while_flashing(self):
+        for kw in ({'cpin':'+CPIN: SIM PIN'},{'cpin':''},{'flag':True},{'cfun':'4'},{'cfun':'0'}):
+            out,log=self.attach_lost(range(0,2000,10),**kw)
+            self.assertEqual(out,['wait 600 cycles 0'],kw)
+            self.assertNotIn('CFUN cycle',log,kw)
+
+    def test_attach_lost_clock_restarts_when_the_sim_is_not_ready(self):
+        # One SIM PIN reading at 500s (a re-lock) restarts the clock: the cycle
+        # comes 600s after the SIM is READY again, not 600s after the loss.
+        out,_=self.attach_lost(range(0,1300,10),per_tick='[ "$t" = 500 ] && cpin="+CPIN: SIM PIN"')
+        self.assertEqual(self.cfun4_times(out),[1110])
+
+    def test_attach_lost_backoff_resets_on_a_good_tick_only(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0;',good)
+        # Attach returning, or the watchdog standing down, restarts the clock
+        # but keeps the backoff.
+        start=s.index('\t\t\tattach_lost_watch\n')
+        after=s[start:s.index('\t\tif [ "$up" = "true" ] && [ -n "$device" ]; then',start)]
+        self.assertIn('\t\tattach_lost_since=0\n',after)
+        self.assertIn('attach_lost_since=0',function(s,'reset_state'))
+        self.assertNotIn('attach_lost_wait',function(s,'reset_state'))
+
 
 if __name__ == '__main__':
     unittest.main()
