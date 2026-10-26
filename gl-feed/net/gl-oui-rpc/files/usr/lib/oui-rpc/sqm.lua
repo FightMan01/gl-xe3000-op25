@@ -3,6 +3,13 @@
 -- {enable, upload, download, qdisc}; GL's own XE3000 firmware implements
 -- that queue on br-lan, so it applies regardless of which Multi-WAN uplink
 -- is currently selected.
+--
+-- sqm-scripts' upload is the interface's egress and download its ingress.
+-- On br-lan egress is what LAN clients download, so the page's values are
+-- swapped onto a br-lan queue, exactly as stock's sqm_api does in both
+-- get_config and set_config (tests/sandbox-sqm-direction.sh measures it).
+-- gl_lan_swap marks a queue whose values are stored that way; see
+-- 98-gl-sqm-direction for queues written before this.
 
 local uci = require "uci"
 
@@ -40,12 +47,15 @@ return {
 		if not section then
 			return { enable = false, upload = 0, download = 0, qdisc = "cake" }
 		end
+		-- sqm-scripts stores kbit/s; GL's page displays and submits
+		-- Mbit/s (and calculates the adjacent MB/s hint from it).
+		local egress = (tonumber((cursor:get("sqm", section, "upload"))) or 0) / 1000
+		local ingress = (tonumber((cursor:get("sqm", section, "download"))) or 0) / 1000
+		local lan = cursor:get("sqm", section, "interface") == "br-lan"
 		return {
 			enable = cursor:get("sqm", section, "enabled") == "1",
-			-- sqm-scripts stores kbit/s; GL's page displays and submits
-			-- Mbit/s (and calculates the adjacent MB/s hint from it).
-			upload = (tonumber((cursor:get("sqm", section, "upload"))) or 0) / 1000,
-			download = (tonumber((cursor:get("sqm", section, "download"))) or 0) / 1000,
+			upload = lan and ingress or egress,
+			download = lan and egress or ingress,
 			qdisc = cursor:get("sqm", section, "qdisc") or "cake",
 		}
 	end,
@@ -75,8 +85,10 @@ return {
 		cursor:set("sqm", section, "qdisc", args.qdisc)
 		cursor:set("sqm", section, "script",
 			args.qdisc == "cake" and "piece_of_cake.qos" or "simple.qos")
-		cursor:set("sqm", section, "upload", tostring(math.floor(upload * 1000)))
-		cursor:set("sqm", section, "download", tostring(math.floor(download * 1000)))
+		-- br-lan: its egress carries the LAN's downloads (see the top).
+		cursor:set("sqm", section, "upload", tostring(math.floor(download * 1000)))
+		cursor:set("sqm", section, "download", tostring(math.floor(upload * 1000)))
+		cursor:set("sqm", section, "gl_lan_swap", "1")
 		cursor:set("sqm", section, "qdisc_advanced", "0")
 		cursor:set("sqm", section, "ingress_ecn", "ECN")
 		cursor:set("sqm", section, "egress_ecn", "ECN")

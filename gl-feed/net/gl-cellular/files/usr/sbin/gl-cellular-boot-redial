@@ -121,6 +121,35 @@ MODEM_RESET_BACKOFF=$(opt modem_reset_backoff_sec 900)
 # happen. 0 restores the plain ladder.
 DEAD_PLANE_TICKS=$(opt dead_plane_ticks 3)
 dead_plane_ticks=0
+# One AT+CFUN=4/1 before that reset, when the CFUN cooldown allows: it costs
+# about half a minute and keeps the PCIe function up, and the forums report it
+# clearing a stuck stack in 10-15 s. Not yet seen to fix this signature here
+# (the 2026-10-11 and 2026-10-18 events only ever cleared with the reset), so
+# if the plane is still dead DEAD_PLANE_TICKS later, the reset follows. Once
+# per episode; a confirmed-good tick re-arms it. 0 = straight to the reset.
+DEAD_PLANE_CFUN=$(opt dead_plane_cfun 1)
+dead_plane_cfun=0
+# Attach lost while the SIM reads READY and the radio is on (AT+CGATT: 0,
+# +CPIN: READY, +CFUN: 1) for this long: power-cycle the radio once. The radio
+# stack can stay stuck in that state with CSQ 99,99 and CEREG 0,0 until
+# AT+CFUN cycles it (Quectel forum 55247, RM520N R01A07 and R03A03; GL's own
+# cellular_manage does CFUN=4 -> CFUN=1 for the same detach, GL forum 69888).
+# CSQ cannot tell that from a tunnel, so only the duration decides. The wait
+# triples after each attempt (capped at ATTACH_LOST_CFUN_MAX) and returns to
+# this value on a confirmed-good tick. 0 = off.
+ATTACH_LOST_CFUN=$(opt attach_lost_cfun_sec 600)
+ATTACH_LOST_CFUN_MAX=3600
+attach_lost_since=0
+attach_lost_wait=$ATTACH_LOST_CFUN
+attach_lost_cycles=0
+# Passive record of attach losses, for the one log line detach_note writes
+# per loss: how many in the last hour and how long attach had held before
+# each. A modem that detaches on a timer (GL forum 69888: every 30-33 min;
+# Quectel forum 56201: every 2 min) shows up there as a steady median.
+# Changes nothing else.
+detach_times=""
+detach_gaps=""
+attached_at=0
 # Last resort: reboot the whole router after the hard-reset budget is spent
 # (the stock firmware does this on a PCIe/MHI failure). Off by default.
 MODEM_RESET_REBOOT=$(opt modem_reset_reboot 0)
@@ -278,6 +307,8 @@ reset_state() {
 	last_rx=""
 	nosignal_ticks=0
 	dead_plane_ticks=0
+	dead_plane_cfun=0
+	attach_lost_since=0
 }
 
 # Sends an AT command through gl-cellular-atd's serialized port access
@@ -827,9 +858,10 @@ CFUN_LOCK=/var/run/gl-cellular-cfun.lock
 # to a modem that is mid power-cycle. Held only around the CFUN=4 -> CFUN=1
 # sequence, never across the redial or hard reset that follows.
 do_cfun_cycle() {
-	_do_cfun_cycle
+	_do_cfun_cycle "$@"
 }
 
+# _do_cfun_cycle [reason]: the reason is logged before the power-cycle.
 _do_cfun_cycle() {
 	local now attempt
 	now="$(date +%s)"
@@ -837,7 +869,7 @@ _do_cfun_cycle() {
 
 	last_cfun=$now
 	logger -p daemon.err -t "$TAG" \
-		"$failed_cycles redial cycles did not restore traffic; power-cycling modem radio"
+		"${1:-$failed_cycles redial cycles did not restore traffic}; power-cycling modem radio"
 	# CFUN=4 (flight mode), not 0: CFUN=0 powers the SIM down, so the card
 	# comes back PIN-locked, and stock's recovery never power-cycles the radio
 	# at all. 4 re-registers the radio and leaves the SIM alone.
@@ -968,6 +1000,92 @@ escalate() {
 	else
 		do_redial && failed_cycles=$((failed_cycles + 1))
 	fi
+}
+
+# DEAD_PLANE_TICKS reached: the radio power-cycle once per episode, if the
+# CFUN cooldown allows, otherwise (and on the next episode tick) the hard reset.
+# Returns modem_hard_reset's status, or 0 after a CFUN cycle.
+dead_plane_recover() {
+	local now
+	now="$(date +%s)"
+	if [ "$DEAD_PLANE_CFUN" = 1 ] && [ "$dead_plane_cfun" -eq 0 ] &&
+		[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ]; then
+		dead_plane_cfun=1
+		logger -p daemon.err -t "$TAG" \
+			"dead data plane for $DEAD_PLANE_TICKS ticks; power-cycling the radio before a hard reset"
+		do_cfun_cycle "dead data plane for $DEAD_PLANE_TICKS ticks"
+		return 0
+	fi
+	logger -p daemon.err -t "$TAG" \
+		"dead data plane for $DEAD_PLANE_TICKS ticks; skipping the ladder and hard-resetting the modem"
+	modem_hard_reset
+}
+
+# First no-attach tick of an episode: one log line with the losses in the last
+# hour and the median attach time before them (the last 10 that followed an
+# observed re-attach; the first loss after start-up has none).
+detach_note() {
+	local now t times="" n=0 gap="" median="" count
+	now="$(date +%s)"
+	for t in $detach_times $now; do
+		[ $((now - t)) -lt 3600 ] || continue
+		times="$times $t"
+		n=$((n + 1))
+	done
+	detach_times="${times# }"
+	if [ "$attached_at" -gt 0 ]; then
+		gap=$((now - attached_at))
+		detach_gaps="$(echo $detach_gaps $gap | tr ' ' '\n' | tail -n 10 | tr '\n' ' ')"
+		detach_gaps="${detach_gaps% }"
+	fi
+	attached_at=0
+	set -- $detach_gaps
+	count=$#
+	if [ "$count" -gt 0 ]; then
+		median="$(echo $detach_gaps | tr ' ' '\n' | sort -n | sed -n "$(( (count + 1) / 2 ))p")"
+	fi
+	logger -t "$TAG" "attach lost: $n in the last hour; attached ${gap:-?}s before this one; median attach time ${median:-?}s over the last $count"
+}
+
+# Attach is back after an episode that detach_note counted.
+attach_returned() {
+	[ "$nosignal_logged" -eq 1 ] || return 0
+	nosignal_logged=0
+	attached_at="$(date +%s)"
+}
+
+# Runs on every no-attach tick; see ATTACH_LOST_CFUN. The clock starts at the
+# first such tick with the SIM READY and restarts whenever the SIM is not, so a
+# re-lock or a PIN entry never counts towards it. AT+CFUN? is only asked once
+# the wait is over: a radio the user switched off (CFUN 4) is left alone, and
+# CFUN 0 is the CFUN_RECHECK_TICKS path's job. The CFUN cooldown is checked
+# here too, so no attempt is logged that do_cfun_cycle would refuse.
+attach_lost_watch() {
+	local now lost
+	[ "$ATTACH_LOST_CFUN" -gt 0 ] || return 0
+	[ -e /var/run/gl-cellular-flashing ] && return 0
+	case "$cpin" in
+		*"+CPIN: READY"*) ;;
+		*) attach_lost_since=0; return 0 ;;
+	esac
+	now="$(date +%s)"
+	if [ "$attach_lost_since" -eq 0 ]; then
+		attach_lost_since=$now
+		return 0
+	fi
+	lost=$((now - attach_lost_since))
+	[ "$lost" -ge "$attach_lost_wait" ] || return 0
+	[ $((now - last_cfun)) -ge "$CFUN_COOLDOWN" ] || return 0
+	cfun_is_full || return 0
+
+	attach_lost_cycles=$((attach_lost_cycles + 1))
+	logger -p daemon.err -t "$TAG" \
+		"attach lost ${lost}s with SIM ready; CFUN cycle $attach_lost_cycles"
+	do_cfun_cycle "attach lost ${lost}s with SIM ready"
+	attach_lost_since="$(date +%s)"
+	attach_lost_wait=$((attach_lost_wait * 3))
+	[ "$attach_lost_wait" -le "$ATTACH_LOST_CFUN_MAX" ] ||
+		attach_lost_wait=$ATTACH_LOST_CFUN_MAX
 }
 
 # The unlock gate in qcm.sh only runs when netifd sets wwan up, so a SIM that
@@ -1311,6 +1429,7 @@ while :; do
 		if [ "$attach" = "0" ]; then
 			if [ "$nosignal_logged" -eq 0 ]; then
 				logger -t "$TAG" "no cellular signal/attach; waiting for it to return"
+				detach_note
 				nosignal_logged=1
 			fi
 			# CGATT=0 is also what a modem reports when its own radio is
@@ -1334,12 +1453,14 @@ while :; do
 					sleep 10
 				fi
 			fi
+			attach_lost_watch
 			consec_bad=0
 			do_sleep "$CHECK_PERIOD"
 			continue
 		fi
-		nosignal_logged=0
+		attach_returned
 		nosignal_ticks=0
+		attach_lost_since=0
 
 		if [ "$up" = "true" ] && [ -n "$device" ]; then
 			# Attached and interface up, but rx_bytes is flat: ping is the
@@ -1386,9 +1507,7 @@ while :; do
 						"dead data plane: attached, call up, lease held, no traffic ($dead_plane_ticks/$DEAD_PLANE_TICKS)"
 					if [ "$dead_plane_ticks" -ge "$DEAD_PLANE_TICKS" ]; then
 						dead_plane_ticks=0
-						logger -p daemon.err -t "$TAG" \
-							"dead data plane for $DEAD_PLANE_TICKS ticks; skipping the ladder and hard-resetting the modem"
-						if modem_hard_reset; then
+						if dead_plane_recover; then
 							do_sleep "$CHECK_PERIOD"
 							continue
 						fi
@@ -1400,6 +1519,9 @@ while :; do
 
 	if [ "$good" -eq 1 ]; then
 		consec_bad=0
+		# A confirmed-good tick means attach is back too; without this an
+		# outage that ended in good ticks left the next one unlogged.
+		attach_returned
 		# Only a *confirmed* good tick (real traffic growth, or a
 		# ping/HTTP probe that actually verified reachability) clears the
 		# CFUN-escalation counter. traffic_state=2 ("no baseline yet") is
@@ -1412,7 +1534,7 @@ while :; do
 		# That made the radio power-cycle escalation effectively
 		# unreachable via this path - only the grace-timeout fast path in
 		# the main loop could ever trigger it.
-		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; reset_count=0; dead_plane_ticks=0; }
+		[ "$traffic_state" = "2" ] || { failed_cycles=0; cfun_cycles=0; mhi_reset_count=0; mhi_reset_window_start=0; lte_fallback_count=0; reset_count=0; dead_plane_ticks=0; dead_plane_cfun=0; attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0; }
 		# Deliberately outside the guard above: a confirmed-good tick is
 		# exactly what should start (and then satisfy) the fallback hold
 		# window, so lte_fallback_since survives the counter reset that

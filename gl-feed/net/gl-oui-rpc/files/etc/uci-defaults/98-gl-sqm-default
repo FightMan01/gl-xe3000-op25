@@ -15,6 +15,7 @@ if [ -f /etc/config/sqm ] && ! uci -q get sqm.@queue[0] >/dev/null; then
 	uci set sqm.gl.itarget='auto'
 	uci set sqm.gl.etarget='auto'
 	uci set sqm.gl.linklayer='none'
+	uci set sqm.gl.gl_lan_swap='1'
 	uci commit sqm
 fi
 

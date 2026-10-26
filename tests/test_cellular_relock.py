@@ -475,6 +475,195 @@ at_alive; echo "dead=$?"
         r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=5)
         self.assertEqual(r.stdout.split(),['retry=0','dead=1'],r.stderr)
 
+    def attach_lost(self, ticks, cpin='+CPIN: READY', flag=False, cooldown=0, cfun='1', prelude='', per_tick=''):
+        # No-attach ticks on a fake clock (100000 + t) against a stub AT port:
+        # CGATT 0, the given CPIN, and CFUN as given until the real
+        # _do_cfun_cycle switches it. Prints every AT+CFUN=x it sends with the
+        # time, then the final backoff state.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        funcs='\n'.join(function(s,n) for n in ('cfun_is_full','do_cfun_cycle','_do_cfun_cycle','attach_lost_watch'))
+        flagfile=self.root/'flashing'
+        for f in ('ops','log','flashing'): (self.root/f).unlink(missing_ok=True)
+        if flag: flagfile.write_text('1\n')
+        funcs=funcs.replace('/var/run/gl-cellular-flashing',str(flagfile)).replace('"$CFUN_LOCK"',str(self.root/'cfun.lock'))
+        code=f'''
+logger() {{ echo "LOG $*" >> {self.root}/log; }}
+sleep() {{ :; }}
+date() {{ cat {self.root}/now; }}
+do_redial() {{ echo "$(date) REDIAL" >> {self.root}/ops; }}
+modem_hard_reset() {{ echo "$(date) RESET" >> {self.root}/ops; }}
+at_query() {{
+	case "$1" in
+	'AT+CGATT?') echo '+CGATT: 0' ;;
+	'AT+CPIN?') echo '{cpin}' ;;
+	'AT+CFUN?') echo "+CFUN: $(cat {self.root}/cfun)"; echo OK ;;
+	AT+CFUN=*) echo "$(date) $1" >> {self.root}/ops; echo "${{1#AT+CFUN=}}" > {self.root}/cfun ;;
+	esac
+}}
+echo {cfun} > {self.root}/cfun
+ATTACH_LOST_CFUN=600; ATTACH_LOST_CFUN_MAX=3600; CFUN_COOLDOWN={cooldown}
+attach_lost_since=0; attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0
+last_cfun=0; failed_cycles=0
+{funcs}
+{prelude}
+for t in {' '.join(str(t) for t in ticks)}; do
+	echo $((t + 100000)) > {self.root}/now
+	cpin="$(at_query 'AT+CPIN?')"
+	{per_tick}
+	attach_lost_watch
+done
+[ -e {self.root}/ops ] && cat {self.root}/ops
+echo "wait $attach_lost_wait cycles $attach_lost_cycles"
+'''
+        r=subprocess.run(['/bin/sh','-c',code],env=self.env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(r.returncode,0,r.stderr)
+        log=(self.root/'log').read_text() if (self.root/'log').exists() else ''
+        return r.stdout.splitlines(), log
+
+    @staticmethod
+    def cfun4_times(out):
+        return [int(l.split()[0])-100000 for l in out if l.endswith('AT+CFUN=4')]
+
+    def test_attach_lost_cycles_the_radio_once_after_the_wait(self):
+        # Ticks every 10s for 15 min: nothing before 600s, then one CFUN=4 and
+        # CFUN=1 (and the redial) at 600s, then nothing during the longer wait.
+        out,log=self.attach_lost(range(0,910,10))
+        self.assertEqual(out,['100600 AT+CFUN=4','100600 AT+CFUN=1','100600 REDIAL','wait 1800 cycles 1'])
+        self.assertIn('attach lost 600s with SIM ready; CFUN cycle 1',log)
+        self.assertIn('attach lost 600s with SIM ready; power-cycling modem radio',log)
+        out,_=self.attach_lost(range(0,600,10))
+        self.assertEqual(out,['wait 600 cycles 0'])
+
+    def test_attach_lost_waits_grow_and_cap(self):
+        # 3 h without attach: 600s, then 1800s, then 3600s (the cap) twice.
+        out,_=self.attach_lost(range(0,10810,10))
+        self.assertEqual(self.cfun4_times(out),[600,2400,6000,9600])
+        self.assertEqual(out[-1],'wait 3600 cycles 4')
+
+    def test_attach_lost_respects_cfun_cooldown(self):
+        # A CFUN cycle 5 min before the loss began: the first attempt waits
+        # out the 30-minute cooldown, and nothing is logged before it.
+        out,log=self.attach_lost(range(0,1600,10),cooldown=1800,prelude='last_cfun=$((100000 - 300))')
+        self.assertEqual(self.cfun4_times(out),[1500])
+        self.assertEqual(log.count('CFUN cycle'),1)
+
+    def test_attach_lost_never_fires_without_a_ready_sim_or_while_flashing(self):
+        for kw in ({'cpin':'+CPIN: SIM PIN'},{'cpin':''},{'flag':True},{'cfun':'4'},{'cfun':'0'}):
+            out,log=self.attach_lost(range(0,2000,10),**kw)
+            self.assertEqual(out,['wait 600 cycles 0'],kw)
+            self.assertNotIn('CFUN cycle',log,kw)
+
+    def test_attach_lost_clock_restarts_when_the_sim_is_not_ready(self):
+        # One SIM PIN reading at 500s (a re-lock) restarts the clock: the cycle
+        # comes 600s after the SIM is READY again, not 600s after the loss.
+        out,_=self.attach_lost(range(0,1300,10),per_tick='[ "$t" = 500 ] && cpin="+CPIN: SIM PIN"')
+        self.assertEqual(self.cfun4_times(out),[1110])
+
+    def test_attach_lost_backoff_resets_on_a_good_tick_only(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('attach_lost_wait=$ATTACH_LOST_CFUN; attach_lost_cycles=0;',good)
+        # Attach returning, or the watchdog standing down, restarts the clock
+        # but keeps the backoff.
+        start=s.index('\t\t\tattach_lost_watch\n')
+        after=s[start:s.index('\t\tif [ "$up" = "true" ] && [ -n "$device" ]; then',start)]
+        self.assertIn('\t\tattach_lost_since=0\n',after)
+        self.assertIn('attach_lost_since=0',function(s,'reset_state'))
+        self.assertNotIn('attach_lost_wait',function(s,'reset_state'))
+
+
+    def dead_plane(self, calls, cfun_on='1', last_cfun='0', cooldown='1800'):
+        # dead_plane_recover called `calls` times on a fixed clock, with the
+        # CFUN cycle and the hard reset stubbed; prints what each call did.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        code=f"""
+logger() {{ :; }}
+date() {{ echo 100000; }}
+do_cfun_cycle() {{ echo "CFUN $1"; last_cfun=100000; }}
+modem_hard_reset() {{ echo RESET; return 0; }}
+DEAD_PLANE_TICKS=3; DEAD_PLANE_CFUN={cfun_on}; dead_plane_cfun=0
+CFUN_COOLDOWN={cooldown}; last_cfun={last_cfun}
+{function(s,'dead_plane_recover')}
+for i in $(seq 1 {calls}); do dead_plane_recover; echo "rc=$?"; done
+"""
+        r=subprocess.run(['/bin/sh','-c',code],capture_output=True,text=True,timeout=5)
+        self.assertEqual(r.returncode,0,r.stderr)
+        return r.stdout.splitlines()
+
+    def test_dead_plane_tries_one_cfun_cycle_before_the_hard_reset(self):
+        # No cooldown at all: it is the once-per-episode flag that moves on.
+        self.assertEqual(self.dead_plane(3,cooldown='0'),
+            ['CFUN dead data plane for 3 ticks','rc=0','RESET','rc=0','RESET','rc=0'])
+
+    def test_dead_plane_goes_straight_to_the_reset_inside_the_cfun_cooldown(self):
+        self.assertEqual(self.dead_plane(1,last_cfun='99000'),['RESET','rc=0'])
+
+    def test_dead_plane_cfun_rung_can_be_switched_off(self):
+        self.assertEqual(self.dead_plane(1,cfun_on='0'),['RESET','rc=0'])
+
+    def test_dead_plane_rung_is_wired_and_rearmed_on_a_good_tick_only(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        block=s[s.index('if [ "$dead_plane_ticks" -ge "$DEAD_PLANE_TICKS" ]; then'):]
+        block=block[:block.index('\t\t\t\t\tfi\n')]
+        self.assertIn('if dead_plane_recover; then',block)
+        self.assertNotIn('modem_hard_reset',block)
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('dead_plane_cfun=0;',good)
+        # A successful hard reset or redial does not re-arm it.
+        self.assertNotIn('dead_plane_cfun',function(s,'modem_hard_reset'))
+        self.assertNotIn('dead_plane_cfun',function(s,'do_redial'))
+
+
+    def detach_log(self, events, shell='/bin/sh'):
+        # events: ("lost"|"back", t). Runs the real detach_note and
+        # attach_returned on a fake clock; returns the lines detach_note logs.
+        s=(S/'gl-cellular-boot-redial').read_text()
+        body=''.join(f'echo {t} > {self.root}/now; ' + ('detach_note; nosignal_logged=1\n' if e=='lost' else 'attach_returned\n')
+                     for e,t in events)
+        code=f"""
+logger() {{ shift 2; echo "$*"; }}
+date() {{ cat {self.root}/now; }}
+TAG=t; detach_times=""; detach_gaps=""; attached_at=0; nosignal_logged=0
+{function(s,'detach_note')}
+{function(s,'attach_returned')}
+{body}"""
+        r=subprocess.run([shell,'-c',code],capture_output=True,text=True,timeout=10)
+        self.assertEqual(r.returncode,0,r.stderr)
+        return r.stdout.splitlines()
+
+    def test_detach_note_shows_a_periodic_cycle(self):
+        # A modem that detaches 30 min after every re-attach, as in GL forum 69888.
+        ev=[('lost',1000)]
+        for k in range(1,5):
+            ev+= [('back',1000+k*1860-1800),('lost',1000+k*1860)]
+        out=self.detach_log(ev)
+        self.assertEqual(out[0],'attach lost: 1 in the last hour; attached ?s before this one; median attach time ?s over the last 0')
+        self.assertEqual(out[-1],'attach lost: 2 in the last hour; attached 1800s before this one; median attach time 1800s over the last 4')
+
+    def test_detach_note_median_and_hour_window(self):
+        out=self.detach_log([('lost',0),('back',10),('lost',70),('back',80),('lost',580),('back',600),('lost',4200)])
+        # gaps 60, 500, 3600 (an even count takes the lower middle); at t=4200
+        # only 4200 itself is inside the hour
+        self.assertEqual(out[1],'attach lost: 2 in the last hour; attached 60s before this one; median attach time 60s over the last 1')
+        self.assertEqual(out[2],'attach lost: 3 in the last hour; attached 500s before this one; median attach time 60s over the last 2')
+        self.assertEqual(out[3],'attach lost: 1 in the last hour; attached 3600s before this one; median attach time 500s over the last 3')
+
+    def test_detach_note_keeps_the_last_ten_gaps(self):
+        ev=[('lost',0)]; t=0
+        for k in range(12):
+            ev+=[('back',t+1),('lost',t+1+(k+1)*10)]; t=t+1+(k+1)*10
+        out=self.detach_log(ev)
+        self.assertTrue(out[-1].endswith('over the last 10'),out[-1])
+
+    def test_attach_return_is_noticed_on_a_good_tick_too(self):
+        s=(S/'gl-cellular-boot-redial').read_text()
+        good=s[s.index('\tif [ "$good" -eq 1 ]; then'):s.index('\t\tlte_fallback_release\n')]
+        self.assertIn('attach_returned',good)
+        nosig=s[s.index('if [ "$nosignal_logged" -eq 0 ]; then'):]
+        self.assertLess(nosig.index('detach_note'),nosig.index('nosignal_logged=1'))
+        # attach_returned is the only thing that clears the episode flag now.
+        self.assertEqual(s.count('nosignal_logged=0'),2)  # initial value + attach_returned
+
 
 if __name__ == '__main__':
     unittest.main()
