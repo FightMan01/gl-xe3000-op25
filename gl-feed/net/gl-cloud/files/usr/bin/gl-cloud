@@ -1,0 +1,1445 @@
+#!/usr/bin/eco
+-- gl-cloud: GoodCloud client for the GL.iNet SDK4 UI on this OpenWrt port.
+--
+-- Protocol notes (all verified against the stock 4.11 client):
+--   * the device authenticates with GET /v2/device/auth using an HMAC-SHA256
+--     over mac || ddns || timestamp || sha256(device_sn_bak), keyed with
+--     device_sn. The answer carries the broker address, port, username and
+--     password and is cached as the UCI `token`.
+--   * MQTT runs over mutual TLS with the factory device certificate. The
+--     stock client only falls back to AES-without-cert when no certificate
+--     exists; this port has one, so the plain framing (type 2) is used.
+--   * topics are /sys/<model>/<version>/<mac>/... and the registration topic
+--     is /device/registration/<mac>.
+--
+-- This is a clean-room reimplementation. It deliberately does not implement
+-- OTA/upgrade commands: GoodCloud must never overwrite this port with a GL
+-- stock image.
+
+local cjson = require "cjson"
+local file = require "eco.file"
+local http = require "eco.http.client"
+local log = require "eco.log"
+local mqtt = require "eco.mqtt"
+local sys = require "eco.sys"
+local dns = require "eco.dns"
+local time = require "eco.time"
+local ubus = require "eco.ubus"
+local sync = require "eco.sync"
+local sha256 = require "eco.hash.sha256"
+local hmac = require "eco.hash.hmac"
+local hex = require "eco.encoding.hex"
+local uci = require "eco.uci"
+
+pcall(cjson.encode_empty_table_as_object, false)
+
+local CFG = "gl-cloud"
+local SEC = "@cloud[0]"
+local FACTORY = "/dev/mmcblk0p3"
+local RUNDIR = "/var/run/cloud"
+local CA_PATH = RUNDIR .. "/ca.crt"
+local CERT_PATH = RUNDIR .. "/device_cert.pem"
+local KEY_PATH = RUNDIR .. "/device_key.pem"
+
+local MSG_TYPE_PLAIN = 2
+local MSG_TYPE_AES = 50
+local HTTP_TIMEOUT = 10
+local BIND_CODE = { REQUEST_FAIL = -1, UNBIND = 0, ISBIND = 1 }
+
+local SERVERS = {
+	["gslb.gl-inet.cn"] = {
+		api = "https://api.gl-inet.cn",
+		url = "https://cloud.gl-inet.cn",
+	},
+	["gslb-cn.goodcloud.xyz"] = {
+		api = "https://api.gl-inet.cn",
+		url = "https://cloud.gl-inet.cn",
+	},
+	["gslb-eu.goodcloud.xyz"] = {
+		api = "https://api.goodcloud.xyz",
+		url = "https://www.goodcloud.xyz",
+	},
+}
+
+local dev = {}
+local has_cert = false
+local topic_prefix = ""
+local mqtt_connected
+local mqtt_connect_id = 0
+local force_reconnect_now = false
+local reconnect_delay = 0
+local reconnect_tmr
+local mqtt_client
+
+local function trim(value)
+	return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function readfile(path, mode)
+	local value = file.readfile(path, mode or "*l")
+	return value and trim(value) or ""
+end
+
+local function factory_bytes(offset, length)
+	local f = io.open(FACTORY, "rb")
+	if not f then return nil end
+	f:seek("set", offset)
+	local data = f:read(length)
+	f:close()
+	return data
+end
+
+local function factory_str(offset, length)
+	local data = factory_bytes(offset, length)
+	if not data then return "" end
+	return trim(data:gsub("%z", ""):gsub("\255", ""))
+end
+
+local function factory_mac()
+	local data = factory_bytes(0x0a, 6)
+	if not data or #data ~= 6 then return "" end
+	local parts = {}
+	for i = 1, 6 do
+		parts[i] = string.format("%02x", data:byte(i))
+	end
+	return table.concat(parts, ":")
+end
+
+local function hw(name)
+	local value = readfile("/proc/gl-hw-info/" .. name)
+	if value ~= "" then return value end
+	if name == "device_mac" then return factory_mac() end
+	if name == "device_ddns" then return factory_str(0x10, 16) end
+	if name == "device_sn_bak" then return factory_str(0x20, 16) end
+	if name == "device_sn" then return factory_str(0x30, 16) end
+	if name == "country_code" then return factory_str(0x88, 2) end
+	return ""
+end
+
+local function board_model()
+	local raw = readfile("/etc/board.json", "*a")
+	local ok, board = pcall(cjson.decode, raw)
+	if ok and type(board) == "table" and board.model and board.model.id then
+		local id = board.model.id:match(",(.+)$") or board.model.id
+		return (id:gsub("^gl%-", ""))
+	end
+	return hw("model") ~= "" and hw("model") or "xe3000"
+end
+
+local function device_type()
+	return dev.model == "s200" and "iot" or "router"
+end
+
+local function ensure_cert()
+	os.execute("mkdir -p " .. RUNDIR)
+	local cert = readfile("/proc/gl-hw-info/device_cert", "*a")
+	local key = readfile("/proc/gl-hw-info/device_key", "*a")
+	if cert == "" or key == "" then
+		local pem = factory_bytes(0x1000, 0x1000)
+		if pem then
+			pem = pem:gsub("\255", ""):gsub("%z", "")
+			local cs = pem:find("-----BEGIN CERTIFICATE-----", 1, true)
+			local ke = pem:find("-----END CERTIFICATE-----", 1, true)
+			local ks = pem:find("-----BEGIN PRIVATE KEY-----", 1, true)
+			local kend = pem:find("-----END PRIVATE KEY-----", 1, true)
+			if cs and ke and ks and kend then
+				cert = pem:sub(cs, ke + 23)
+				key = pem:sub(ks, kend + 21)
+			end
+		end
+	end
+	if cert == "" or key == "" then return false end
+	file.writefile(CERT_PATH, cert)
+	file.writefile(KEY_PATH, key)
+	return file.access(CERT_PATH) and file.access(KEY_PATH)
+end
+
+local function load_identity()
+	dev.mac = hw("device_mac"):gsub(":", ""):lower()
+	dev.mac_colon = hw("device_mac")
+	dev.ddns = hw("device_ddns")
+	dev.sn = hw("device_sn")
+	dev.sn_bak = hw("device_sn_bak")
+	dev.model = board_model()
+	dev.version = readfile("/etc/glversion")
+	if dev.version == "" then dev.version = "4.11.0-op25" end
+	dev.version_type = readfile("/etc/version.type")
+	dev.country = hw("country_code")
+	if dev.country == "" then dev.country = "US" end
+	dev.hostname = uci.cursor():get("system", "@system[0]", "hostname") or "OpenWrt"
+	dev.version_date = readfile("/etc/version.date")
+	local epoch = tonumber(sys.sh("date -u -d " ..
+		("'" .. dev.version_date:gsub("'", "'\\''") .. "'") .. " +%s") or "")
+	if epoch then
+		-- Stock stores milliseconds and subtracts the CST offset.
+		dev.version_date = tostring(epoch - 57600) .. "000"
+	end
+	has_cert = ensure_cert()
+end
+
+local function current_time()
+	return math.ceil(time.now() * 1000)
+end
+
+local function sha256_hex(value)
+	return hex.encode(sha256.sum(value))
+end
+
+-- Stock get_sign(): HMAC keyed with the serial, over the MAC, DDNS, timestamp
+-- and the hash of the backup serial. `mark` is only used by the bind-status
+-- and clean-token calls.
+local function get_sign(timestamp, mark)
+	if dev.sn == "" or dev.sn_bak == "" then return nil end
+	local ctx = hmac.new(sha256, dev.sn)
+	ctx:update(dev.mac)
+	ctx:update(dev.ddns)
+	ctx:update(timestamp)
+	ctx:update(sha256_hex(dev.sn_bak))
+	if mark then ctx:update(mark) end
+	return hex.encode(ctx:final())
+end
+
+local function http_json(url, body, headers, timeout)
+	local opt = { timeout = timeout or HTTP_TIMEOUT, headers = headers }
+	local ok, resp, err
+	if body then
+		ok, resp, err = pcall(http.post, url, body, opt)
+	else
+		ok, resp, err = pcall(http.get, url, opt)
+	end
+	if not ok then return nil, tostring(resp) end
+	if not resp then return nil, err end
+	if resp.code ~= 200 then return nil, "http code " .. tostring(resp.code) end
+	if not resp.body then return nil, "empty body" end
+	local decoded, data = pcall(cjson.decode, resp.body)
+	if not decoded then return nil, "invalid json" end
+	return data
+end
+
+local function cursor()
+	return uci.cursor()
+end
+
+local function server_name()
+	local c = cursor()
+	local server = c:get(CFG, SEC, "server")
+	if server and server ~= "" then return server end
+	server = dev.country == "CN" and "gslb.gl-inet.cn" or "gslb-eu.goodcloud.xyz"
+	c:set(CFG, SEC, "server", server)
+	c:commit(CFG)
+	return server
+end
+
+local function server_url(src_format)
+	local c = cursor()
+	local server = server_name()
+	if src_format == 1 then
+		local custom = c:get(CFG, SEC, "srv_url")
+		if custom and custom ~= "" then return custom end
+		return SERVERS[server] and SERVERS[server].url or ""
+	end
+	local custom = c:get(CFG, SEC, "srv_api")
+	if custom and custom ~= "" then return custom end
+	return SERVERS[server] and SERVERS[server].api or ""
+end
+
+local function fetch_ca(server)
+	if not has_cert then return true end
+	local ok, resp = pcall(http.get,
+		"https://" .. server .. "/getCaCert/ca.crt", { timeout = HTTP_TIMEOUT })
+	if ok and resp and resp.code == 200 and resp.body and resp.body ~= "" then
+		file.writefile(CA_PATH, resp.body)
+		return true
+	end
+	log.err("fetch ca failed; using cached certificate if present")
+	return file.access(CA_PATH)
+end
+
+local function set_token(value)
+	local c = cursor()
+	if value and value ~= "" then
+		c:set(CFG, SEC, "token", value)
+	else
+		c:delete(CFG, SEC, "token")
+	end
+	c:commit(CFG)
+	file.sync()
+end
+
+local function notify_status()
+	local c = cursor()
+	ubus.call("gl-session", "notify", {
+		name = "cloud.status",
+		data = {
+			cloud_enable = c:get(CFG, SEC, "enable") == "1",
+			username = c:get(CFG, SEC, "username") or "",
+			email = c:get(CFG, SEC, "email") or "",
+			bindtime = c:get(CFG, SEC, "bindtime") or "",
+			bindtype = c:get(CFG, SEC, "bindtype") or "",
+			token_status = mqtt_connected and 1 or 0,
+		},
+	})
+end
+
+-- ---- GoodCloud API -----------------------------------------------------
+
+local function clean_token()
+	local timestamp = os.time() .. "000"
+	local sign = get_sign(timestamp, "_cleanToken")
+	if not sign then return false end
+	local url = server_url(0) .. "/cloud-api/cloud/v2/sdk/device/cleanToken"
+	local body = cjson.encode({ mac = dev.mac, timestamp = timestamp, sign = sign })
+	local data, err = http_json(url, body, { ["Content-Type"] = "application/json" }, 5)
+	if not data or data.code ~= 0 then
+		log.err("clean token failed:", err or (data and data.code))
+		return false
+	end
+	log.info("clean token success")
+	return true
+end
+
+local function check_bind(clean)
+	local timestamp = os.time() .. "000"
+	local sign = get_sign(timestamp, "_cleanToken")
+	if not sign then return BIND_CODE.REQUEST_FAIL end
+	local url = server_url(0) .. "/cloud-api/cloud/v2/sdk/device/bind/status"
+	local body = cjson.encode({ mac = dev.mac, timestamp = timestamp, sign = sign })
+	local data, err = http_json(url, body, { ["Content-Type"] = "application/json" }, 5)
+	if not data then
+		log.err("check bind failed:", err)
+		return BIND_CODE.REQUEST_FAIL
+	end
+	if data.code ~= 0 then
+		log.err("check bind failed with code", data.code)
+		return BIND_CODE.REQUEST_FAIL
+	end
+	local info = data.info or {}
+	local status, bindtype = info.statusCode, info.bindType
+	if status == 0 then
+		if clean == 1 then clean_token() end
+		return BIND_CODE.UNBIND
+	elseif status == 1 then
+		if bindtype == "self" and clean == 1 then
+			clean_token()
+			return BIND_CODE.UNBIND
+		end
+		return BIND_CODE.ISBIND
+	end
+	return BIND_CODE.UNBIND
+end
+
+local function bind_device(url, token, id)
+	local body = {
+		ddns = dev.ddns,
+		mac = dev.mac,
+		sn = dev.sn,
+		password = dev.sn_bak,
+		description = "",
+	}
+	if url:find("self", 1, true) then
+		body.name = dev.ddns
+	elseif url:find("org", 1, true) then
+		body.orgId = id
+		body.name = dev.ddns
+	else
+		body.name = dev.ddns
+		body.orderId = ""
+		body.storage = ""
+		body.varId = id
+	end
+	local data, err = http_json(url, cjson.encode(body), {
+		token = token,
+		["content-type"] = "application/json",
+		["Cloud-Request-Source"] = "Router",
+	})
+	if not data then
+		return { code = -3, err = err }
+	end
+	if data.code ~= 0 then
+		return { code = data.code, err = data.msg or "wrong response" }
+	end
+	return { code = 0 }
+end
+
+local function rebind_device(url, token)
+	local target = string.format(
+		"%s/cloud-api/cloud/v2/device/reActivate?mac=%s", url, dev.mac)
+	local data, err = http_json(target, nil, {
+		token = token,
+		["content-type"] = "application/json",
+		["Cloud-Request-Source"] = "Router",
+	})
+	if not data then return { code = -3, err = err } end
+	if data.code ~= 0 then
+		return { code = data.code, err = data.msg or "wrong response" }
+	end
+	return { code = 0 }
+end
+
+local function bindurl_is_valid(url)
+	if type(url) ~= "string" then return false end
+	local c = cursor()
+	if c:get(CFG, SEC, "custom_enable") == "1" then return true end
+	local allowed = { "https://api.gl-inet.cn", "https://api.goodcloud.xyz" }
+	for _, base in ipairs(allowed) do
+		if url == base or url:sub(1, #base + 1) == base .. "/" then
+			return true
+		end
+	end
+	return false
+end
+
+local function fetch_server()
+	if dev.mac == "" or dev.sn == "" or dev.ddns == "" then
+		log.err("device identity is incomplete; refusing to authenticate")
+		return nil
+	end
+	if not has_cert then
+		log.err("no factory device certificate; GoodCloud requires mutual TLS")
+		return nil
+	end
+	local server = server_name()
+	if not fetch_ca(server) then return nil end
+
+	local token = cursor():get(CFG, SEC, "token")
+	local timestamp = os.time() .. "000"
+	local sign = get_sign(timestamp)
+	if not sign then return nil end
+	local url = string.format(
+		"https://%s/v2/device/auth?deviceType=%s&mac=%s&sn=%s&ddns=%s" ..
+		"&timestamp=%s&sign=%s&token=%s",
+		server, device_type(), dev.mac, dev.sn, dev.ddns,
+		timestamp, sign, token or "")
+	log.info("authenticating with", server)
+	local data, err = http_json(url)
+	if not data then
+		log.err("authentication request failed:", err)
+		return nil
+	end
+	if data.code == 0 then
+		local info = data.info or {}
+		if info.token and info.token ~= "" then set_token(info.token) end
+		return info
+	end
+	log.err("authentication refused: code", data.code, data.msg or "")
+	if data.code == -4 then
+		local bind = check_bind(1)
+		if bind == BIND_CODE.ISBIND then
+			set_token("invalid")
+			notify_status()
+		elseif bind == BIND_CODE.UNBIND then
+			-- cleanToken dropped the server-side token; forget the stale one
+			-- locally too so the next auth starts from an empty token.
+			set_token(nil)
+			reconnect_delay = 0
+		end
+	end
+	return nil
+end
+
+-- ---- MQTT --------------------------------------------------------------
+
+local function current_api()
+	local c = cursor()
+	return {
+		cloud_enable = c:get(CFG, SEC, "enable") == "1",
+		rtty_ssh = c:get("rtty", "general", "ssh_en") == "1",
+		rtty_web = c:get("rtty", "general", "web_en") == "1",
+		username = c:get(CFG, SEC, "username") or "",
+		email = c:get(CFG, SEC, "email") or "",
+		bindtime = c:get(CFG, SEC, "bindtime") or "",
+		bindtype = c:get(CFG, SEC, "bindtype") or "",
+	}
+end
+
+local function publish(topic, payload, qos)
+	if not mqtt_client then return nil end
+	local kind = MSG_TYPE_PLAIN
+	return mqtt_client:publish(topic, table.concat({
+		"GL", string.char(kind), "\0\0\0", payload,
+	}), qos or 0)
+end
+
+local function iface_ip(name)
+	local status = ubus.call("network.interface." .. name, "status") or {}
+	local address = status["ipv4-address"] and status["ipv4-address"][1]
+	return address and address.address or ""
+end
+
+local function wan_ip()
+	for _, name in ipairs({ "wan", "wwan_4", "tethering" }) do
+		local ip = iface_ip(name)
+		if ip ~= "" then return ip end
+	end
+	return ""
+end
+
+local function main_aps()
+	local status = ubus.call("network.wireless", "status") or {}
+	local result = {}
+	for _, radio in pairs(status) do
+		local band = radio.config and radio.config.band
+		for _, iface in ipairs(radio.interfaces or {}) do
+			local cfg = iface.config or {}
+			if cfg.mode == "ap" and not cfg.disabled then
+				result[band] = result[band] or {}
+				result[band].ssid = cfg.ssid or ""
+				result[band].bssid = cfg.macaddr or readfile(
+					"/sys/class/net/" .. tostring(iface.ifname) .. "/address")
+				result[band].ifname = iface.ifname
+			end
+		end
+	end
+	return result
+end
+
+local function get_routes()
+	local routes = {}
+	local function ntoa(value)
+		local n = tonumber(value, 16)
+		if not n then return "0.0.0.0" end
+		local a = n % 256; n = math.floor(n / 256)
+		local b = n % 256; n = math.floor(n / 256)
+		local c = n % 256; n = math.floor(n / 256)
+		return string.format("%d.%d.%d.%d", a, b, c, n % 256)
+	end
+	for line in io.lines("/proc/net/route") do
+		local fields = {}
+		for field in line:gmatch("%S+") do
+			fields[#fields + 1] = field
+		end
+		if fields[1] ~= "Iface" then
+			local flags = tonumber(fields[4], 16) or 0
+			if flags % 2 == 1 then
+				local mask = tonumber(fields[8], 16) or 0
+				local bits = 0
+				while mask > 0 do
+					mask = math.floor(mask / 2)
+					bits = bits + 1
+				end
+				routes[#routes + 1] = {
+					destination = string.format("%s/%d", ntoa(fields[2]), bits),
+					nexthop = ntoa(fields[3]),
+					metric = tonumber(fields[7]),
+					iface = fields[1],
+				}
+			end
+		end
+	end
+	return routes
+end
+
+local function uci_addr(value, default)
+	if type(value) == "table" then value = value[1] end
+	value = tostring(value or ""):gsub("/%d+$", "")
+	if value == "" then return default or "" end
+	return value
+end
+
+local local_rpc
+
+local function build_alive()
+	local aps = main_aps()
+	local c = cursor()
+	local info = {
+		model = dev.model,
+		version = dev.version,
+		version_type = dev.version_type,
+		version_date = dev.version_date,
+		country_code = dev.country,
+		mac = dev.mac,
+		sn = dev.sn,
+		device_id = dev.ddns,
+		has_cert = has_cert,
+		device_name = c:get("system", "@system[0]", "hostname") or dev.hostname,
+		lan_ip = uci_addr(c:get("network", "lan", "ipaddr"),
+			iface_ip("lan")),
+		guest_ip = uci_addr(c:get("network", "guest", "ipaddr"),
+			"192.168.9.1"),
+		iot_ip = uci_addr(c:get("network", "iot", "ipaddr"),
+			"192.168.10.1"),
+		wan_ip = wan_ip(),
+		board_info_model = (ubus.call("system", "board") or {}).model or "",
+		network_mode = c:get("glconfig", "general", "mode") or "router",
+		firmware_type = readfile("/etc/firmware_type"),
+		rtty_ssh = c:get("rtty", "general", "ssh_en") or "",
+		rtty_web = c:get("rtty", "general", "web_en") or "",
+		s2s = tonumber(c:get("gl_s2s", "global", "enable") or "0"),
+		routes = get_routes(),
+		reboot_flag = c:get("glconfig", "cloud", "reboot_flag") or "",
+		reset_uuid = c:get(CFG, SEC, "reset_uuid") or "",
+	}
+	if aps["2g"] then
+		info.ssid = aps["2g"].ssid
+		info.bssid_2g = aps["2g"].bssid
+	end
+	if aps["5g"] then
+		info.ssid5g = aps["5g"].ssid
+		info.bssid_5g = aps["5g"].bssid
+	end
+	local modem = local_rpc("modem", "info")
+	if type(modem) == "table" then
+		info.modem_version = modem.model or ""
+		info.modem_imei = modem.imei or ""
+	end
+	local iccid = c:get("network", "wwan", "pin_iccid")
+	if iccid and iccid ~= "" then info.iccid = iccid end
+	return info
+end
+
+local function send_alive()
+	local info = build_alive()
+	info.time = current_time()
+	local encoded = cjson.encode(info)
+	log.debug("registration:", encoded)
+	publish("/device/registration/" .. dev.mac, encoded)
+end
+
+local function send_notify(msg)
+	if type(msg.type) ~= "string" then return end
+	local parts = {}
+	for part in msg.type:gmatch("[^/]+") do
+		parts[#parts + 1] = part
+	end
+	local data = {
+		id = tostring(current_time()),
+		time = current_time(),
+		code = 0,
+	}
+	data[parts[1]] = { [parts[2]] = { type = msg.type, data = msg.data or {} } }
+	publish("/sys/" .. topic_prefix .. "/event/" .. msg.type, cjson.encode(data))
+end
+
+-- ---- local RPC helpers -------------------------------------------------
+
+local_rpc = function(module, method, params)
+	local c = cursor()
+	local port = 80
+	local conf = readfile("/etc/nginx/conf.d/gl-oui.conf", "*a")
+	local listen = conf:match("listen%s+(%d+)")
+	if listen then port = tonumber(listen) end
+	local url = port == 80 and "http://localhost/rpc" or
+		string.format("http://localhost:%d/rpc", port)
+	local body = cjson.encode({
+		method = "call",
+		params = { "", module, method, params or {} },
+	})
+	local data, err = http_json(url, body, { glinet = 1 })
+	if not data then
+		log.err("local rpc", module .. "." .. method, "failed:", err)
+		return nil
+	end
+	if data.error then
+		log.err("local rpc", module .. "." .. method, "error:",
+			data.error.message or data.error.code)
+		return nil
+	end
+	return data.result
+end
+
+local function system_status()
+	return local_rpc("system", "get_status") or {}
+end
+
+-- ---- cloud features ----------------------------------------------------
+
+local function goodcloud_get()
+	local api = current_api()
+	local local_access = local_rpc("local-access", "get_config") or {}
+	return {
+		cloud_enable = api.cloud_enable,
+		username = api.username,
+		email = api.email,
+		bindtime = api.bindtime,
+		bindtype = api.bindtype,
+		rtty_ssh = api.rtty_ssh,
+		rtty_web = api.rtty_web,
+		http_port = local_access.http_port,
+		https_port = local_access.https_port,
+		redirect_https = local_access.redirect_https,
+	}
+end
+
+local function goodcloud_set(value)
+	if type(value) ~= "table" then return 20010002 end
+	local c = cursor()
+	if type(value.cloud_enable) == "boolean" then
+		c:set(CFG, SEC, "enable", value.cloud_enable and "1" or "0")
+	end
+	if type(value.rtty_ssh) == "boolean" then
+		c:set("rtty", "general", "ssh_en", value.rtty_ssh and "1" or "0")
+	end
+	if type(value.rtty_web) == "boolean" then
+		c:set("rtty", "general", "web_en", value.rtty_web and "1" or "0")
+	end
+	c:commit(CFG)
+	c:commit("rtty")
+	file.sync()
+	notify_status()
+	return nil
+end
+
+local function goodcloud_bind(value)
+	if type(value) ~= "table" then return 20010002 end
+	local c = cursor()
+	local unbind = c:get(CFG, SEC, "unbind")
+	if unbind == "1" and (value.bindtime or "") == "" then
+		c:delete(CFG, SEC, "unbind")
+	end
+	c:set(CFG, SEC, "username", value.username or "")
+	c:set(CFG, SEC, "email", value.email or "")
+	c:set(CFG, SEC, "bindtime", value.bindtime or "")
+	c:set(CFG, SEC, "bindtype", value.bindtype or value.bindType or "")
+	c:commit(CFG)
+	file.sync()
+	notify_status()
+	if unbind == "1" then
+		ubus.call("gl-cloud", "reconnect")
+	end
+	return nil
+end
+
+local function goodcloud_unbind()
+	local c = cursor()
+	c:delete(CFG, SEC, "username")
+	c:delete(CFG, SEC, "email")
+	c:delete(CFG, SEC, "bindtime")
+	c:delete(CFG, SEC, "bindtype")
+	c:commit(CFG)
+	os.execute("/etc/init.d/rtty stop >/dev/null 2>&1")
+	file.sync()
+	notify_status()
+	return nil
+end
+
+local function goodcloud_rtty(value)
+	if type(value) ~= "table" then return 20010002 end
+	local resp = local_rpc("rtty", "run", value)
+	if resp == nil then
+		local status = false
+		for _ = 1, 10 do
+			local state = readfile("/var/run/rtty")
+			if state ~= "" then
+				status = state == "Connected"
+				break
+			end
+			time.sleep(0.1)
+		end
+		ubus.call("gl-cloud", "subscribe_events_notify", {
+			type = "goodcloud/rtty_login",
+			data = { status = status },
+		})
+		return nil
+	end
+	if type(resp) == "table" then
+		return { code = resp.err_code or 20010001, msg = resp.err_msg or "rtty failed" }
+	end
+	return nil
+end
+
+local function base_get()
+	local c = cursor()
+	local status = system_status()
+	local system_info = status.system or {}
+	local boot = readfile("/proc/uptime", "*a")
+	local uptime = tonumber((boot:match("^(%d+)")) or "") or 0
+	local load = status.system and status.system.load_average
+	if not load then
+		local raw = readfile("/proc/loadavg", "*a")
+		local a, b, col = raw:match("^(%S+)%s+(%S+)%s+(%S+)")
+		load = { tonumber(a) or 0, tonumber(b) or 0, tonumber(col) or 0 }
+	end
+	return {
+		compile_time = dev.version_date,
+		device_id = dev.ddns,
+		model = dev.model,
+		sn = dev.sn,
+		version = dev.version,
+		version_type = dev.version_type,
+		device_name = c:get("system", "@system[0]", "hostname") or dev.hostname,
+		uptime = system_info.uptime or uptime,
+		load_average = load,
+		memory_total = system_info.memory_total,
+		memory_buff_cache = system_info.memory_buff_cache,
+		memory_free = system_info.memory_free,
+		country_code = dev.country,
+		firmware_type = readfile("/etc/firmware_type"),
+		netmode = c:get("glconfig", "general", "mode") or "router",
+	}
+end
+
+local function base_rpc(values)
+	if type(values) ~= "table" or type(values[1]) ~= "string" then
+		return 20010002
+	end
+	local result = { values[1], values[2] }
+	local resp
+	if values[3] == nil or values[3] == "" then
+		resp = local_rpc(values[1], values[2])
+	else
+		resp = local_rpc(values[1], values[2], values[3])
+	end
+	if resp == nil then return 20010001 end
+	result[3] = resp
+	return result
+end
+
+local function system_get()
+	local c = cursor()
+	local zone = c:get("system", "@system[0]", "zonename") or "UTC"
+	local hostname = c:get("system", "@system[0]", "hostname") or ""
+	return {
+		timezone = zone,
+		hostname = hostname,
+		security_rule = c:get("oui-httpd", "main", "security_rule") or "0",
+	}
+end
+
+local function shell_quote(value)
+	return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function system_set(values)
+	if type(values) ~= "table" then return { code = 20010002 } end
+	local c = cursor()
+	if values.hostname and values.hostname ~= "" then
+		c:set("system", "@system[0]", "hostname", values.hostname)
+		c:commit("system")
+		os.execute("hostname " .. shell_quote(values.hostname))
+	end
+	if values.timezone then
+		local zone = values.timezone
+		local zonename, tz = zone:match("^([^:]+):(.+)$")
+		if zonename and tz then
+			c:set("system", "@system[0]", "zonename", zonename)
+			c:set("system", "@system[0]", "timezone", tz)
+			c:commit("system")
+			os.execute("/etc/init.d/sysntpd restart >/dev/null 2>&1")
+		end
+	end
+	local password = values.strong_password or values.weak_password
+	if password and password ~= "" then
+		os.execute(string.format(
+			"(echo %s; sleep 1; echo %s) | passwd -a sha256 >/dev/null 2>&1",
+			shell_quote(password), shell_quote(password)))
+		os.execute("/etc/init.d/dropbear restart >/dev/null 2>&1")
+	end
+	ubus.send("gl-cloud", { feature = "system" })
+	return { code = 0 }
+end
+
+local function wifi_logical()
+	local c = cursor()
+	local status = ubus.call("network.wireless", "status") or {}
+	local map = {}
+	for radio_name, radio in pairs(status) do
+		local band = radio.config and radio.config.band
+		for _, iface in ipairs(radio.interfaces or {}) do
+			local cfg = iface.config or {}
+			if cfg.mode == "ap" and not cfg.disabled and band then
+				local key = band == "2g" and "wifi2g" or
+					(band == "5g" and "wifi5g" or nil)
+				if key and not map[key] then
+					map[key] = {
+						section = iface.section,
+						ssid = cfg.ssid or "",
+						key = cfg.key or "",
+						encryption = cfg.encryption or "",
+						ifname = iface.ifname,
+						device = radio_name,
+						band = band == "2g" and "2G" or "5G",
+						hidden = cfg.hidden == "1",
+						guest = false,
+						iot = false,
+					}
+				end
+			end
+		end
+	end
+	return map
+end
+
+local function wifi_get()
+	local map = wifi_logical()
+	local config = { wifi_main = {}, wifi_guest = {} }
+	for key, iface in pairs(map) do
+		iface.ifname = iface.ifname
+		config.wifi_main[key] = iface
+	end
+	return config
+end
+
+local function wifi_set(values)
+	if type(values) ~= "table" then return { code = 20010002 } end
+	local c = cursor()
+	local map = wifi_logical()
+	for key, iface in pairs(map) do
+		local requested = values[key]
+		if type(requested) == "table" then
+			if type(requested.ssid) == "string" and requested.ssid ~= "" then
+				c:set("wireless", iface.section, "ssid", requested.ssid)
+			end
+			if type(requested.key) == "string" and requested.key ~= "" then
+				c:set("wireless", iface.section, "key", requested.key)
+			end
+			if type(requested.hidden) == "boolean" then
+				c:set("wireless", iface.section, "hidden",
+					requested.hidden and "1" or "0")
+			end
+		end
+	end
+	c:commit("wireless")
+	os.execute("wifi reload >/dev/null 2>&1")
+	return nil
+end
+
+local function clients_get()
+	local result = local_rpc("clients", "get_list")
+	if type(result) ~= "table" then return 20010001 end
+	local clients = {}
+	for _, client in ipairs(result.clients or {}) do
+		if client.iface then
+			client.ifname = client.iface
+			client.iface = nil
+		end
+		clients[#clients + 1] = client
+	end
+	return {
+		clients = clients,
+		black_white_list = { mode = "", black_mac = cjson.empty_array,
+			white_mac = cjson.empty_array },
+	}
+end
+
+local FEATURES = {
+	attributes = {
+		base = { get_callback = base_get },
+		system = { get_callback = system_get, set_callback = system_set },
+		goodcloud = { get_callback = goodcloud_get, set_callback = goodcloud_set },
+		wifi = { get_callback = wifi_get, set_callback = wifi_set },
+		clients = { get_callback = clients_get },
+	},
+	commands = {
+		base = {
+			reboot = function()
+				local ret = local_rpc("system", "reboot")
+				return ret == nil and 20010001 or nil
+			end,
+			reset = function()
+				local ret = local_rpc("system", "reset_firmware")
+				return ret == nil and 20010001 or nil
+			end,
+			rpc = base_rpc,
+			cmd = base_rpc,
+		},
+		goodcloud = {
+			get_config = goodcloud_get,
+			set_config = goodcloud_set,
+			bind_goodcloud = goodcloud_bind,
+			unbind_goodcloud = goodcloud_unbind,
+			rtty_run = goodcloud_rtty,
+		},
+		system = {},
+		wifi = {},
+		clients = {},
+	},
+	events = {
+		goodcloud = {
+			device_unbind = {
+				enable = true,
+				set_event_config = function(value)
+					if type(value) == "table" and value.enable ~= nil then
+						FEATURES.events.goodcloud.device_unbind.enable = value.enable
+					end
+					return 0
+				end,
+				get_event_data = function()
+					local c = cursor()
+					return {
+						username = c:get(CFG, SEC, "username") or "",
+						email = c:get(CFG, SEC, "email") or "",
+						bindtime = c:get(CFG, SEC, "bindtime") or "",
+					}
+				end,
+			},
+		},
+	},
+}
+
+local function feature_attributes(feature)
+	local entry = FEATURES.attributes[feature]
+	return entry and type(entry.get_callback) == "function" and
+		entry.get_callback() or nil
+end
+
+local function handle_attribute_get(topic, payload)
+	local keys = payload.feature_keys
+	local body = { id = payload.id, time = current_time(), code = 0 }
+	if type(keys) == "table" then
+		local missing = {}
+		for _, key in ipairs(keys) do
+			local value = feature_attributes(key)
+			if value ~= nil then body[key] = value
+			else missing[#missing + 1] = key end
+		end
+		if #missing > 0 then body.err_list = missing end
+	else
+		for key in pairs(FEATURES.attributes) do
+			body[key] = feature_attributes(key)
+		end
+	end
+	local reply = topic:gsub("get_request", "get_respond")
+	publish(reply, cjson.encode(body))
+end
+
+local function handle_attribute_set(topic, payload)
+	local body = { id = payload.id, time = current_time(), code = 0, err_list = {} }
+	for key, value in pairs(payload) do
+		if key ~= "id" and key ~= "time" then
+			local entry = FEATURES.attributes[key]
+			if entry and type(entry.set_callback) == "function" then
+				local result = entry.set_callback(value)
+				if type(result) == "table" and (result.code or 0) ~= 0 then
+					body.code = result.code
+					body.err_list[#body.err_list + 1] = {
+						module = key, msg = result.msg or "error" }
+				end
+			end
+		end
+	end
+	publish(topic:gsub("set_request", "set_respond"), cjson.encode(body))
+end
+
+local function handle_command(topic, payload)
+	local parts = {}
+	for part in topic:gmatch("[^/]+") do parts[#parts + 1] = part end
+	local feature, method = parts[6], parts[7]
+	local body = { id = payload.id, time = current_time(), code = 0 }
+	local entry = FEATURES.commands[feature] and FEATURES.commands[feature][method]
+	if not entry then
+		body.code = 20010001
+		body.msg = "command not supported"
+	else
+		local result = entry(payload[feature] and payload[feature][method] or payload)
+		if type(result) == "table" and result.code and result.code ~= 0 then
+			body.code = result.code
+			body.msg = result.msg or "error"
+		elseif result ~= nil then
+			body[feature] = { [method] = result }
+		end
+	end
+	publish(topic:gsub("request", "respond"), cjson.encode(body))
+end
+
+local function handle_event(topic, payload)
+	local parts = {}
+	for part in topic:gmatch("[^/]+") do parts[#parts + 1] = part end
+	local method = parts[6]
+	if method == "subscribe_request" then
+		local body = { id = payload.id, time = current_time(), code = 0 }
+		publish(topic:gsub("request", "respond"), cjson.encode(body))
+		return
+	end
+	local feature = parts[6]
+	local event = parts[7]
+	local entry = FEATURES.events[feature] and FEATURES.events[feature][event]
+	if entry and type(entry.set_event_config) == "function" then
+		entry.set_event_config(payload[feature] and payload[feature][event] or {})
+	end
+	local body = { id = payload.id, time = current_time(), code = 0 }
+	publish(topic:gsub("request", "respond"), cjson.encode(body))
+end
+
+local function handle_message(topic, payload)
+	local parts = {}
+	for part in topic:gmatch("[^/]+") do parts[#parts + 1] = part end
+	if parts[5] == "attribute" and parts[6] == "get_request" then
+		handle_attribute_get(topic, payload)
+	elseif parts[5] == "attribute" and parts[6] == "set_request" then
+		handle_attribute_set(topic, payload)
+	elseif parts[5] == "command" then
+		handle_command(topic, payload)
+	elseif parts[5] == "event" then
+		handle_event(topic, payload)
+	end
+end
+
+local function parse_message(data)
+	if type(data) ~= "string" or data:sub(1, 2) ~= "GL" then return nil end
+	local kind = data:byte(3)
+	data = data:sub(7)
+	if kind == MSG_TYPE_PLAIN then return data end
+	if kind == MSG_TYPE_AES then
+		log.err("AES-framed cloud message received but no decryptor is available")
+		return nil
+	end
+	return nil
+end
+
+local function subscription_topics()
+	local topics = {
+		"/sys/" .. topic_prefix .. "/attribute/get_request",
+		"/sys/" .. topic_prefix .. "/attribute/set_request",
+		"/sys/" .. topic_prefix .. "/event/subscribe_request",
+	}
+	for feature, commands in pairs(FEATURES.commands) do
+		for method in pairs(commands) do
+			topics[#topics + 1] = string.format(
+				"/sys/%s/command/%s/%s/request", topic_prefix, feature, method)
+		end
+	end
+	return topics
+end
+
+local function mqtt_init(info)
+	local opts = {
+		id = dev.mac,
+		clean_session = true,
+	}
+	if has_cert then
+		opts.ssl = true
+		opts.ca = CA_PATH
+		opts.cert = CERT_PATH
+		opts.key = KEY_PATH
+	end
+	local client = mqtt.new(opts)
+	client:set("ipaddr", info.ip)
+	client:set("port", tonumber(info.port))
+	client:set("keepalive", tonumber(info.keepalive) or 60)
+	client:set("username", info.id)
+	client:set("password", info.password)
+	mqtt_client = client
+
+	client:on({
+		conack = function(ack)
+			log.info("mqtt conack:", ack.rc, ack.reason)
+			if ack.rc ~= 0 then return end
+			mqtt_connected = sys.uptime()
+			mqtt_connect_id = mqtt_connect_id + 1
+			reconnect_delay = 0
+			for _, topic in ipairs(subscription_topics()) do
+				client:subscribe(topic)
+			end
+			send_alive()
+			notify_status()
+		end,
+
+		publish = function(msg)
+			local payload = parse_message(msg.payload)
+			if not payload then return end
+			local ok, decoded = pcall(cjson.decode, payload)
+			if not ok then
+				log.err("invalid cloud payload on", msg.topic)
+				return
+			end
+			log.debug("cloud message", msg.topic)
+			handle_message(msg.topic, decoded)
+		end,
+
+		error = function(err)
+			log.err("mqtt error:", err)
+			mqtt_connected = nil
+		end,
+	})
+
+	return client
+end
+
+local function close_mqtt(reconnect)
+	if reconnect then force_reconnect_now = true end
+	if mqtt_client then mqtt_client:close() end
+end
+
+-- ---- ubus --------------------------------------------------------------
+
+local function ubus_server()
+	local con, err = ubus.connect()
+	if not con then
+		log.err("ubus connect failed:", err)
+		return
+	end
+
+	local defs = {
+		status = {
+			function(req)
+				con:reply(req, {
+					connected = mqtt_connected and
+						math.floor(sys.uptime() - mqtt_connected) or 0,
+				})
+			end, {},
+		},
+		alive = {
+			function(req)
+				send_alive()
+				con:reply(req, { code = 0 })
+			end, {},
+		},
+		reconnect = {
+			function(req)
+				if mqtt_connected then
+					close_mqtt(true)
+				else
+					reconnect_tmr:set(1)
+				end
+				con:reply(req, { code = 0 })
+			end, {},
+		},
+		notify = {
+			function(req, msg)
+				send_notify(msg)
+				con:reply(req, { code = 0 })
+			end, {},
+		},
+		subscribe_events_notify = {
+			function(req, msg)
+				local parts = {}
+				for part in tostring(msg.type or ""):gmatch("[^/]+") do
+					parts[#parts + 1] = part
+				end
+				if parts[1] and parts[2] then
+					local data = {
+						id = tostring(current_time()),
+						time = current_time(),
+						code = 0,
+					}
+					data[parts[1]] = { [parts[2]] = msg.data or {} }
+					publish("/sys/" .. topic_prefix .. "/event/" ..
+						msg.type, cjson.encode(data), mqtt.QOS1)
+				end
+				con:reply(req, { code = 0 })
+			end, {},
+		},
+		bind = {
+			function(req, msg)
+				if not bindurl_is_valid(msg.url) then
+					con:reply(req, { code = -5, err = "url invalid" })
+					return
+				end
+				if not msg.token or msg.token == "" then
+					con:reply(req, { code = -6, err = "no token" })
+					return
+				end
+				con:reply(req, bind_device(msg.url, msg.token, msg.id))
+			end, { url = ubus.STRING, token = ubus.STRING, id = ubus.STRING },
+		},
+		rebind = {
+			function(req, msg)
+				if not bindurl_is_valid(msg.url) then
+					con:reply(req, { code = -5, err = "url invalid" })
+					return
+				end
+				if not msg.token or msg.token == "" then
+					con:reply(req, { code = -6, err = "no token" })
+					return
+				end
+				con:reply(req, rebind_device(msg.url, msg.token))
+			end, { url = ubus.STRING, token = ubus.STRING },
+		},
+		unbind = {
+			function(req)
+				local c = cursor()
+				c:set(CFG, SEC, "unbind", "1")
+				c:commit(CFG)
+				file.sync()
+				if not mqtt_connected then
+					reconnect_tmr:set(1)
+					con:reply(req, { code = -1, err = "mqtt disconnected" })
+					return
+				end
+				local event = FEATURES.events.goodcloud.device_unbind
+				publish("/sys/" .. topic_prefix ..
+					"/event/goodcloud/device_unbind",
+					cjson.encode(event.get_event_data()))
+				time.sleep(2)
+				if check_bind(0) == BIND_CODE.UNBIND then
+					con:reply(req, { code = 0 })
+					close_mqtt(true)
+				else
+					con:reply(req, { code = -1, err = "mqtt disconnected" })
+					close_mqtt(false)
+				end
+			end, {},
+		},
+		bind_url = {
+			function(req)
+				local c = cursor()
+				if dev.mac == "" then
+					con:reply(req, { url = "", err_code = -1, err = "no mac" })
+					return
+				end
+				local token = c:get(CFG, SEC, "token") or ""
+				if token == "" then
+					con:reply(req, { url = "", err_code = -1,
+						err = "Connecting, please retry later" })
+					return
+				end
+				if token == "invalid" then
+					local bind = check_bind(1)
+					if bind == BIND_CODE.UNBIND then
+						set_token(nil)
+						con:reply(req, { url = "", err_code = -1,
+							err = "Connecting, please retry later" })
+						return
+					end
+					local timestamp = os.time() .. "000"
+					local sign = get_sign(timestamp, "_cleanToken")
+					local url = string.format("%s/#/deviceBind?sign=%s&timestamp=%s&mac=%s",
+						server_url(1), sign or "", timestamp, dev.mac)
+					reconnect_delay = 5
+					con:reply(req, { url = url, err_code = BIND_CODE.ISBIND })
+					return
+				end
+				local timestamp = os.time() .. "000"
+				local ctx = sha256.new()
+				ctx:update(token)
+				ctx:update(timestamp)
+				local sign = hex.encode(ctx:final())
+				local body = cjson.encode({
+					mac = dev.mac, timestamp = timestamp, sign = sign })
+				local data, err = http_json(
+					server_url(0) .. "/cloud-api/cloud/v2/sdk/device/bind/url",
+					body, { ["Content-Type"] = "application/json" }, 5)
+				if not data or not data.info or not data.info.url then
+					con:reply(req, { url = "", err_code = -1,
+						err = err or "no bind url" })
+					return
+				end
+				con:reply(req, { url = data.info.url, err_code = 0 })
+			end, {},
+		},
+		dump_features = {
+			function(req)
+				local features = {}
+				for key in pairs(FEATURES.attributes) do
+					features[key] = { commands = {}, events = {} }
+				end
+				for key, commands in pairs(FEATURES.commands) do
+					features[key] = features[key] or { commands = {}, events = {} }
+					for method in pairs(commands) do
+						features[key].commands[#features[key].commands + 1] = method
+					end
+				end
+				for key, events in pairs(FEATURES.events) do
+					features[key] = features[key] or { commands = {}, events = {} }
+					for name, event in pairs(events) do
+						features[key].events[#features[key].events + 1] = {
+							name = name, enable = event.enable }
+					end
+				end
+				con:reply(req, { features = features })
+			end, {},
+		},
+		dump_subscribe_attributes = {
+			function(req) con:reply(req, { subscribe_attributes = {} }) end, {},
+		},
+		["notify-network-info"] = {
+			function(req)
+				send_alive()
+				con:reply(req, { code = 0 })
+			end, {},
+		},
+		["notify-sim-status"] = {
+			function(req) con:reply(req, { code = 0 }) end, {},
+		},
+		set_log_level = {
+			function(req, msg) con:reply(req, { err_code = 0 }) end,
+			{ level = ubus.INT32 },
+		},
+	}
+
+	local ok, add_err = con:add("gl-cloud", defs)
+	if not ok then
+		log.err("ubus add failed:", add_err)
+		return
+	end
+
+	con:listen("network.interface", function(_, params)
+		local interface = params.interface
+		if params.action ~= "ifup" then return end
+		if interface == "wan" or interface == "wwan" or interface == "lan" then
+			if reconnect_delay > 0 then reconnect_tmr:set(1) end
+		end
+	end)
+	con:listen("ntp.valid", function()
+		if not mqtt_connected then reconnect_tmr:set(1) end
+	end)
+	con:listen("gl-cloud", function(_, msg)
+		if msg.feature == "system" then
+			send_alive()
+		end
+	end)
+
+	while true do
+		time.sleep(1000)
+	end
+end
+
+local function ensure_uuid()
+	local c = cursor()
+	local uuid = c:get(CFG, SEC, "reset_uuid")
+	if type(uuid) == "string" then
+		uuid = uuid:gsub("%-", "")
+		if #uuid == 32 and uuid:match("^%x+$") then
+			return uuid
+		end
+	end
+	local raw = readfile("/proc/sys/kernel/random/uuid")
+	uuid = raw:gsub("%-", "")
+	if #uuid ~= 32 or not uuid:match("^%x+$") then
+		return nil
+	end
+	c:set(CFG, SEC, "reset_uuid", uuid)
+	c:commit(CFG)
+	file.sync()
+	return uuid
+end
+
+local function main()
+	log.set_ident("gl-cloud")
+	local level = cursor():get(CFG, SEC, "log") or "INFO"
+	if type(log[level]) == "number" then
+		log.set_level(log[level])
+	else
+		log.set_level(log.INFO)
+	end
+	log.info("starting, lua-eco", eco.VERSION)
+
+	load_identity()
+	if ensure_uuid() == nil then
+		log.err("could not generate reset_uuid")
+		return
+	end
+
+	local cond = sync.cond()
+	reconnect_tmr = time.timer(function() cond:signal() end)
+	eco.run(ubus_server)
+
+	while true do
+		local info = fetch_server()
+		if info then
+			local client = mqtt_init(info)
+			log.info("mqtt broker", info.ip, info.port)
+			client:run()
+		end
+		mqtt_connected = nil
+		notify_status()
+		if force_reconnect_now then
+			force_reconnect_now = false
+		else
+			if reconnect_delay == 0 then
+				reconnect_delay = 5
+			elseif reconnect_delay < 160 then
+				reconnect_delay = reconnect_delay * 2
+			end
+			local token = cursor():get(CFG, SEC, "token") or ""
+			if token == "invalid" and reconnect_delay > 30 then
+				reconnect_delay = 30
+			end
+			log.info("reconnecting in", reconnect_delay, "seconds")
+			reconnect_tmr:set(reconnect_delay)
+			cond:wait()
+		end
+	end
+end
+
+main()

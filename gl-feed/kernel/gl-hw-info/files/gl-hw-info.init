@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+# Fill /proc/gl-hw-info the way GL's stock kernel does on the XE3000: board
+# facts from the running system, identity from the factory partition.
+#
+# GL's own kernel module reads the layout from a factory_data device-tree
+# node. The OpenWrt device tree on this port does not carry that node, so the
+# offsets below are the XE3000 layout published by the stock DTB:
+#   0x0a  device MAC (6 bytes)      0x10 device DDNS / cloud id (16)
+#   0x20  backup serial (16)        0x30 device serial (16)
+#   0x88  country code (2)          0x1000 certificate + private key (PEM)
+# Everything else (model, WAN/LAN names, firmware type) comes from the
+# running configuration, not from a model-specific table.
+
+START=11
+
+FACTORY=/dev/mmcblk0p3
+P=/proc/gl-hw-info
+
+put() {
+	[ -w "$P/$1" ] && printf '%s' "$2" > "$P/$1"
+}
+
+factory_str() {
+	dd if="$FACTORY" bs=1 skip=$(($1)) count="$2" 2>/dev/null |
+		tr '\377\000\n' '\n\n\n' | head -n 1
+}
+
+board_model() {
+	local id
+	id=$(jsonfilter -i /etc/board.json -e '@.model.id' 2>/dev/null)
+	id=${id##*,}
+	id=${id#gl-}
+	[ -n "$id" ] && echo "$id" || echo xe3000
+}
+
+start() {
+	[ -d "$P" ] || modprobe gl-hw-info 2>/dev/null
+	[ -d "$P" ] || return 1
+
+	put model "$(board_model)"
+	put wan "$(uci -q get network.wan.device)"
+	put lan "$(uci -q get network.lan.device)"
+	put firmware_type "$(cat /etc/firmware_type 2>/dev/null)"
+
+	[ -b "$FACTORY" ] || return 0
+
+	put device_mac "$(dd if="$FACTORY" bs=1 skip=$((0x0a)) count=6 2>/dev/null |
+		hexdump -v -e '6/1 "%02x:"' | sed 's/:$//')"
+	put device_ddns "$(factory_str 0x10 16)"
+	put device_sn_bak "$(factory_str 0x20 16)"
+	put device_sn "$(factory_str 0x30 16)"
+	put country_code "$(factory_str 0x88 2)"
+
+	# Certificate followed by its private key, both PEM, in the first two
+	# 4 KiB blocks of the factory area.
+	local pem
+	pem="$(dd if="$FACTORY" bs=4096 skip=1 count=2 2>/dev/null |
+		tr -d '\377\000')"
+	put device_cert "$(printf '%s\n' "$pem" |
+		sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p')
+"
+	put device_key "$(printf '%s\n' "$pem" |
+		sed -n '/-----BEGIN PRIVATE KEY-----/,/-----END PRIVATE KEY-----/p')
+"
+}

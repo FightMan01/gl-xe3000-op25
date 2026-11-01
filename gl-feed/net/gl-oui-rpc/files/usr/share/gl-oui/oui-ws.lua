@@ -90,16 +90,16 @@ local TOPICS = {
 	["mesh.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/mesh.lua", method = "get_status" },
 	["mesh.topology"] = { kind = "rpc", path = "/usr/lib/oui-rpc/mesh.lua", method = "get_topology" },
 	["vpnclient.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/vpn-client.lua", method = "get_status" },
+	-- The Account/Cloud pages subscribe to cloud.status unconditionally and
+	-- render their bound/unbound state from it. It is an RPC-backed topic,
+	-- like cable/repeater, because the binding state lives in UCI and the
+	-- gl-cloud daemon's ubus status method.
+	["cloud.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/cloud.lua", method = "get_config" },
 }
 
 -- The Internet page also subscribes to "cloud.status" unconditionally on
--- load. GL's cloud/GoodCloud binding isn't implemented here, so there's
--- no ubus call to make for it - handled as a static literal instead of a
--- TOPICS table lookup, so subscribing gets an honest "not bound" answer
--- rather than being silently ignored forever.
-local STATIC_TOPICS = {
-	["cloud.status"] = { bound = false },
-}
+-- load; it is an RPC-backed topic in TOPICS now.
+local STATIC_TOPICS = {}
 
 local function is_loopback()
 	local addr = ngx.var.remote_addr

@@ -15,10 +15,12 @@ GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the origi
 - **gl-oui-runtime** - a small vanilla-JS file that keeps the Internet/Multi-WAN status cards live without needing a page refresh, plus a fallback restore page for getting the GL GUI back after flashing (both original code, not vendored from GL)
 - **gl-cellular** - RM520N-GL modem management over its AT port (SIM/APN config, band locking, cell tower scanning, SMS), plus the `qcm` netifd proto and watchdog for the actual QMI/QMAP data connection
 - **gl-mcu** - the onboard battery/MCU controller daemon (UART, JSON wire protocol with GL's byte-substitution framing)
+- **gl-cloud** - GoodCloud client and Cloud/Account page backend: factory-identity authentication, MQTT over mutual TLS with the device certificate, the bind-URL flow, remote SSH/Web through `rtty`, and the `cloud`/`rtty` RPC objects
+- **gl-hw-info** (kernel) - recreates GL's `/proc/gl-hw-info` identity files (MAC, DDNS id, serials, country, device certificate/key) from the XE3000 factory partition
 - **gl-network-quality** - the 4.11 Network Quality page backend: a ubus daemon that probes the WAN gateway, internet target and DNS once a second, keeps the 30-minute reliability history, samples the active WAN counters, and drives the Cloudflare speedtest with the stock `curl` client
 - **gl-repeater** - WiFi repeater/bridge mode uplink, using a STA interface + double-NAT so it also works against WPA2/3-Enterprise networks (eduroam and the like), which WDS-based repeating never does
 - **openwrt-patches** - the handful of kernel/package patches this needs: turning off PCIe port power management (stops a reset loop on this hardware) and a small lua-cjson patch so an empty list serializes as `[]` instead of `{}`
-- **build-config** - misc build-time package config (ksmbd)
+- **build-config** - misc build-time package config (ksmbd, GoodCloud)
 - **tools/backup-gl-ui.sh** - pulls the GL GUI files off a router that's still on stock firmware, so you can restore them after flashing
 
 ## Flashing
@@ -70,16 +72,30 @@ You'll need a real OpenWrt source checkout, not just the SDK - the kernel patche
    cp openwrt-patches/mediatek-filogic/*.patch target/linux/mediatek/patches-6.18/
    ```
 4. Apply the `lua-cjson` patch against that package's own `patches/` directory (typically `feeds/packages/utils/lua-cjson/patches/`).
-5. `make menuconfig` - Target System: MediaTek Ralink/Filogic, Subtarget: filogic, Target Profile: GL.iNet GL-XE3000. Under Network, select `gl-oui-rpc`, `gl-oui-runtime`, `gl-cellular`, `gl-mcu`, `gl-repeater`, plus `mwan3-nft` (not the official `mwan3`, which is iptables-based and conflicts with it) and `wpad-full` if they aren't already pulled in as dependencies.
+5. `make menuconfig` - Target System: MediaTek Ralink/Filogic, Subtarget: filogic, Target Profile: GL.iNet GL-XE3000. Under Network, select `gl-oui-rpc`, `gl-oui-runtime`, `gl-cellular`, `gl-mcu`, `gl-repeater`, `gl-cloud`, `kmod-gl-hw-info`, `rtty-openssl` and `lua-eco-mqtt`, plus `mwan3-nft` (not the official `mwan3`, which is iptables-based and conflicts with it) and `wpad-full` if they aren't already pulled in as dependencies.
 6. `make -j$(nproc) V=s`
 
 The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what you flash per the [Flashing](#flashing) section above.
 
 ## Status
 
-Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, the battery/MCU controller, and the 4.11 Network Quality, DNS and UPnP pages. The 4.11 Mesh page is present with an autoconfiguring prplmesh controller/agent; multi-node onboarding is not verified yet. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, multi-node EasyMesh onboarding and remote node upgrade, cloud security scan, and OLED screen scheduling (this device has no screen).
+Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, the battery/MCU controller, the 4.11 Network Quality, DNS, UPnP and Mesh pages, and a working GoodCloud client (bind URL, MQTT presence, remote SSH/Web). Multi-node EasyMesh onboarding is not verified yet. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, multi-node EasyMesh onboarding and remote node upgrade, cloud security scan, GoodCloud firmware-upgrade commands (deliberately rejected so the port cannot be replaced by a stock image), and OLED screen scheduling (this device has no screen).
 
 Tested on a physical XE3000. Issues and pull requests welcome.
+
+## GoodCloud
+
+`gl-cloud` speaks the same protocol as the stock 4.11 client:
+
+- Identity comes from the factory partition, exposed through `/proc/gl-hw-info`: WAN MAC, DDNS id, device serial and backup serial, country, and the device certificate/private key.
+- Authentication is `GET /v2/device/auth` with an HMAC-SHA256 over `mac || ddns || timestamp || sha256(backup serial)`, keyed with the device serial. The answer is the MQTT broker address plus a cached `token`.
+- MQTT runs over mutual TLS (port 28883) using the factory certificate; the registration payload is published to `/device/registration/<mac>`, and the attribute/command/event topics under `/sys/xe3000/4.11.0-op25/<mac>/` are served by the daemon.
+- The Account page's **Get Started** flow returns the real GoodCloud bind URL. The first time this port runs, the local account fields are empty even if the device is still bound on the GoodCloud side; open that URL once, sign in, and GoodCloud sends the bind command that fills the username/bind time locally.
+- Remote SSH and Web access are opened by GoodCloud through the upstream `rtty` client (`rtty-openssl`); the Cloud page's two switches are stored in `/etc/config/rtty`.
+
+Deliberate boundary: the daemon does **not** implement `ota` or any firmware-upgrade command. GoodCloud must never flash a GL stock image over this port. It also does not advertise the modem or DPI feature tabs, because those upstream RPC contracts do not match this port's `gl-cellular`/DPI implementation.
+
+The kernel module writes no board-specific constants beyond the XE3000 factory layout (documented in `gl-feed/kernel/gl-hw-info/files/gl-hw-info.init`); model, WAN/LAN names and firmware type are read from `/etc/board.json`, UCI and `/etc/firmware_type` at boot.
 
 ## Cellular data path
 

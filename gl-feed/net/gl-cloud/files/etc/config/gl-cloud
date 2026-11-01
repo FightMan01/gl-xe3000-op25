@@ -1,0 +1,6 @@
+config cloud 'cloud'
+	option enable '0'
+	option log 'INFO'
+	# Filled in at first boot from the factory country code by
+	# /etc/uci-defaults/99-gl-cloud (CN -> gslb.gl-inet.cn, else EU).
+	option server ''

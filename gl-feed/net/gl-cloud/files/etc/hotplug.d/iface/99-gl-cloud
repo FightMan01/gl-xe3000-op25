@@ -1,0 +1,8 @@
+#!/bin/sh
+# Tell the cloud daemon the WAN/LAN state changed so it can re-authenticate
+# or refresh the registration without waiting for the next MQTT error.
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+
+ubus call gl-cloud notify-network-info >/dev/null 2>&1 &
+exit 0
