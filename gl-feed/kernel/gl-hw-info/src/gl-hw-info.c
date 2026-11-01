@@ -47,6 +47,7 @@ static struct gl_hw_entry entries[] = {
 	{ "device_sn", 0644 },
 	{ "device_sn_bak", 0644 },
 	{ "country_code", 0644 },
+	{ "firmware_type", 0644 },
 	{ "device_cert", 0644 },
 	{ "device_key", 0600 },
 };
