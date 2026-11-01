@@ -1,0 +1,41 @@
+#!/bin/sh
+# First-boot defaults for GoodCloud. The server is picked from the factory
+# country code, exactly like stock: CN uses the mainland endpoints, every
+# other region uses the EU gslb. No hostname is hardcoded per board.
+
+[ -f /etc/config/gl-cloud ] || touch /etc/config/gl-cloud
+
+if ! uci -q get gl-cloud.@cloud[0] >/dev/null 2>&1; then
+	uci -q set gl-cloud.@cloud[0]='cloud'
+	uci -q set gl-cloud.@cloud[0].enable='0'
+	uci -q set gl-cloud.@cloud[0].log='INFO'
+fi
+
+country=$(cat /proc/gl-hw-info/country_code 2>/dev/null)
+if [ -z "$country" ] && [ -b /dev/mmcblk0p3 ]; then
+	country=$(dd if=/dev/mmcblk0p3 bs=1 skip=136 count=2 2>/dev/null |
+		tr -d '\000\377\n')
+fi
+if [ -z "$(uci -q get gl-cloud.@cloud[0].server)" ]; then
+	case "$country" in
+	CN) uci -q set gl-cloud.@cloud[0].server='gslb.gl-inet.cn' ;;
+	*)  uci -q set gl-cloud.@cloud[0].server='gslb-eu.goodcloud.xyz' ;;
+	esac
+fi
+uci -q commit gl-cloud
+
+# Remote-access switches the Cloud page writes. rtty's own package ships the
+# commented example config; the stock firmware creates this section at first
+# boot, so do the same.
+if [ -f /etc/config/rtty ]; then
+	if ! uci -q get rtty.general >/dev/null 2>&1; then
+		uci -q set rtty.general='general'
+	fi
+	uci -q get rtty.general.ssh_en >/dev/null 2>&1 ||
+		uci -q set rtty.general.ssh_en='1'
+	uci -q get rtty.general.web_en >/dev/null 2>&1 ||
+		uci -q set rtty.general.web_en='1'
+	uci -q commit rtty
+fi
+
+exit 0
