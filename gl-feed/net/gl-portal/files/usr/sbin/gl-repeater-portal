@@ -174,7 +174,7 @@ end
 -- have that answer stripped for LAN clients. While a portal is pending, allow
 -- private answers for that host only, as travelmate does, and drop the
 -- exception once the portal is passed or the uplink is gone. Like the DNS
--- include above: a tmpfs file, rewritten and reloaded only when it changes.
+-- include above: a tmpfs file, rewritten and restarted only when it changes.
 --
 -- The portal page often loads sibling hosts (Telekom's redirect points at
 -- virtual-ip.instant.telekom.hu while the login page is on
