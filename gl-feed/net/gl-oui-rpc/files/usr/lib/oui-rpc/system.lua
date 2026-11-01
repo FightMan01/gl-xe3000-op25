@@ -426,7 +426,7 @@ return {
 		-- than the raw "SNAPSHOT" DISTRIB_RELEASE. GL_PORT_VERSION is this
 		-- port's own branded string; board_info.openwrt_version below
 		-- still reports the real underlying OpenWrt release.
-		local GL_PORT_VERSION = "4.9.0-op25"
+		local GL_PORT_VERSION = "4.11.0-op25"
 		local ver = GL_PORT_VERSION
 		local sysinfo = get_sysinfo()
 		-- BusyBox has no `nproc` binary, so count /proc/cpuinfo entries
@@ -439,7 +439,7 @@ return {
 
 		local have_ksmbd = ksmbd_available()
 		local hidden_features = {
-			"astrowarp", "bridge", "cloud",
+			"astrowarp", "bridge",
 			"dpifeatures", "dynamicdns",
 		}
 		if not have_ksmbd then
@@ -494,13 +494,12 @@ return {
 			device_id = identity.device_id or "",
 			device_type = 2,
 			firmware_date = "",
-			firmware_type = "snapshot",
+			firmware_type = "port",
 			-- The menu filter's hiddenList mechanism (fed by this field) is
 			-- the standard way to suppress specific views per product -
 			-- this list is every view this port's RPC layer has no backing
-			-- object for. "cloud" and "astrowarp" are the only two views
-			-- under the "Cloud Services" parent, so hiding both makes that
-			-- entire sidebar section disappear too.
+			-- object for. Cloud/GoodCloud now has a backend, so only the
+			-- AstroWarp view under "Cloud Services" stays hidden.
 			hidden_features = hidden_features,
 			sn = sn,
 			sn_bak = "",

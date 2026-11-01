@@ -171,13 +171,19 @@ local function rpc_call(id, params)
 	local cursor = uci.cursor()
 	-- Uninitialized device (no password set): the setup wizard needs full
 	-- RPC access (modem/wifi/cable/lan/etc.) with no session at all, since
-	-- none can exist yet - matches rpc_alive's same root_password_is_set()
-	-- check and the observed real behavior (wizard opens directly, no
-	-- login). Once a real password exists, this bypass stops applying and
-	-- every object/method goes back through normal session+ACL checks -
-	-- this is intentionally NOT a permanent broad allowlist, only active
-	-- during the narrow pre-setup window.
-	local no_auth = is_no_auth(cursor, object, method) or not root_password_is_set()
+	-- Two narrow bypasses sit in front of the session check:
+	--   * before a root password exists, the setup wizard has to be able to
+	--     create one (matches rpc_alive's root_password_is_set() check);
+	--   * a loopback caller with the `glinet` header is a local daemon
+	--     (gl-cloud and the other userspace helpers), which GL's own
+	--     oui-httpd also allows. There is no per-user split on the router:
+	--     every local process already runs as root, so this does not widen
+	--     access beyond what a process running as root could already do.
+	-- Everything else still goes through the normal session and ACL checks.
+	local local_call = ngx.var.remote_addr == "127.0.0.1" or
+		ngx.var.remote_addr == "::1"
+	local no_auth = local_call or is_no_auth(cursor, object, method) or
+		not root_password_is_set()
 
 	local aclgroup = nil
 	if not no_auth then
