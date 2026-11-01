@@ -712,9 +712,14 @@ local function goodcloud_unbind()
 	c:delete(CFG, SEC, "bindtime")
 	c:delete(CFG, SEC, "bindtype")
 	c:commit(CFG)
+	-- The broker token from before the unbind is invalid now. Drop it and
+	-- reconnect so the next auth gets a fresh token; otherwise bind_url
+	-- sends the stale token and the API answers "Parameter error".
+	set_token(nil)
 	os.execute("/etc/init.d/rtty stop >/dev/null 2>&1")
 	file.sync()
 	notify_status()
+	ubus.call("gl-cloud", "reconnect")
 	return nil
 end
 
@@ -899,6 +904,145 @@ local function wifi_set(values)
 	return nil
 end
 
+local function cable_get()
+	local status = local_rpc("cable", "get_ports_status")
+	local config = local_rpc("cable", "get_ports_config")
+	if type(status) ~= "table" or type(config) ~= "table" then
+		return 20010001
+	end
+	local map = {}
+	for _, port in ipairs(config.ports or {}) do
+		map[port.name] = port
+	end
+	local ports = {}
+	for _, port in ipairs(status.ports or {}) do
+		local cfg = map[port.name] or {}
+		ports[#ports + 1] = {
+			name = port.name,
+			speed = port.speed,
+			duplex = port.duplex,
+			sfp_online = port.sfp_online,
+			silk = cfg.silk,
+			mode = cfg.mode,
+			default_mode = cfg.default_mode,
+		}
+	end
+	return { ports = ports }
+end
+
+
+local function kmwan_get()
+	local config = local_rpc("kmwan", "get_config")
+	if type(config) ~= "table" or type(config.interfaces) ~= "table" then
+		return 20010001
+	end
+	local interfaces = {}
+	for _, entry in ipairs(config.interfaces) do
+		interfaces[#interfaces + 1] = {
+			interface = entry.interface,
+			metric = tonumber(entry.metric) or 0,
+		}
+	end
+	return { interfaces = interfaces }
+end
+
+local function mcu_get()
+	local mcu = ubus.call("mcu", "status")
+	if type(mcu) ~= "table" then return 20010001 end
+	return {
+		temperature = tonumber(mcu.temperature),
+		charge_percent = tonumber(mcu.charge_percent),
+		charging_status = tonumber(mcu.charging_status),
+		charge_cnt = tonumber(mcu.charge_cnt),
+		abnormal = mcu.abnormal,
+		abnormal_type = tonumber(mcu.abnormal_type),
+		fastcharge = mcu.fastcharge,
+	}
+end
+
+local function modem_get()
+	local info = local_rpc("modem", "info") or {}
+	local status = local_rpc("modem", "status") or {}
+	local signals = local_rpc("modem", "get_signals") or {}
+	local c = cursor()
+	local iccid = c:get("network", "wwan", "pin_iccid") or
+		c:get("gl-cellular", "state", "last_iccid") or ""
+	local active = tonumber(info.active_slot) or 1
+	local entry = (signals.signals or {})[active] or (signals.signals or {})[1]
+	local cell = entry and entry.signal and entry.signal[1] or {}
+	local level = tonumber(cell.rsrp_level) or 0
+	local wwan = ubus.call("network.interface.wwan_4", "status") or {}
+	local address = wwan["ipv4-address"] and wwan["ipv4-address"][1]
+	return {
+		status = status.connected and 1 or 0,
+		online = status.connected and 0 or 1,
+		exist_sim_card = iccid ~= "",
+		sim_card = {
+			status = iccid ~= "" and 1 or 0,
+			carrier = info.operator or "",
+			phone_number = "",
+			iccid = iccid,
+			signal = {
+				strength = level * 20,
+				rssi = tonumber(cell.rssi) or 0,
+				rsrp = tonumber(cell.rsrp) or 0,
+				rsrq = tonumber(cell.rsrq) or 0,
+				sinr = tonumber(cell.sinr) or 0,
+				network_type = info.network_type or "",
+				mode = info.network_type or "",
+				band_mode = info.network_type or "",
+				band = tonumber(cell.band) or 0,
+				bandwidth = tonumber(cell.bandwidth) or 0,
+				id = tostring(cell.pci or ""),
+			},
+		},
+		ipv4 = {
+			ip = address and address.address or "",
+			dns = {},
+			gateway = "",
+			netmask = "",
+		},
+		ipv6 = {},
+		slot_config = {
+			current_sim = active,
+			main_sim = active,
+			enable_switch = false,
+			enable_timing = false,
+			switch_time = "03:00",
+			sim_config = {},
+		},
+		sim_slot_num = 1,
+		external_modules = false,
+		external = { signal = {}, ipv6 = {}, sim_config = {} },
+	}
+end
+
+local function ethernet1_get()
+	local status = local_rpc("cable", "get_status") or {}
+	local config = local_rpc("cable", "get_config") or {}
+	local wan = ubus.call("network.interface.wan", "status") or {}
+	local mode = tonumber(status.mode) or 0
+	local result = {
+		mode = mode,
+		enabled = mode == 0,
+		protocol = status.protocol or config.protocol or "dhcp",
+		status = tonumber(status.status) or 0,
+		online = wan.up and 0 or 1,
+		ipv4 = status.ipv4 or { ip = "", dns = {}, gateway = "", netmask = "" },
+		ipv6 = { ip = {}, dns = {}, gateway = {} },
+		username = config.username or "",
+		password = config.password or "",
+	}
+	if tonumber(config.mtu) and tonumber(config.mtu) > 0 then
+		result.mtu = tonumber(config.mtu)
+	end
+	if mode ~= 0 then
+		return { enabled = false, online = 1, status = result.status,
+			protocol = "dhcp" }
+	end
+	return result
+end
+
 local function clients_get()
 	local result = local_rpc("clients", "get_list")
 	if type(result) ~= "table" then return 20010001 end
@@ -926,6 +1070,11 @@ local FEATURES = {
 		goodcloud = { get_callback = goodcloud_get, set_callback = goodcloud_set },
 		wifi = { get_callback = wifi_get, set_callback = wifi_set },
 		clients = { get_callback = clients_get },
+		cable = { get_callback = cable_get },
+		ethernet1 = { get_callback = ethernet1_get },
+		kmwan = { get_callback = kmwan_get },
+		mcu = { get_callback = mcu_get },
+		modem = { get_callback = modem_get },
 	},
 	commands = {
 		base = {
@@ -1354,8 +1503,9 @@ local function ubus_server()
 					server_url(0) .. "/cloud-api/cloud/v2/sdk/device/bind/url",
 					body, { ["Content-Type"] = "application/json" }, 5)
 				if not data or not data.info or not data.info.url then
-					con:reply(req, { url = "", err_code = -1,
-						err = err or "no bind url" })
+					con:reply(req, { url = "",
+						err_code = (data and data.code) or -1,
+						err = (data and data.msg) or err or "no bind url" })
 					return
 				end
 				con:reply(req, { url = data.info.url, err_code = 0 })
