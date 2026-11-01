@@ -946,6 +946,29 @@ local function kmwan_get()
 	return { interfaces = interfaces }
 end
 
+local function kmwan_set(values)
+	if type(values) ~= "table" or type(values.interfaces) ~= "table" then
+		return { code = 20010002, msg = "invalid parameter" }
+	end
+	local interfaces = {}
+	for _, entry in ipairs(values.interfaces) do
+		if type(entry) == "table" and entry.interface then
+			interfaces[#interfaces + 1] = {
+				interface = entry.interface,
+				metric = tonumber(entry.metric) or 0,
+			}
+		end
+	end
+	local resp = local_rpc("kmwan", "set_config", {
+		mode = 0,
+		interfaces = interfaces,
+	})
+	if resp == nil then
+		return { code = 20010001, msg = "set kmwan failed" }
+	end
+	return nil
+end
+
 local function mcu_get()
 	local mcu = ubus.call("mcu", "status")
 	if type(mcu) ~= "table" then return 20010001 end
@@ -963,39 +986,52 @@ end
 local function modem_get()
 	local info = local_rpc("modem", "info") or {}
 	local status = local_rpc("modem", "status") or {}
-	local signals = local_rpc("modem", "get_signals") or {}
+	local cell_info = local_rpc("modem", "get_cell_info") or {}
 	local c = cursor()
 	local iccid = c:get("network", "wwan", "pin_iccid") or
 		c:get("gl-cellular", "state", "last_iccid") or ""
 	local active = tonumber(info.active_slot) or 1
-	local entry = (signals.signals or {})[active] or (signals.signals or {})[1]
-	local cell = entry and entry.signal and entry.signal[1] or {}
+	local cell = (cell_info.signal or {})[1] or {}
+	if not cell.rsrp then
+		local history = local_rpc("modem", "get_signals") or {}
+		local entry = (history.signals or {})[active] or (history.signals or {})[1]
+		cell = entry and entry.signal and entry.signal[1] or {}
+	end
 	local level = tonumber(cell.rsrp_level) or 0
 	local wwan = ubus.call("network.interface.wwan_4", "status") or {}
 	local address = wwan["ipv4-address"] and wwan["ipv4-address"][1]
-	-- GL's modem dial-status enum: 0 disconnected, 1 connecting,
-	-- 2 connected. The Ethernet port enum uses 1 for connected, but the
-	-- cellular card follows this one.
+	-- GL's modem dial-status enum is the reverse of the Ethernet one:
+	-- 0 connected, 1 connecting, 2 disconnected. The stock map_dial_status
+	-- defaults to 2, the safe disconnected value.
 	return {
-		status = status.connected and 2 or 0,
+		status = status.connected and 0 or 2,
 		online = status.connected and 0 or 1,
 		exist_sim_card = iccid ~= "",
 		sim_card = {
-			status = iccid ~= "" and 1 or 0,
+			-- GL's SIM status enum: 0 absent, 1 initializing, 2 ready.
+			status = iccid ~= "" and 2 or 0,
 			carrier = info.operator or "",
 			phone_number = "",
 			iccid = iccid,
 			signal = {
-				strength = level * 20,
+				-- The cloud UI draws a 0-5 bar meter; the stock client
+				-- forwards the modem's signal level here, not a percentage.
+				strength = level,
 				rssi = tonumber(cell.rssi) or 0,
 				rsrp = tonumber(cell.rsrp) or 0,
 				rsrq = tonumber(cell.rsrq) or 0,
 				sinr = tonumber(cell.sinr) or 0,
+				rsrp_level = level,
+				rssi_level = tonumber(cell.rssi_level) or 0,
+				rsrq_level = tonumber(cell.rsrq_level) or 0,
+				sinr_level = tonumber(cell.sinr_level) or 0,
 				network_type = info.network_type or "",
 				mode = info.network_type or "",
 				band_mode = info.network_type or "",
 				band = tonumber(cell.band) or 0,
 				bandwidth = tonumber(cell.bandwidth) or 0,
+				ul_bandwidth = tonumber(cell.bandwidth) or 0,
+				dl_bandwidth = tonumber(cell.bandwidth) or 0,
 				id = tostring(cell.pci or ""),
 			},
 		},
@@ -1075,7 +1111,7 @@ local FEATURES = {
 		clients = { get_callback = clients_get },
 		cable = { get_callback = cable_get },
 		ethernet1 = { get_callback = ethernet1_get },
-		kmwan = { get_callback = kmwan_get },
+		kmwan = { get_callback = kmwan_get, set_callback = kmwan_set },
 		mcu = { get_callback = mcu_get },
 		modem = { get_callback = modem_get },
 	},
