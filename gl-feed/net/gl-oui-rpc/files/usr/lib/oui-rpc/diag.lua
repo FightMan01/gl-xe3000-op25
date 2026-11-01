@@ -55,8 +55,7 @@ return {
 	end,
 
 	traceroute = function(args)
-		args = args or {}
-		local addr = trim(args.addr)
+		local addr = address(args)
 		if not valid_ipv4(addr) and not valid_domain(addr) then
 			return { trace_result = "ip address is not correct" }
 		end
