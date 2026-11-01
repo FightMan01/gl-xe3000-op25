@@ -1083,7 +1083,9 @@ end
 local function handle_message(topic, payload, raw)
 	-- The wildcard subscription also receives our own respond/event
 	-- publications; handling those would reply to ourselves in a loop.
-	if not (topic:match("/request$") or topic:match("/subscribe_request$")) then
+	-- Attribute topics end in get_request/set_request (no slash before
+	-- "request"), commands end in /request.
+	if not (topic:match("/request$") or topic:match("_request$")) then
 		return
 	end
 	if is_duplicate(topic, raw) then return end
