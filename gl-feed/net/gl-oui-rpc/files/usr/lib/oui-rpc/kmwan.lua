@@ -59,13 +59,18 @@ end
 -- to the frontend as "modem".
 local MEMBERS = {
 	{ real = "wan", member = "wan_m1_w1", frontend = "wan" },
+	-- Repeater is a WAN source, not a last-resort backup: stock GL has no
+	-- separate repeater member because the STA takes the WAN slot. Keep it
+	-- ahead of the cellular modem so connecting to an uplink actually uses it
+	-- (and so captive-portal traffic stays on the STA instead of leaking out
+	-- over cellular).
+	{ real = "repeater", member = "repeater_m3_w1", frontend = "wwan" },
 	-- These are the identifiers used by the shipped Internet page:
 	-- modem cards look up modem_<bus>, while the repeater card looks up
 	-- wwan.  Returning the friendly names "modem"/"repeater" prevented
 	-- interfaceConfig from reaching either card, so the stock
 	-- "connected but no Internet" warning could never render.
 	{ real = "wwan_4", member = "wwan4_m2_w1", frontend = "modem_mhi0", metered = true },
-	{ real = "repeater", member = "repeater_m3_w1", frontend = "wwan" },
 	{ real = "tethering", member = "tethering_m4_w1", frontend = "tethering", metered = true },
 }
 
@@ -92,8 +97,10 @@ local function find_member(frontend_name)
 	end
 	-- Accept identifiers emitted by earlier builds so an already-open UI
 	-- can still save its Multi-WAN form during a rolling live update.
-	if frontend_name == "modem" then return MEMBERS[2] end
-	if frontend_name == "repeater" then return MEMBERS[3] end
+	for _, m in ipairs(MEMBERS) do
+		if frontend_name == "modem" and m.real == "wwan_4" then return m end
+		if frontend_name == "repeater" and m.real == "repeater" then return m end
+	end
 	return nil
 end
 

@@ -124,9 +124,10 @@ end
 -- the URL supplied by the upstream captive network from resolving.  Use a
 -- tmpfs dnsmasq include instead of changing /etc/config/dhcp, so leaving
 -- portal mode (or rebooting) automatically restores the normal resolver.
--- Idempotent: only reload dnsmasq when the include actually changes, so a
+-- Idempotent: only restart dnsmasq when the include actually changes, so a
 -- disconnect (or any other path that calls restore with nothing pending)
--- doesn't bounce the resolver for nothing.
+-- doesn't bounce the resolver for nothing. A reload (SIGHUP) would not
+-- re-read conf-dir, so the include has to go through a full restart.
 -- mwan3 judges the repeater by pinging public hosts, which a captive portal
 -- blocks until login, so it keeps the uplink "offline" and marks everything -
 -- the portal's own DNS and login pages included - for the cellular table.
@@ -193,7 +194,7 @@ local function set_portal_dns(cursor, dns)
 	file:write(content)
 	file:close()
 	os.rename(temp, path)
-	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
 	return true
 end
 
@@ -207,7 +208,7 @@ local function restore_portal_dns(cursor)
 	if not existing then return false end
 	existing:close()
 	os.remove(path)
-	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
 	return true
 end
 
@@ -246,6 +247,110 @@ local function current_saved(cursor, iface)
 		end
 	end)
 	return found
+end
+
+-- Repeater MAC mode.  The frontend sends and reads macaddr as
+-- {macaddr = "xx:..", mode = "default"|"random"|"manual", update = "none"|...}.
+-- "default" leaves wireless.<iface>.macaddr unset so mac80211 derives the STA
+-- address from the radio; the other two write the override.  The choice is
+-- stored on the saved network and mirrored in gl-repeater.settings for the
+-- live uplink, because the single shared wifinet section cannot remember it
+-- across saved networks.
+local MAC_PATTERN = "^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$"
+
+local function read_mac(dev)
+	if not dev then return nil end
+	local f = io.open("/sys/class/net/" .. dev .. "/address", "r")
+	if not f then return nil end
+	local mac = (f:read("*l") or ""):lower()
+	f:close()
+	if not mac:match(MAC_PATTERN) then return nil end
+	return mac
+end
+
+local function random_mac()
+	local f = io.open("/dev/urandom", "rb")
+	if not f then return nil end
+	local octets = {}
+	for i = 1, 6 do
+		local byte = f:read(1)
+		if not byte then f:close() return nil end
+		octets[i] = byte:byte()
+	end
+	f:close()
+	-- locally administered, unicast: clear bit 0, set bit 1
+	local first = octets[1]
+	first = first - (first % 2)
+	if first % 4 < 2 then first = first + 2 end
+	octets[1] = first
+	local out = {}
+	for i = 1, 6 do out[i] = string.format("%02x", octets[i]) end
+	return table.concat(out, ":")
+end
+
+local function stored_mac(cursor, saved, dev)
+	-- saved is a saved_ap section table in the RPC paths, but apply_config
+	-- works with the section name; accept both.
+	local section = type(saved) == "table" and saved[".name"] or saved
+	local mode, update, value
+	if section then
+		mode = cursor:get("gl-repeater", section, "mac_mode")
+		update = cursor:get("gl-repeater", section, "mac_update")
+		value = cursor:get("gl-repeater", section, "mac_value")
+	else
+		mode = cursor:get("gl-repeater", "settings", "mac_mode")
+		update = cursor:get("gl-repeater", "settings", "mac_update")
+		value = cursor:get("gl-repeater", "settings", "mac_value")
+	end
+	if mode ~= "random" and mode ~= "manual" then mode = "default" end
+	if update == nil or update == "" then update = "none" end
+	if mode == "default" then
+		value = read_mac(dev)
+	elseif not value or value == "" then
+		value = read_mac(dev) or ""
+	end
+	return { macaddr = value or "", mode = mode, update = update }
+end
+
+local function apply_mac(cursor, iface, value)
+	-- Older callers passed a bare MAC string.
+	if type(value) == "string" then
+		value = { macaddr = value, mode = "manual" }
+	end
+	if type(value) ~= "table" then return nil end
+
+	local mode = tostring(value.mode or "default")
+	local update = tostring(value.update or "none")
+	local mac = tostring(value.macaddr or ""):lower()
+	if mode ~= "random" and mode ~= "manual" then mode = "default" end
+
+	if mode == "default" then
+		cursor:delete("wireless", iface, "macaddr")
+		return { mode = mode, update = update, macaddr = "" }
+	end
+	if mode == "random" and not mac:match(MAC_PATTERN) then
+		mac = random_mac()
+	end
+	if not mac or not mac:match(MAC_PATTERN) then
+		return nil, "invalid MAC address"
+	end
+	cursor:set("wireless", iface, "macaddr", mac)
+	return { mode = mode, update = update, macaddr = mac }
+end
+
+local function store_mac(cursor, saved, mac)
+	if not mac then return end
+	local targets = { { "gl-repeater", "settings" } }
+	if saved then targets[#targets + 1] = { "gl-repeater", saved } end
+	for _, target in ipairs(targets) do
+		cursor:set(target[1], target[2], "mac_mode", mac.mode)
+		cursor:set(target[1], target[2], "mac_update", mac.update)
+		if mac.mode == "default" then
+			cursor:delete(target[1], target[2], "mac_value")
+		else
+			cursor:set(target[1], target[2], "mac_value", mac.macaddr)
+		end
+	end
 end
 
 local RADIOS = { "radio0", "radio1" }
@@ -504,6 +609,11 @@ local function apply_config(args)
 		cursor:delete("wireless", iface, "identity")
 		cursor:delete("wireless", iface, "password")
 	end
+	local mac, mac_error
+	if args.macaddr ~= nil then
+		mac, mac_error = apply_mac(cursor, iface, args.macaddr)
+		if not mac then return { code = 1, message = mac_error } end
+	end
 	cursor:commit("wireless")
 
 	if args.protocol then
@@ -573,6 +683,7 @@ local function apply_config(args)
 			end
 		end
 	end
+	store_mac(cursor, saved_section, mac)
 	cursor:commit("gl-repeater")
 
 	reload_wifi()
@@ -591,20 +702,16 @@ return {
 	end,
 
 	-- dfs_support mirrors wifi.lua's 5G-radio DFS-channel support
-	-- (radio1 supports the 52-144 DFS range). macaddr reports the
-	-- repeater STA interface's real MAC once configured, else the
-	-- primary radio's own MAC. auto/smart_reconnect are always true -
-	-- this port always attempts to stay connected to a configured
-	-- upstream AP, there's no separate toggle for either yet.
+	-- (radio1 supports the 52-144 DFS range). macaddr carries the current
+	-- repeater MAC choice in the frontend's {macaddr, mode, update} shape.
+	-- auto/smart_reconnect are always true - this port always attempts to
+	-- stay connected to a configured upstream AP, there's no separate
+	-- toggle for either yet.
 	get_config = function(args)
 		local cursor = uci.cursor()
 		local iface = repeater_iface(cursor)
-		local mac = nil
-		local mf = io.open("/sys/class/net/eth1/address", "r")
-		if mf then
-			mac = (mf:read("*l") or ""):lower()
-			mf:close()
-		end
+		local saved = iface and current_saved(cursor, iface)
+		local mac = stored_mac(cursor, saved, iface and real_ifname(iface))
 		if not iface then
 			return {
 				configured = false,
@@ -757,6 +864,8 @@ return {
 	get_saved_ap_list = function(args)
 		local cursor = uci.cursor()
 		local saved = {}
+		local live_iface = repeater_iface(cursor)
+		local live_dev = live_iface and real_ifname(live_iface)
 		cursor:foreach("gl-repeater", "saved_ap", function(s)
 			-- Per-network security written by apply_config. Fall back to the
 			-- shared uplink iface for records created before that existed.
@@ -780,7 +889,7 @@ return {
 				manual = s.manual == "1", auto_portal = s.auto_portal == "1",
 				disguise = s.disguise == "1",
 				protocol = s.protocol or "dhcp",
-				macaddr = { mode = "default", update = "none" },
+				macaddr = stored_mac(cursor, s, s.iface == live_iface and live_dev or nil),
 				portal_info = portal_info(cursor, s),
 			})
 		end)
@@ -974,7 +1083,8 @@ return {
 				or cursor:get("wireless", iface, "password"),
 			identity = cursor:get("wireless", iface, "identity"),
 			auto_portal = auto_portal,
-			disguise = false,
+			disguise = cursor:get("gl-repeater", "settings", "disguise") == "1",
+			macaddr = stored_mac(cursor, current_saved(cursor, iface), dev),
 		}
 
 		return {

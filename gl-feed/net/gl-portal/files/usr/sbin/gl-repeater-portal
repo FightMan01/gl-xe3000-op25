@@ -107,10 +107,14 @@ end
 -- DNS to an old VPN/AdGuard/custom server, which makes the portal URL fail to
 -- resolve even though the STA itself can reach the upstream login page.
 -- Both of these run from the detection loop, so they must be
--- idempotent: reloading dnsmasq on every tick (as an earlier version did)
--- means a needless reload every 15s for the entire time no portal is
+-- idempotent: restarting dnsmasq on every tick (as an earlier version did)
+-- means a needless restart every 15s for the entire time no portal is
 -- pending, and again for every tick while one is.  Only touch dnsmasq
 -- when the include actually changes.
+--
+-- restart, not reload: /etc/init.d/dnsmasq reload is SIGHUP, which drops
+-- leases/hosts but does not re-read conf-dir, so a new server= line would
+-- not take effect until the next unrelated dnsmasq restart.
 local function set_portal_dns(dns)
 	local cursor = uci.cursor()
 	local directory = dnsmasq_confdir(cursor)
@@ -147,7 +151,7 @@ local function set_portal_dns(dns)
 	file:write(content)
 	file:close()
 	os.rename(temp, path)
-	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
 	return true
 end
 
@@ -161,22 +165,31 @@ local function restore_portal_dns()
 	if not existing then return false end
 	existing:close()
 	os.remove(path)
-	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
 	return true
 end
 
 -- dnsmasq keeps rebind protection on (91-gl-repeater-dns-rebind), so a portal
 -- whose login host resolves to a private address (MAVSTART-WiFi does) would
 -- have that answer stripped for LAN clients. While a portal is pending, allow
--- private answers for that one host only, as travelmate does, and drop the
+-- private answers for that host only, as travelmate does, and drop the
 -- exception once the portal is passed or the uplink is gone. Like the DNS
 -- include above: a tmpfs file, rewritten and reloaded only when it changes.
-local function portal_rebind_host(url)
-	local host = tostring(url or ""):match("^[Hh][Tt][Tt][Pp][Ss]?://([^/:%?#]+)")
-	if not host or host:match("^[%d%.]+$") then return nil end
+--
+-- The portal page often loads sibling hosts (Telekom's redirect points at
+-- virtual-ip.instant.telekom.hu while the login page is on
+-- mav-fedelzet.instant.telekom.hu), so the parent domain is included too.
+local function portal_domains(url)
+	local host = tostring(url or ""):lower():match("^[Hh][Tt][Tt][Pp][Ss]?://([^/:%?#]+)")
+	if not host or host:match("^[%d%.]+$") or host:find(":", 1, true) then return {} end
 	-- The URL comes from the portal: only a plain DNS name reaches dnsmasq.
-	if #host > 253 or not host:match("^[%w][%w%.%-]*$") then return nil end
-	return host:lower()
+	if #host > 253 or not host:match("^[%w][%w%.%-]*$") then return {} end
+	local domains = { host }
+	local parent = host:match("^[^.]+%.(.+)$")
+	if parent and parent:find("%.") then
+		domains[#domains + 1] = parent
+	end
+	return domains
 end
 
 local function set_portal_rebind(url)
@@ -184,15 +197,19 @@ local function set_portal_rebind(url)
 	local directory = dnsmasq_confdir(cursor)
 	if not directory then return false end
 	local path = directory .. "/gl-repeater-portal-rebind.conf"
-	local host = portal_rebind_host(url)
+	local domains = portal_domains(url)
+	local lines = {}
+	for _, domain in ipairs(domains) do
+		lines[#lines + 1] = "rebind-domain-ok=/" .. domain .. "/"
+	end
+	local content = #lines > 0 and (table.concat(lines, "\n") .. "\n") or nil
 	local existing = io.open(path, "r")
 	local current = existing and existing:read("*a")
 	if existing then existing:close() end
-	if not host then
+	if not content then
 		if not current then return false end
 		os.remove(path)
 	else
-		local content = "rebind-domain-ok=/" .. host .. "/\n"
 		if current == content then return true end
 		os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
 		local temp = path .. ".new"
@@ -202,8 +219,109 @@ local function set_portal_rebind(url)
 		file:close()
 		os.rename(temp, path)
 	end
-	os.execute("/etc/init.d/dnsmasq reload >/dev/null 2>&1")
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
 	return true
+end
+
+-- The portal hostname usually exists only in the hotspot's own resolver:
+-- mav-fedelzet.instant.telekom.hu is NXDOMAIN on Cloudflare and on Telekom's
+-- public DNS. Forward just the portal's domains to the DNS servers learned
+-- from the STA lease. A scoped server=/domain/ line takes precedence over
+-- dnsmasq's generic upstreams, so a manual or secure choice on the 4.11 DNS
+-- page cannot shadow the login page while the portal is pending.
+local function set_portal_forward(url, dns)
+	local cursor = uci.cursor()
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal-domain.conf"
+	local servers = {}
+	for _, server in ipairs(as_list(dns)) do
+		server = tostring(server)
+		if server:match("^[%x%.:]+$") then
+			servers[#servers + 1] = server
+		end
+	end
+	local lines = {}
+	for _, domain in ipairs(portal_domains(url)) do
+		for _, server in ipairs(servers) do
+			lines[#lines + 1] = "server=/" .. domain .. "/" .. server
+		end
+	end
+	local content = #lines > 0 and (table.concat(lines, "\n") .. "\n") or nil
+	local existing = io.open(path, "r")
+	local current = existing and existing:read("*a")
+	if existing then existing:close() end
+	if not content then
+		if not current then return false end
+		os.remove(path)
+	else
+		if current == content then return true end
+		os.execute("mkdir -p " .. shell_quote(directory) .. " >/dev/null 2>&1")
+		local temp = path .. ".new"
+		local file = io.open(temp, "w")
+		if not file then return false end
+		file:write(content)
+		file:close()
+		os.rename(temp, path)
+	end
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
+	return true
+end
+
+local function clear_portal_forward()
+	local cursor = uci.cursor()
+	local directory = dnsmasq_confdir(cursor)
+	if not directory then return false end
+	local path = directory .. "/gl-repeater-portal-domain.conf"
+	os.remove(path .. ".new")
+	local existing = io.open(path, "r")
+	if not existing then return false end
+	existing:close()
+	os.remove(path)
+	os.execute("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
+	return true
+end
+
+-- mwan3 judges the repeater by pinging public hosts, which a captive portal
+-- blocks until login, so it keeps the uplink "offline" and marks everything -
+-- the portal's own DNS and login pages included - for the cellular table.
+-- While logging in, send the portal's DNS servers and the private/test ranges
+-- captive networks host their pages on through the main table (where the
+-- repeater route lives), ahead of mwan3's fwmark rules.
+local PORTAL_RULE_PRIO = 800
+local PORTAL_RANGES = { "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "192.0.2.0/24" }
+local PORTAL_ROUTES_MARKER = "/tmp/gl-repeater-portal-routes"
+
+local function clear_portal_routes()
+	os.remove(PORTAL_ROUTES_MARKER)
+	os.execute("while ip rule del prio " .. PORTAL_RULE_PRIO .. " 2>/dev/null; do :; done")
+end
+
+local function set_portal_routes(dns)
+	local targets = {}
+	for _, server in ipairs(as_list(dns)) do
+		server = tostring(server)
+		if server:match("^%d+%.%d+%.%d+%.%d+$") then
+			targets[#targets + 1] = server
+		end
+	end
+	for _, range in ipairs(PORTAL_RANGES) do
+		targets[#targets + 1] = range
+	end
+	local want = table.concat(targets, " ")
+	local marker = io.open(PORTAL_ROUTES_MARKER, "r")
+	local current = marker and marker:read("*l") or nil
+	if marker then marker:close() end
+	if current == want then return end
+	clear_portal_routes()
+	for _, target in ipairs(targets) do
+		os.execute("ip rule add to " .. target .. " lookup main prio " .. PORTAL_RULE_PRIO .. " 2>/dev/null")
+	end
+	local file = io.open(PORTAL_ROUTES_MARKER, "w")
+	if file then
+		file:write(want .. "\n")
+		file:close()
+	end
 end
 
 local function clear_portal_rebind()
@@ -326,6 +444,8 @@ local function detect(settings)
 				-- manually entered bare mode so the LAN gate cannot remain open.
 				restore_portal_dns()
 				clear_portal_rebind()
+				clear_portal_forward()
+				clear_portal_routes()
 				if old.bare_mode then set_bare_mode(false, false) end
 				update_state({
 					detected = false, detecting = false, portal_url = "",
@@ -345,6 +465,8 @@ local function detect(settings)
 			-- engaged; otherwise a detected portal on an idle repeater would
 			-- take DNS away from a healthy cellular uplink.
 			set_portal_rebind(url)
+			set_portal_forward(url, settings.dns)
+			set_portal_routes(settings.dns)
 			if settings.auto_portal or load_state().bare_mode then set_portal_dns(settings.dns) end
 			if settings.auto_portal then set_bare_mode(true, true) end
 			update_state({
@@ -359,6 +481,8 @@ local function detect(settings)
 	end
 
 	clear_portal_rebind()
+	clear_portal_forward()
+	clear_portal_routes()
 	update_state({
 		detected = false, detecting = false, portal_url = "",
 		status = "not found portal", last_error = last_error,
@@ -376,6 +500,8 @@ local function tick()
 		local old = load_state()
 		restore_portal_dns()
 		clear_portal_rebind()
+		clear_portal_forward()
+		clear_portal_routes()
 		if old.auto_bare_mode then set_bare_mode(false, false) end
 		update_state({
 			detected = false, detecting = false, portal_url = "",

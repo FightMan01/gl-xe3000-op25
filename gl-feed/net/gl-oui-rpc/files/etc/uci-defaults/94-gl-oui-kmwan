@@ -100,12 +100,12 @@ uci -q batch <<-EOF
 
 	set mwan3.wwan4_m2_w1=member
 	set mwan3.wwan4_m2_w1.interface='wwan_4'
-	set mwan3.wwan4_m2_w1.metric='2'
+	set mwan3.wwan4_m2_w1.metric='3'
 	set mwan3.wwan4_m2_w1.weight='1'
 
 	set mwan3.repeater_m3_w1=member
 	set mwan3.repeater_m3_w1.interface='repeater'
-	set mwan3.repeater_m3_w1.metric='3'
+	set mwan3.repeater_m3_w1.metric='2'
 	set mwan3.repeater_m3_w1.weight='1'
 
 	set mwan3.tethering_m4_w1=member
@@ -116,8 +116,8 @@ uci -q batch <<-EOF
 	set mwan3.gl_failover=policy
 	delete mwan3.gl_failover.use_member
 	add_list mwan3.gl_failover.use_member='wan_m1_w1'
-	add_list mwan3.gl_failover.use_member='wwan4_m2_w1'
 	add_list mwan3.gl_failover.use_member='repeater_m3_w1'
+	add_list mwan3.gl_failover.use_member='wwan4_m2_w1'
 	add_list mwan3.gl_failover.use_member='tethering_m4_w1'
 	set mwan3.gl_failover.last_resort='default'
 
