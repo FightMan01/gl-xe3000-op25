@@ -973,8 +973,11 @@ local function modem_get()
 	local level = tonumber(cell.rsrp_level) or 0
 	local wwan = ubus.call("network.interface.wwan_4", "status") or {}
 	local address = wwan["ipv4-address"] and wwan["ipv4-address"][1]
+	-- GL's modem dial-status enum: 0 disconnected, 1 connecting,
+	-- 2 connected. The Ethernet port enum uses 1 for connected, but the
+	-- cellular card follows this one.
 	return {
-		status = status.connected and 1 or 0,
+		status = status.connected and 2 or 0,
 		online = status.connected and 0 or 1,
 		exist_sim_card = iccid ~= "",
 		sim_card = {
