@@ -82,6 +82,13 @@ local TOPICS = {
 	["cellular.networks_info"] = { "cellular", "networks_info" },
 	["cellular.networks_status"] = { "cellular", "networks_status" },
 	["mcu.status"] = { "mcu", "status" },
+	-- Network Quality page: the network-quality daemon exposes the same
+	-- snapshot over ubus that its own gl-session notify carries. Polling it
+	-- here keeps the page live without relying on GL's notify fan-out.
+	["network_quality.status"] = { "network-quality", "snapshot" },
+	["mesh.config"] = { kind = "rpc", path = "/usr/lib/oui-rpc/mesh.lua", method = "get_config" },
+	["mesh.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/mesh.lua", method = "get_status" },
+	["mesh.topology"] = { kind = "rpc", path = "/usr/lib/oui-rpc/mesh.lua", method = "get_topology" },
 	["vpnclient.status"] = { kind = "rpc", path = "/usr/lib/oui-rpc/vpn-client.lua", method = "get_status" },
 }
 

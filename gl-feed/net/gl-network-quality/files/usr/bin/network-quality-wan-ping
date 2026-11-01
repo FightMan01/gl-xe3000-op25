@@ -1,0 +1,29 @@
+#!/bin/sh
+# One ICMP echo to the active WAN gateway, optionally pinned to an
+# interface (balance mode). Prints: "<status> <latency-ms>"
+
+ifname="$1"
+target="$2"
+ping_timeout="$3"
+
+[ -n "$target" ] || exit 1
+[ -n "$ping_timeout" ] || ping_timeout=1
+
+if [ -n "$ifname" ] && [ "$ifname" != "-" ]; then
+	output=$(ping -I "$ifname" -c1 -W"$ping_timeout" "$target" 2>&1)
+else
+	output=$(ping -c1 -W"$ping_timeout" "$target" 2>&1)
+fi
+rc=$?
+
+if [ "$rc" -eq 0 ]; then
+	latency=$(echo "$output" | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p' | head -n1)
+	[ -n "$latency" ] && {
+		echo "0 $latency"
+		exit 0
+	}
+fi
+
+reason=$(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')
+echo "1 -1 $reason"
+exit 1

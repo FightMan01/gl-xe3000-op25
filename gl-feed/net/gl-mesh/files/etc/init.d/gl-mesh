@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+STOP=10
+
+# Mesh and repeater both drive the STA side of a radio. If the user left a
+# repeater uplink active, keep prplmesh from starting on top of it. The RPC
+# set_config performs the same check for the interactive path.
+repeater_active() {
+	[ "$(uci -q get gl-repeater.settings.auto)" = "0" ] && return 1
+	for section in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)\.mode='sta'$/\1/p"); do
+		[ "$(uci -q get wireless.$section.disabled)" = "1" ] && continue
+		return 0
+	done
+	return 1
+}
+
+start() {
+	[ "$(uci -q get gl-mesh.base.enabled)" = "1" ] || return 0
+	[ "$(uci -q get prplmesh.config.enabled)" = "1" ] || return 0
+
+	if repeater_active; then
+		logger -t gl-mesh "repeater/STA mode is active; not starting prplmesh"
+		uci -q set prplmesh.config.enabled='0'
+		uci commit prplmesh
+		/etc/init.d/prplmesh stop >/dev/null 2>&1
+		return 0
+	fi
+}

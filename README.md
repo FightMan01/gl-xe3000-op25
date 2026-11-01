@@ -15,6 +15,7 @@ GL's actual GUI (the compiled Vue.js frontend, package `gl-oui-www` in the origi
 - **gl-oui-runtime** - a small vanilla-JS file that keeps the Internet/Multi-WAN status cards live without needing a page refresh, plus a fallback restore page for getting the GL GUI back after flashing (both original code, not vendored from GL)
 - **gl-cellular** - RM520N-GL modem management over its AT port (SIM/APN config, band locking, cell tower scanning, SMS), plus the `qcm` netifd proto and watchdog for the actual QMI/QMAP data connection
 - **gl-mcu** - the onboard battery/MCU controller daemon (UART, JSON wire protocol with GL's byte-substitution framing)
+- **gl-network-quality** - the 4.11 Network Quality page backend: a ubus daemon that probes the WAN gateway, internet target and DNS once a second, keeps the 30-minute reliability history, samples the active WAN counters, and drives the Cloudflare speedtest with the stock `curl` client
 - **gl-repeater** - WiFi repeater/bridge mode uplink, using a STA interface + double-NAT so it also works against WPA2/3-Enterprise networks (eduroam and the like), which WDS-based repeating never does
 - **openwrt-patches** - the handful of kernel/package patches this needs: turning off PCIe port power management (stops a reset loop on this hardware) and a small lua-cjson patch so an empty list serializes as `[]` instead of `{}`
 - **build-config** - misc build-time package config (ksmbd)
@@ -76,7 +77,7 @@ The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what y
 
 ## Status
 
-Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, and the battery/MCU controller. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, and OLED screen scheduling (this device has no screen).
+Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, the battery/MCU controller, and the 4.11 Network Quality, DNS and UPnP pages. The 4.11 Mesh page is present with an autoconfiguring prplmesh controller/agent; multi-node onboarding is not verified yet. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, multi-node EasyMesh onboarding and remote node upgrade, cloud security scan, and OLED screen scheduling (this device has no screen).
 
 Tested on a physical XE3000. Issues and pull requests welcome.
 

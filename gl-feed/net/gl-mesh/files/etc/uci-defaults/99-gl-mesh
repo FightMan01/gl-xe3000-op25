@@ -1,0 +1,12 @@
+#!/bin/sh
+
+[ -f /etc/config/gl-mesh ] || touch /etc/config/gl-mesh
+
+if ! uci -q get gl-mesh.base >/dev/null 2>&1; then
+	uci -q set gl-mesh.base='base'
+	uci -q set gl-mesh.base.enabled='0'
+	uci -q set gl-mesh.base.mode='controller'
+	uci commit gl-mesh
+fi
+
+exit 0
