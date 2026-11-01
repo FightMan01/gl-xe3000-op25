@@ -254,12 +254,29 @@ local function connection_status()
 		status = (cfg.enabled and running) and "connected" or "waiting",
 		enabled = cfg.enabled,
 		mode = cfg.mode,
-		type = "Ethernet",
+		type = uplink_type(),
 	}
 end
 
+local function uplink_type()
+	local route = first_line("/proc/net/route")
+	-- /proc/net/route does not carry the device name; use the default
+	-- route's ifindex through iproute2 in a single cheap call.
+	local output = first_line((function()
+		local p = io.popen("ip route show default 2>/dev/null | head -n1")
+		if not p then return "" end
+		local line = p:read("*l") or ""
+		p:close()
+		return line
+	end)()) or ""
+	local dev = output:match("%sdev%s+([^%s]+)")
+	if dev and (dev:match("^eth") or dev:match("^br")) then
+		return "Ethernet"
+	end
+	return "WiFi"
+end
+
 local function local_topology()
-	local cursor = uci.cursor()
 	local ifname = lan_device()
 	local mac = device_mac(ifname)
 	local status = lan_status()
@@ -270,7 +287,7 @@ local function local_topology()
 		online = true,
 		ip = lan_ip(),
 		uptime = uptime(),
-		connection = "Ethernet",
+		connection = uplink_type(),
 		son_nodes = cjson.empty_array,
 		clients = cjson.empty_array,
 	}
