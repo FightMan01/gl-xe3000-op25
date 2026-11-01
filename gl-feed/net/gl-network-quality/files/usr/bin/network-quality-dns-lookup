@@ -1,0 +1,40 @@
+#!/bin/sh
+# DNS probe: resolve the configured domain through one upstream server,
+# asking for both A and AAAA. Prints: "<status> <latency-ms> [resolved-ip]"
+#
+# The stock firmware uses dig for this; this port ships BusyBox nslookup and
+# measures the wall time around both queries instead of reading dig's
+# "Query time" field.
+
+dns_ip="$1"
+domain="$2"
+dns_timeout="$3"
+
+[ -n "$dns_ip" ] || exit 1
+[ -n "$domain" ] || exit 1
+[ -n "$dns_timeout" ] || dns_timeout=1
+
+start_ms=$(awk '{printf "%d", $1*1000}' /proc/uptime)
+out4=$(timeout "$((dns_timeout + 1))" nslookup -type=A "$domain" "$dns_ip" 2>&1)
+rc4=$?
+out6=$(timeout "$((dns_timeout + 1))" nslookup -type=AAAA "$domain" "$dns_ip" 2>&1)
+rc6=$?
+end_ms=$(awk '{printf "%d", $1*1000}' /proc/uptime)
+latency=$((end_ms - start_ms))
+[ "$latency" -lt 0 ] && latency=0
+
+ip4=$(printf '%s\n' "$out4" | sed -n '/^Name:/,$p' | sed -n 's/^Address: *\([0-9a-fA-F:.]*\)$/\1/p' | head -n1)
+ip6=$(printf '%s\n' "$out6" | sed -n '/^Name:/,$p' | sed -n 's/^Address: *\([0-9a-fA-F:.]*\)$/\1/p' | head -n1)
+
+if [ "$rc4" -eq 0 ] && [ -n "$ip4" ]; then
+	echo "0 $latency $ip4"
+	exit 0
+fi
+if [ "$rc6" -eq 0 ] && [ -n "$ip6" ]; then
+	echo "0 $latency $ip6"
+	exit 0
+fi
+
+reason=$(printf '%s %s' "$out4" "$out6" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')
+echo "1 -1 $reason"
+exit 1

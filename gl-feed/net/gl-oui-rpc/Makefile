@@ -23,7 +23,7 @@ define Package/gl-oui-rpc
   TITLE:=GL.iNet SDK4 GUI - backend (session/RPC), reimplemented
   URL:=https://github.com/zhaojh329/lua-eco
   DEPENDS:= \
-	+gl-portal \
+	+gl-portal +dnsproxy +miniupnpd-nftables \
 	nginx-ssl +nginx-mod-lua +nginx-mod-lua-resty-core +nginx-mod-lua-resty-lrucache \
 	+lua-eco +lua-eco-ubus +lua-eco-uci +lua-eco-sha256 +lua-eco-log \
 	+libubus-lua +libuci-lua +lua-cjson +libiwinfo-lua \
@@ -40,6 +40,7 @@ define Package/gl-oui-rpc/conffiles
 /etc/config/gl-oui-rpc
 /etc/config/gl-wan-health
 /etc/config/gl-oui-acl
+/etc/config/gl-dns-v2
 /etc/config/gl_wgserver
 /etc/config/gl_wgclient
 /etc/config/gl_vpnclient

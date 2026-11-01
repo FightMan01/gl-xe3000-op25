@@ -1,0 +1,39 @@
+#!/bin/sh
+
+[ -f /etc/config/network-quality ] || touch /etc/config/network-quality
+
+if uci -q show network-quality.global >/dev/null 2>&1; then
+	exit 0
+fi
+
+uci -q set network-quality.global='global'
+
+country="$(cat /proc/gl-hw-info/country_code 2>/dev/null)"
+default_target="google.com"
+[ "$country" = "CN" ] && default_target="baidu.com"
+
+[ -n "$(uci -q get network-quality.global.enabled 2>/dev/null)" ] || uci set network-quality.global.enabled='0'
+[ -n "$(uci -q get network-quality.global.log 2>/dev/null)" ] || uci set network-quality.global.log='INFO'
+[ -n "$(uci -q get network-quality.global.preset_target 2>/dev/null)" ] || {
+	uci -q add_list network-quality.global.preset_target='Baidu=baidu.com'
+	uci -q add_list network-quality.global.preset_target='Tencent=qq.com'
+	uci -q add_list network-quality.global.preset_target='Alibaba=www.aliyun.com'
+	uci -q add_list network-quality.global.preset_target='Google=google.com'
+	uci -q add_list network-quality.global.preset_target='Microsoft=www.microsoft.com'
+	uci -q add_list network-quality.global.preset_target='Cloudflare=cloudflare.com'
+}
+[ -n "$(uci -q get network-quality.global.ethernet_ping_address 2>/dev/null)" ] || uci set network-quality.global.ethernet_ping_address="$default_target"
+[ -n "$(uci -q get network-quality.global.dns_probe_domain 2>/dev/null)" ] || uci set network-quality.global.dns_probe_domain="$default_target"
+[ -n "$(uci -q get network-quality.global.ping_interval 2>/dev/null)" ] || uci set network-quality.global.ping_interval='1'
+[ -n "$(uci -q get network-quality.global.dns_interval 2>/dev/null)" ] || uci set network-quality.global.dns_interval='1'
+[ -n "$(uci -q get network-quality.global.dns_timeout 2>/dev/null)" ] || uci set network-quality.global.dns_timeout='1'
+[ -n "$(uci -q get network-quality.global.ping_timeout 2>/dev/null)" ] || uci set network-quality.global.ping_timeout='1'
+[ -n "$(uci -q get network-quality.global.speedtest_download_bytes 2>/dev/null)" ] || uci set network-quality.global.speedtest_download_bytes='1073741824'
+[ -n "$(uci -q get network-quality.global.speedtest_download_interval 2>/dev/null)" ] || uci set network-quality.global.speedtest_download_interval='1'
+[ -n "$(uci -q get network-quality.global.speedtest_download_concurrency 2>/dev/null)" ] || uci set network-quality.global.speedtest_download_concurrency='4'
+[ -n "$(uci -q get network-quality.global.speedtest_upload_bytes 2>/dev/null)" ] || uci set network-quality.global.speedtest_upload_bytes='1073741824'
+[ -n "$(uci -q get network-quality.global.speedtest_upload_interval 2>/dev/null)" ] || uci set network-quality.global.speedtest_upload_interval='1'
+[ -n "$(uci -q get network-quality.global.speedtest_upload_concurrency 2>/dev/null)" ] || uci set network-quality.global.speedtest_upload_concurrency='4'
+
+uci commit network-quality
+exit 0

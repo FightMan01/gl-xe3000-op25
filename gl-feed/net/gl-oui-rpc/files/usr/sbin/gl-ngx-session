@@ -339,8 +339,12 @@ local methods = {
 		-- (ngx-cmd-proxy.sock equivalent). Not needed by anything in this
 		-- port yet - left unimplemented rather than guessed at. Revisit
 		-- when a concrete RPC object needs it.
+		--
+		-- The reply must be a table: eco.ubus' reply path serializes a
+		-- table, and passing a bare status number here raises inside the
+		-- daemon and takes the whole session service down with it.
 		function(req, msg, con)
-			con:reply(req, ubus.STATUS_NOT_SUPPORTED)
+			con:reply(req, { code = ubus.STATUS_NOT_SUPPORTED })
 		end, { func = ubus.STRING, module = ubus.STRING, params = ubus.TABLE }
 	},
 }

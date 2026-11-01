@@ -1,0 +1,2 @@
+config dns 'dns'
+	option mode 'auto'

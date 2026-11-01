@@ -1,0 +1,75 @@
+#!/usr/bin/env eco
+
+-- network-quality: continuous latency/DNS/loss monitor for the network
+-- quality page, plus the Cloudflare speedtest driver.
+--
+-- Registers the ubus object "network-quality" with snapshot/reload_config/
+-- set_speedtest, matching the contract the GL frontend expects. The page
+-- itself reads the snapshot again over /ws via the network_quality.status
+-- topic (oui-ws.lua polls this same object).
+
+local time = require("eco.time")
+local eco = require("eco")
+local ubus = require("eco.ubus")
+local log = require("eco.log")
+local quality = require("gl.network_quality")
+
+local con
+
+local function ubus_init()
+	con = ubus.connect(nil, true)
+	if not con then
+		log.err("failed to connect ubus")
+		return false
+	end
+	quality.init(con)
+	local obj, err = con:add("network-quality", {
+		snapshot = {
+			function(req)
+				con:reply(req, quality.snapshot())
+			end
+		},
+		reload_config = {
+			function(req)
+				quality.reload_config()
+				con:reply(req, { err_code = 0 })
+			end
+		},
+		set_speedtest = {
+			function(req, msg)
+				local ok = quality.set_speedtest(msg and msg.enable)
+				if ok then
+					con:reply(req, { err_code = 0 })
+				else
+					con:reply(req, {
+						err_code = 1,
+						err_msg = "failed to set speedtest"
+					})
+				end
+			end,
+			{ enable = ubus.BOOLEAN }
+		}
+	})
+	if not obj then
+		log.err("failed to register ubus object: ", tostring(err))
+		return false
+	end
+	quality.start()
+	return true
+end
+
+log.set_flags(log.FLAG_LF | log.FLAG_FILE)
+log.set_ident("network-quality")
+
+function eco.panic_hook(err)
+	log.err(err)
+end
+
+if not ubus_init() then
+	return
+end
+
+-- Keep the main coroutine alive. The workers started by quality.start()
+-- are eco tasks; without a task the runtime would have nothing to wait
+-- on when the probe workers are disabled.
+time.sleep(3600)
