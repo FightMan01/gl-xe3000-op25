@@ -171,8 +171,14 @@ local function load_identity()
 	local epoch = tonumber(sys.sh("date -u -d " ..
 		("'" .. dev.version_date:gsub("'", "'\\''") .. "'") .. " +%s") or "")
 	if epoch then
-		-- Stock stores milliseconds and subtracts the CST offset.
-		dev.version_date = tostring(epoch - 57600) .. "000"
+		-- The registration's version_date is milliseconds (stock format),
+		-- but the base attribute's compile_time is seconds. Sending the
+		-- millisecond value there makes GoodCloud discard the live base
+		-- data and fall back to the old device record.
+		dev.compile_time = tostring(epoch - 57600)
+		dev.version_date = dev.compile_time .. "000"
+	else
+		dev.compile_time = dev.version_date
 	end
 	has_cert = ensure_cert()
 end
@@ -750,7 +756,7 @@ local function base_get()
 		load = { tonumber(a) or 0, tonumber(b) or 0, tonumber(col) or 0 }
 	end
 	return {
-		compile_time = dev.version_date,
+		compile_time = dev.compile_time or dev.version_date,
 		device_id = dev.ddns,
 		model = dev.model,
 		sn = dev.sn,
@@ -906,7 +912,9 @@ local function clients_get()
 	end
 	return {
 		clients = clients,
-		black_white_list = { mode = "", black_mac = cjson.empty_array,
+		-- The GoodCloud page renders "Blocklist"; an empty mode makes its
+		-- access-control selector spin forever.
+		black_white_list = { mode = "black", black_mac = cjson.empty_array,
 			white_mac = cjson.empty_array },
 	}
 end
@@ -973,6 +981,7 @@ local function feature_attributes(feature)
 end
 
 local function handle_attribute_get(topic, payload)
+	log.debug("attribute get request:", cjson.encode(payload))
 	local keys = payload.feature_keys
 	local body = { id = payload.id, time = current_time(), code = 0 }
 	if type(keys) == "table" then
@@ -989,6 +998,7 @@ local function handle_attribute_get(topic, payload)
 		end
 	end
 	local reply = topic:gsub("get_request", "get_respond")
+	log.debug("attribute get reply:", cjson.encode(body))
 	publish(reply, cjson.encode(body))
 end
 
@@ -1050,9 +1060,40 @@ local function handle_event(topic, payload)
 	publish(topic:gsub("request", "respond"), cjson.encode(body))
 end
 
-local function handle_message(topic, payload)
+local recent_requests = {}
+
+-- The broker can deliver the same publish more than once (it also carries
+-- the stale stock session's subscriptions). Commands such as reboot must
+-- not run twice, so collapse identical topic+payload within a short window.
+local function is_duplicate(topic, raw)
+	local now = time.now()
+	local key = topic .. "|" .. tostring(raw)
+	if recent_requests[key] and now - recent_requests[key] < 3 then
+		return true
+	end
+	recent_requests[key] = now
+	if next(recent_requests) and math.random(1, 50) == 1 then
+		for k, stamp in pairs(recent_requests) do
+			if now - stamp > 10 then recent_requests[k] = nil end
+		end
+	end
+	return false
+end
+
+local function handle_message(topic, payload, raw)
+	-- The wildcard subscription also receives our own respond/event
+	-- publications; handling those would reply to ourselves in a loop.
+	if not (topic:match("/request$") or topic:match("/subscribe_request$")) then
+		return
+	end
+	if is_duplicate(topic, raw) then return end
 	local parts = {}
 	for part in topic:gmatch("[^/]+") do parts[#parts + 1] = part end
+	-- A request may arrive under the version stored in the GoodCloud device
+	-- record. Adopt its prefix for the reply and for later pushes.
+	if parts[1] == "sys" and parts[4] then
+		topic_prefix = parts[2] .. "/" .. parts[3] .. "/" .. parts[4]
+	end
 	if parts[5] == "attribute" and parts[6] == "get_request" then
 		handle_attribute_get(topic, payload)
 	elseif parts[5] == "attribute" and parts[6] == "set_request" then
@@ -1077,18 +1118,14 @@ local function parse_message(data)
 end
 
 local function subscription_topics()
-	local topics = {
-		"/sys/" .. topic_prefix .. "/attribute/get_request",
-		"/sys/" .. topic_prefix .. "/attribute/set_request",
-		"/sys/" .. topic_prefix .. "/event/subscribe_request",
+	-- One wildcard under our MAC. The broker's device record may still carry
+	-- the stock version (4.9.0), so subscribing only to the version this
+	-- daemon reports makes every cloud request time out. A wildcard also
+	-- avoids overlapping subscriptions, which would deliver each request
+	-- more than once and produce duplicate replies.
+	return {
+		"/sys/+/+/" .. dev.mac .. "/#",
 	}
-	for feature, commands in pairs(FEATURES.commands) do
-		for method in pairs(commands) do
-			topics[#topics + 1] = string.format(
-				"/sys/%s/command/%s/%s/request", topic_prefix, feature, method)
-		end
-	end
-	return topics
 end
 
 local function mqtt_init(info)
@@ -1103,6 +1140,11 @@ local function mqtt_init(info)
 		opts.key = KEY_PATH
 	end
 	local client = mqtt.new(opts)
+	-- The stock client's topic prefix. Every subscription and response below
+	-- is relative to this; an empty value sends commands to /sys//command/...
+	-- and the server never gets a reply.
+	topic_prefix = dev.model .. "/" .. dev.version .. "/" .. dev.mac
+	log.debug("topic prefix:", topic_prefix)
 	client:set("ipaddr", info.ip)
 	client:set("port", tonumber(info.port))
 	client:set("keepalive", tonumber(info.keepalive) or 60)
@@ -1124,7 +1166,17 @@ local function mqtt_init(info)
 			notify_status()
 		end,
 
+		suback = function(data)
+			log.debug("suback:", cjson.encode(data))
+			for _, result in ipairs(data.results or {}) do
+				if result.rc == mqtt.SUBACK_FAILURE then
+					log.err("subscription refused:", result.topic)
+				end
+			end
+		end,
+
 		publish = function(msg)
+			log.debug("cloud message", msg.topic)
 			local payload = parse_message(msg.payload)
 			if not payload then return end
 			local ok, decoded = pcall(cjson.decode, payload)
@@ -1133,7 +1185,7 @@ local function mqtt_init(info)
 				return
 			end
 			log.debug("cloud message", msg.topic)
-			handle_message(msg.topic, decoded)
+			handle_message(msg.topic, decoded, payload)
 		end,
 
 		error = function(err)
@@ -1331,6 +1383,20 @@ local function ubus_server()
 		},
 		dump_subscribe_attributes = {
 			function(req) con:reply(req, { subscribe_attributes = {} }) end, {},
+		},
+		-- Local diagnostics: exercise the broker round-trip and the
+		-- attribute/command handlers without waiting for the cloud page.
+		publish_test = {
+			function(req, msg)
+				local ok = publish(msg.topic, msg.payload, 0)
+				con:reply(req, { ok = ok and true or false })
+			end, { topic = ubus.STRING, payload = ubus.STRING },
+		},
+		get_attribute = {
+			function(req, msg)
+				local value = feature_attributes(msg.name)
+				con:reply(req, { name = msg.name, value = value })
+			end, { name = ubus.STRING },
 		},
 		["notify-network-info"] = {
 			function(req)
