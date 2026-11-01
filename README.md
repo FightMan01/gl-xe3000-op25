@@ -77,7 +77,7 @@ The resulting `*-sysupgrade.bin` under `bin/targets/mediatek/filogic/` is what y
 
 ## Status
 
-Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, the battery/MCU controller, and the 4.11 Network Quality and DNS pages. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, mesh/EasyMesh, cloud security scan, and OLED screen scheduling (this device has no screen).
+Day-to-day this runs wifi, LAN/guest/IoT networks, native VLAN subnets (custom 802.1q trunk networks over the LAN port, plus WireGuard client tunnels with manually-entered peer configs), the firewall, multi-WAN failover, the cellular modem (LTE and 5G NSA), repeater mode, USB tethering, the battery/MCU controller, and the 4.11 Network Quality, DNS and UPnP pages. The 4.11 Mesh page is present with an autoconfiguring prplmesh controller/agent; multi-node onboarding is not verified yet. A few things are honestly stubbed rather than faked: eSIM, remote APN database updates, DPI-based per-app traffic stats, multi-node EasyMesh onboarding and remote node upgrade, cloud security scan, and OLED screen scheduling (this device has no screen).
 
 Tested on a physical XE3000. Issues and pull requests welcome.
 
